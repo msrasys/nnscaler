@@ -1240,6 +1240,10 @@ class ParallelModule(CubeModule):
 
     # the rank of the module, will be assigned in the generated subclasses
     rank: int
+    # True when the policy places no operator on this rank's plan position.
+    # Such a module holds no parameters and must not be called,
+    # but it still joins collective calls such as gradient norm and checkpointing.
+    is_inactive_rank: bool = False
     # the world size to run this module, will be assigned in the generated subclasses
     world_size: int
     # the runtime version of the module when it is generated, will be assigned in the generated subclasses

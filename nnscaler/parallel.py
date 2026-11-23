@@ -1105,9 +1105,12 @@ def _gencode(
     repr_execplan = first(execplan.values()) if isinstance(execplan, dict) else execplan
 
     # code generation
-    assert len(repr_execplan.graph.device) == compute_config.plan_ngpus, f"{repr_execplan.graph.device}"
-
-    mgener = ModuleCodeGen(repr_execplan, compute_config.runtime_ngpus)
+    if compute_config.use_end2end and len(repr_execplan.graph.device) != compute_config.plan_ngpus:
+        raise ValueError("End-to-end schedules require all plan ranks to be active")
+    mgener = ModuleCodeGen(
+        repr_execplan, compute_config.runtime_ngpus,
+        plan_ndevs=compute_config.plan_ngpus,
+    )
     sgener = None
     attr_merged_meta_map = {}
     if compute_config.use_end2end:
@@ -1915,53 +1918,41 @@ def build_optimizer(
     }
 
     def _local_parameters(module: torch.nn.Module):
-        pm_suffix = "_PARALLEL_MODULE_PARAM_SUFFIX"
-        def _p_gen(m: torch.nn.Module) -> list[tuple[str, torch.nn.Parameter]]:
+        offset = 0
+        seen = set()
+        for name, m in module.named_modules():
             if isinstance(m, ParallelModule):
-                return [
-                    (pm_suffix, p)  # (pm_suffix, p) to meet _named_members requirement
-                    for p in (
-                        m.parameters_for_optimizer() if m.compute_config.use_zero
-                        else m.parameters() # `ParallelModule.merge_partial_states` supports parameters_for_optimizer() only in zero mode
-                    )
-                    if p is not None and p.requires_grad
-                ]
-            if not non_parallel_module_use_zero:
-                return [
-                    (name, p)
-                    for name, p in m._parameters.items()
-                    if p is not None and p.requires_grad
-                ]
-            # will handle non-parallel parameters with reducer later
-            return []
-
-        gen = module._named_members(_p_gen)
-
-        for idx, (name, param) in enumerate(gen):
-            if name.endswith(pm_suffix):  # is a parameter of ParallelModule
-                # -1 for removing the dot
-                # please note when the whole module is a ParallelModule,
-                # the name will be empty after removing the suffix
-                name = name[:-len(pm_suffix) - 1]
-                if name not in opt_module_locs:
-                    opt_module_locs[name] = ModuleParameterLocation(idx, 1)
-                else:
-                    opt_module_locs[name].count += 1
-            yield param
-
-        if not opt_module_locs:
-            raise RuntimeError(
-                "No parameter found from ParallelModule for optimizer. Please make sure the module contains parameters and they require grad."
-            )
+                params = m.parameters_for_optimizer() if m.compute_config.use_zero else m.parameters()
+            elif not non_parallel_module_use_zero:
+                params = m._parameters.values()
+            else:
+                continue  # non-parallel parameters are handled by the reducer below
+            start = offset
+            for param in params:
+                if param is not None and param.requires_grad and param not in seen:
+                    seen.add(param)
+                    offset += 1
+                    yield param
+            if isinstance(m, ParallelModule):
+                # A zero-length location still consumes the module's original parameters
+                # in a merged checkpoint, but consumes no local optimizer slots.
+                opt_module_locs[name] = ModuleParameterLocation(start, offset - start)
 
         if non_parallel_module_use_zero:
-            for param in non_parallel_module_reducer.parameters_for_optimizer():
-                yield param
-            opt_module_locs[_NON_PARALLEL_MODULE_ATTR_NAME] = ModuleParameterLocation(
-                idx + 1,
-                len(non_parallel_module_reducer.parameters_for_optimizer())
-            )
+            npp_params = non_parallel_module_reducer.parameters_for_optimizer()
+            yield from npp_params
+            opt_module_locs[_NON_PARALLEL_MODULE_ATTR_NAME] = ModuleParameterLocation(offset, len(npp_params))
             opt_module_configs[_NON_PARALLEL_MODULE_ATTR_NAME] = non_parallel_module_reducer_config
+            offset += len(npp_params)
+
+        # A rank where every ParallelModule is inactive and no other parameter is trainable
+        # would otherwise fail inside the optimizer with an opaque empty-parameter-list error.
+        if offset == 0:
+            raise RuntimeError(
+                f"No trainable parameter found for optimizer on rank {torch.distributed.get_rank()}. "
+                "Please make sure the module contains parameters that require grad on every rank; "
+                "a rank where all ParallelModules are inactive needs at least one other trainable parameter."
+            )
 
     if is_hybrid:
         optimizer = optimizer_fn(_local_parameters(module),
@@ -2353,13 +2344,12 @@ def merge_state_dicts(
         optimizer_state_dicts = _sort_state_dicts(optimizer_state_dicts)
         opt_extra_states, opt_state_dicts, ret_opt_state_dict = _get_optimizer_state_dict_info(optimizer_state_dicts)
         # the new optimizer state dict for ParallelModules
-        # key: the parallel module location in the optimizer state
+        # key: the module prefix (multiple empty local shards can have the same location)
         # value: A tuple of
         #    0. the new state values for the parallel module
         #    (index is the parameter index in parallel module)
-        #    1. the module prefix
-        #    2. the original parameter names (OriginModuleMetadata.origin_param_names)
-        opt_new_pm_states: Dict[ModuleParameterLocation, Tuple[Dict[int, Any], str, List[str]]] = {}
+        #    1. the original parameter names (OriginModuleMetadata.origin_param_names)
+        opt_new_pm_states: Dict[str, Tuple[Dict[int, Any], List[str]]] = {}
     else:
         opt_extra_states, opt_state_dicts, ret_opt_state_dict, opt_new_pm_states = None, None, None, None
 
@@ -2407,15 +2397,7 @@ def merge_state_dicts(
 
         # merge back opt state dict
         if opt_state_dicts is not None:
-            opt_module_locs = [opt_extra_states[i].parallel_module_locs[module_prefix] for i in range(len(opt_extra_states))]
-
-            # We can't assume all ranks have the same opt_module_locs (offset and count)
-            # when we use pipeline parallelism, different ranks may have different opt_module_locs
-            # fortunately, we can use the location information from any rank to do the merging in following
-            # here we always use the location information from rank 0
-            # for i in range(1, len(opt_module_locs)):
-            #     assert opt_module_locs[i] == opt_module_locs[0]
-            opt_new_pm_states[opt_module_locs[0]] = (merged_opt_state_dict['state'], module_prefix, extra_states[0].origin_param_names)
+            opt_new_pm_states[module_prefix] = (merged_opt_state_dict['state'], extra_states[0].origin_param_names)
 
     if opt_new_pm_states:
         pm_orig_param_names: Dict[str, List[str]] = {}
@@ -2440,11 +2422,8 @@ def merge_state_dicts(
                 ],
             )
 
-            opt_new_pm_states[
-                opt_extra_states[0].parallel_module_locs[_NON_PARALLEL_MODULE_ATTR_NAME]
-            ] = (
+            opt_new_pm_states[_NON_PARALLEL_MODULE_ATTR_NAME] = (
                 npp_merged_opt_state_dict['state'],
-                _NON_PARALLEL_MODULE_ATTR_NAME,
                 opt_extra_states[0].non_parallel_extra_state.origin_param_names,
             )
 
@@ -2458,16 +2437,17 @@ def merge_state_dicts(
         # as said previously, the merge will be based on rank0's data
         orig_states: Dict[int, Any] = optimizer_state_dicts[0]['state']
         ret_states: Dict[int, Any] = {}  # see `_get_optimizer_state_dict_info` for the value structure.
-        sorted_pm_locs = sorted(opt_new_pm_states.keys(), key=lambda x: x.offset)
+        # At a shared offset, preserve the optimizer's module traversal order.
+        sorted_pm_locs = sorted(opt_extra_states[0].parallel_module_locs.items(), key=lambda item: item[1].offset)
         assert len(optimizer_state_dicts[0]['param_groups']) == 1
         orig_effective_state_len = len(optimizer_state_dicts[0]['param_groups'][0]['params'])
         orig_cur_index = 0        # index of orig_states
         ret_states_cur_index = 0  # index of ret_state_dict
         sorted_pm_locs_cur_index = 0 # index of sorted_pm_locs
-        while orig_cur_index < orig_effective_state_len:
+        while orig_cur_index < orig_effective_state_len or sorted_pm_locs_cur_index < len(sorted_pm_locs):
             if (
                 sorted_pm_locs_cur_index >= len(sorted_pm_locs)  # after all parallel module parameters
-                or orig_cur_index < sorted_pm_locs[sorted_pm_locs_cur_index].offset  # not in the range of current parallel module
+                or orig_cur_index < sorted_pm_locs[sorted_pm_locs_cur_index][1].offset
             ):
                 # non parallel module paramters
                 if orig_cur_index in orig_states:
@@ -2476,8 +2456,8 @@ def merge_state_dicts(
                 ret_states_cur_index += 1
             else:
                 # parallel module parameters
-                pm_loc = sorted_pm_locs[sorted_pm_locs_cur_index]
-                state, module_prefix, orignal_param_names = opt_new_pm_states[pm_loc]
+                module_prefix, pm_loc = sorted_pm_locs[sorted_pm_locs_cur_index]
+                state, orignal_param_names = opt_new_pm_states[module_prefix]
                 named_state = {}  #  the state dict with named keys
                 for i, v in state.items():
                     named_state[pm_orig_param_names[module_prefix][i]] = v
@@ -3345,6 +3325,10 @@ def load_deduped_state_dict(
 
 def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List[int], dedup_group_size: int):
     if not state_indexes:
+        # A module that is inactive on this rank has no local optimizer states,
+        # but the trailing barrier is world-wide,
+        # so skipping it would pair later barriers with the wrong peers and hang.
+        torch.distributed.barrier()
         return
 
     rank = torch.distributed.get_rank()

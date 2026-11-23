@@ -678,6 +678,18 @@ the generated code in outdir will be removed EVEN IF the code generation fails i
 
 5. For `broadcast_strategy`, please note that the broadcast will only be done in `torchrun` environment, and will throw an error if `torch.distributed` is not initialized and `broadcast_strategy` is not `NONE`.
 
+6. A submodule can run on only the first plan ranks,
+for example a vision encoder that feeds the first pipeline stage of a language model.
+Keep `compute_config.plan_ngpus` equal to the full plan size shared by the other modules,
+and let the policy place all operators on plan ranks `0..k-1`,
+e.g. by planning with a reduced config: `fn(graph, dataclasses.replace(cfg, plan_ngpus=k), plans)`.
+On the other plan ranks the module has no parameters and `is_inactive_rank` is `True`.
+Still create it and pass it to `build_optimizer` on every rank,
+because gradient norm, checkpoint and communication-group setup are collective;
+only skip its forward.
+Each rank still needs at least one trainable parameter to build an optimizer.
+Inactive ranks are not supported when `use_end2end` is `True`.
+
 
 ## Optimizer Creation
 
