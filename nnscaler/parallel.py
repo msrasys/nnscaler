@@ -1811,13 +1811,23 @@ def build_optimizer(
                 non_parallel_parameters_dict[param] = None
     non_parallel_parameters = list(non_parallel_parameters_dict.keys())
 
+    # The locations index the merged optimizer state, which follows `module.parameters()` order
+    # but holds only trainable non-parallel parameters,
+    # and gives each ParallelModule all of its original parameters however many it holds locally.
+    # Local indices would differ across ranks (e.g. on inactive plan ranks)
+    # and frozen parameters would shift later states out of range.
     non_parallel_parameter_locs: Dict[torch.nn.Parameter, int] = {}
-    for idx, p in enumerate(module.parameters()):
-        # the order of parameters in module.parameters() is the same
-        # with the order of parameters in optimizer.param_groups[0]['params']
-        # NOTE: the parameter dedup is done in `module.parameters()`
-        if p in non_parallel_parameters_dict:
-            non_parallel_parameter_locs[p] = idx
+    idx = 0
+    for m in module.modules():
+        if isinstance(m, ParallelModule):
+            idx += len(m.origin_module_metadata.origin_param_names)
+            continue
+        for p in m.parameters(recurse=False):
+            # `non_parallel_parameters_dict` only holds trainable parameters,
+            # so frozen parameters take no location and do not advance `idx`.
+            if p in non_parallel_parameters_dict and p not in non_parallel_parameter_locs:
+                non_parallel_parameter_locs[p] = idx
+                idx += 1
 
     param_original_names = {}
     for n, p in module.named_parameters():
