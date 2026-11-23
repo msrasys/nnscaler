@@ -62,6 +62,10 @@ def _sole_owner_refcounts() -> Tuple[int, int]:
 _SOLE_OWNER_REFS, _SOLE_OWNER_BASE_REFS = _sole_owner_refcounts()
 # Set by `_check_release_storage` at import; False disables `release_storage`.
 _release_storage_enabled = _use_count is not None
+# Attribute `release_storage` sets on a tensor it released.
+# A backward pre-hook must hand such a tensor back as is,
+# see `Executor._apply_backward_pre_hook`.
+_RELEASED_TAG = '_nnscaler_storage_released'
 
 
 def debug_id(tensors, msg: str, rank: int):
@@ -318,13 +322,8 @@ class Executor:
                 dedup_output_tensor_grads.append(g)
 
         # apply hook before backward
-        if Executor._backward_pre_hook is not None:
-            input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
-                Executor._backward_pre_hook(
-                    input_tensors,
-                    dedup_output_tensors,
-                    dedup_output_tensor_grads
-                )
+        input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
+            Executor._apply_backward_pre_hook(input_tensors, dedup_output_tensors, dedup_output_tensor_grads)
 
         torch.autograd.backward(
             dedup_output_tensors,
@@ -394,13 +393,8 @@ class Executor:
                 dedup_output_tensors.append(tensor)
                 dedup_output_tensor_grads.append(grad)
 
-        if Executor._backward_pre_hook is not None:
-            input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
-                Executor._backward_pre_hook(
-                    input_tensors,
-                    dedup_output_tensors,
-                    dedup_output_tensor_grads,
-                )
+        input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
+            Executor._apply_backward_pre_hook(input_tensors, dedup_output_tensors, dedup_output_tensor_grads)
 
         if not input_tensors:
             Executor._weight_backward_states.setdefault(name, []).append(
@@ -524,6 +518,35 @@ class Executor:
                 # (complex, or an output that is float8 already)
                 dtype = torch.float8_e4m3fn if x.dtype.is_floating_point else x.dtype
                 x.data = torch.full((), float('nan'), dtype=dtype, device=x.device).expand(x.shape)
+            setattr(t, _RELEASED_TAG, True)
+
+    @staticmethod
+    def _apply_backward_pre_hook(input_tensors, output_tensors, output_tensor_grads):
+        """
+        Run the registered backward pre-hook and check that it kept every released output.
+
+        A tensor the hook builds on top of a released output (even a view) records
+        the float8 placeholder dtype in its new autograd node,
+        so backward from it would cast the incoming gradient to float8 and truncate it silently.
+        Reading values through such a tensor sees NaN.
+        A pipeline-internal output is already sent, so changing it can only change
+        the gradient flowing back; the hook should change `output_tensor_grads` instead.
+        """
+        if Executor._backward_pre_hook is None:
+            return input_tensors, output_tensors, output_tensor_grads
+        new_inputs, new_outputs, new_grads = Executor._backward_pre_hook(
+            input_tensors, output_tensors, output_tensor_grads)
+        for idx, old in enumerate(output_tensors):
+            if not getattr(old, _RELEASED_TAG, False):
+                continue
+            if idx >= len(new_outputs) or new_outputs[idx] is not old:
+                raise RuntimeError(
+                    f'The backward pre-hook replaced output {idx}, whose storage was released after it '
+                    f'was sent to the next pipeline stage. A hook must return released outputs unchanged '
+                    f'and adjust output_tensor_grads instead, or disable '
+                    f'ComputeConfig.pipeline_deallocate_outputs.'
+                )
+        return new_inputs, new_outputs, new_grads
 
     @staticmethod
     def sync_tensors(tensors: List[Any]) -> List[Any]:
@@ -549,12 +572,15 @@ class Executor:
             Users can only register one backward pre_hook. If there was a hook
             registered before, it will be overwritten.
 
-            With pipeline output deallocation (`ComputeConfig.pipeline_deallocate_outputs`)
+            With pipeline output deallocation (`ComputeConfig.pipeline_deallocate_outputs`),
             an output tensor other than the loss may already have had its storage
-            released by `Executor.release_storage` and only keeps its shape and
-            grad_fn (its dtype is then float8). The hook may replace or scale such
-            entries but must not read their values. The loss is a graph output and is never released, which is all the
-            built-in loss-scaling hook touches.
+            released by `Executor.release_storage`.
+            It then only keeps its shape and grad_fn, and its dtype is float8.
+            The hook must return such a tensor unchanged (the same object),
+            otherwise backward raises a RuntimeError;
+            to change what flows back, change its entry in output_tensor_grads.
+            The loss is a graph output and is never released,
+            which is all the built-in loss-scaling hook touches.
 
         Args:
             hook (Callable or None): the backward hook to be registered. The hook takes

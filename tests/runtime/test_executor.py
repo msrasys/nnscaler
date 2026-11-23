@@ -635,3 +635,57 @@ def test_release_storage_disabled_is_a_no_op(monkeypatch):
     assert out.untyped_storage().nbytes() == 4 * 3 * out.element_size()
     torch.autograd.backward([out], [torch.ones_like(out)])
     torch.testing.assert_close(x.grad, torch.full_like(x, 2.0))
+
+
+@release_storage_test
+@pytest.mark.parametrize('use_fbw', [False, True])
+@pytest.mark.parametrize('deallocate', [False, True])
+@pytest.mark.parametrize('hook', ['passthrough', 'scale_grads', 'view_outputs', 'scale_outputs'])
+def test_release_storage_backward_pre_hook_contract(hook, deallocate, use_fbw):
+    # A tensor derived from a released output records the float8 placeholder dtype,
+    # so backward from it would truncate the gradient silently;
+    # such a hook must fail loudly instead, while changing the grads keeps working.
+    if use_fbw and not _patch_torch.FBW_SUPPORTED:
+        pytest.skip('FBW is not supported by this torch version')
+
+    def backward_pre_hook(inputs, outputs, grads):
+        if hook == 'scale_grads':
+            grads = [g * 3.0 for g in grads]
+        elif hook == 'view_outputs':
+            outputs = [out.view_as(out) for out in outputs]
+        elif hook == 'scale_outputs':
+            outputs = [3.0 * out for out in outputs]
+        return inputs, outputs, grads
+
+    Executor.clear()
+    try:
+        x = torch.ones(4, requires_grad=True)
+        output = Executor.fexecute('stage', lambda t: t * 2.0, x)
+        # values float8 cannot represent: 1.001 and 1.01 round, 500 overflows
+        output_grad = torch.tensor([1.001, 1.01, 500.0, 1e-4])
+        Executor.register_backward_pre_hook(backward_pre_hook)
+        if deallocate:
+            Executor.release_storage(output)
+
+        def run():
+            if use_fbw:
+                grad = Executor.backward_input('stage', [x], [output], [output_grad], [])
+                Executor.backward_weight('stage', [])
+                return grad
+            return Executor.backward('stage', [x], [output], [output_grad])
+
+        if deallocate and hook == 'view_outputs':
+            # metadata-only ops succeed on the placeholder; the contract check catches them
+            with pytest.raises(RuntimeError, match='storage was released'):
+                run()
+            return
+        if deallocate and hook == 'scale_outputs':
+            # arithmetic already fails inside the hook, as float8 has no such kernel
+            with pytest.raises(NotImplementedError):
+                run()
+            return
+        expected = output_grad * 2.0 * (3.0 if hook in ('scale_grads', 'scale_outputs') else 1.0)
+        torch.testing.assert_close(run(), expected)
+        Executor.check_clear()
+    finally:
+        Executor.clear()
