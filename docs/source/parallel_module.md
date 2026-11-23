@@ -681,14 +681,42 @@ the generated code in outdir will be removed EVEN IF the code generation fails i
 6. A submodule can run on only the first plan ranks,
 for example a vision encoder that feeds the first pipeline stage of a language model.
 Keep `compute_config.plan_ngpus` equal to the full plan size shared by the other modules,
-and let the policy place all operators on plan ranks `0..k-1`,
-e.g. by planning with a reduced config: `fn(graph, dataclasses.replace(cfg, plan_ngpus=k), plans)`.
+and let the policy place all operators on plan ranks `0..k-1`.
+A policy does this by planning with a reduced copy of the config,
+and returning the planned graph:
+
+```python
+from dataclasses import replace
+from nnscaler.policies import fn, get_pas_ops, OpPlan
+
+def replicate(graph, cfg):
+    return (OpPlan(node) for node in get_pas_ops(graph))
+
+def first_rank_only(graph, cfg):
+    # place every operator on plan rank 0 only
+    return fn(graph, replace(cfg, plan_ngpus=1), replicate)
+
+# plan rank 0 of each scale unit (global ranks 0 and 2) runs the encoder
+encoder = parallelize(Encoder(), dummy_args, first_rank_only, ComputeConfig(2, 4), ...)
+```
+
+The inner policy can also partition operators across the first `k` plan ranks,
+e.g. `fn(graph, replace(cfg, plan_ngpus=2), tp_plans)` in a plan of 3 ranks.
+Only the call to `fn` uses the reduced config;
+the `ComputeConfig` passed to `parallelize` must keep the full plan size,
+because replica offsets and communication groups follow it.
 On the other plan ranks the module has no parameters and `is_inactive_rank` is `True`.
 Still create it and pass it to `build_optimizer` on every rank,
 because gradient norm, checkpoint and communication-group setup are collective;
-only skip its forward.
+only skip its forward:
+
+```python
+features = None if encoder.is_inactive_rank else encoder(pixels)
+```
+
 Each rank still needs at least one trainable parameter to build an optimizer.
-Inactive ranks are not supported when `use_end2end` is `True`.
+Inactive ranks are not supported when `use_end2end` is `True`,
+so the inner policy cannot assign pipeline stages either.
 
 
 ## Optimizer Creation
