@@ -186,6 +186,15 @@ class Executor:
         e.g. when one tensor object is fed to several micro-batches;
         You should pass each micro-batch its own tensor, or register again to start a new round.
 
+        Unlike an ordinary hook, a registration is one-shot:
+
+        - It fires at most once, in whichever backward completes its last consumer,
+          including a backward that another callback runs through ``Executor``;
+          any later backward skips it.
+        - A pending registration cannot be replaced: registering ``tensor`` again raises.
+          Registering it again after the callback fired starts a new round,
+          which collects only the consumers whose forward runs afterwards.
+
         Register the callback before the ``train_step`` of the module that consumes ``tensor``,
         with no other end-to-end module's ``train_step`` in between, or while that ``train_step`` runs.
         ``ParallelModule.train_step`` raises if any callback is still pending when it returns,
@@ -293,8 +302,12 @@ class Executor:
         ``grad_by_dtensor_id`` is None when the segment has no gradient roots,
         so it contributes no gradient.
         """
+        # Accumulate every registered input of the segment before firing any
+        # callback: a callback that runs another segment's backward through
+        # Executor may otherwise fire a callback this segment still owes a share to.
         # A repeated input shares one detached tensor whose grad already sums
         # all its uses; dict() collapses the repeats so it is counted once.
+        entries = []
         for tensor_id, dtensor in dict(saved_pairs).items():
             entry = Executor._input_grad_callbacks.get(tensor_id)
             if entry is None:
@@ -305,6 +318,13 @@ class Executor:
                     raise RuntimeError('segment did not produce a registered input gradient')
                 grad = grad.detach()
                 entry.grad = grad if entry.grad is None else entry.grad + grad
+            entries.append((tensor_id, entry))
+        for tensor_id, entry in entries:
+            # A registration fires at most once: an earlier callback may have run
+            # another segment's backward that already fired it, after which the
+            # tensor may even be registered again for a new round.
+            if Executor._input_grad_callbacks.get(tensor_id) is not entry:
+                continue
             # Another segment that consumed the tensor still owes its share.
             if any(
                 tid == tensor_id

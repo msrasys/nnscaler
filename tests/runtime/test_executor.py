@@ -458,6 +458,7 @@ def test_input_grad_callback_rejects_consumer_after_delivery():
     assert not Executor._delivered_input_grads
     Executor.check_clear()
 
+
 def test_custom_fbw_survives_reentrant_backward_in_callback():
     first = torch.tensor([3.0], requires_grad=True) * 1
     first.retain_grad()
@@ -477,6 +478,32 @@ def test_custom_fbw_survives_reentrant_backward_in_callback():
     # rather than write the retained grad the callback owns.
     assert first.grad is None
     Executor.check_clear()
+
+
+@pytest.mark.parametrize('split', [False, True])
+def test_input_grad_callback_accumulates_before_reentrant_backward(split):
+    first = torch.tensor([1.0], requires_grad=True) * 1
+    shared = torch.tensor([1.0], requires_grad=True) * 1
+    first_output = Executor.fexecute('first', lambda x, y: x * 2 + y * 3, first, shared)
+    second_output = Executor.fexecute('second', lambda y: y * 5, shared)
+    shared_grads = []
+
+    def run_second_segment(grad):
+        # Runs the other consumer of ``shared`` before the first segment
+        # has dispatched ``shared`` itself.
+        Executor.backward('second', [shared], [second_output], [torch.ones(1)])
+
+    Executor.register_input_grad_callback(first, run_second_segment)
+    Executor.register_input_grad_callback(shared, shared_grads.append)
+    if split:
+        Executor.backward_input('first', [first, shared], [first_output], [torch.ones(1)], [])
+        Executor.backward_weight('first', [])
+    else:
+        Executor.backward('first', [first, shared], [first_output], [torch.ones(1)])
+    # Both segments contribute before the shared callback fires, exactly once.
+    assert [grad.item() for grad in shared_grads] == [3.0 + 5.0]
+    Executor.check_clear()
+
 
 def test_check_input_grad_callbacks_fired_rejects_pending_callback():
     # E.g. registered on a rank whose pipeline stage never consumes the tensor.
