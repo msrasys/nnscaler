@@ -8,8 +8,11 @@ from functools import lru_cache
 
 import torch
 import os
+from pathlib import Path
 
 ENV_NAME = 'NNSCALER_DEEPEP_CONFIG'
+CONFIG_FIELDS = ('num_sms', 'nvl_chunk_size', 'nvl_buffer_size',
+                 'rdma_chunk_size', 'rdma_buffer_size')
 
 
 def validate_configs(configs, max_sms):
@@ -24,6 +27,10 @@ def validate_configs(configs, max_sms):
             raise ValueError('Each EP size requires exactly dispatch and combine')
         converted = {}
         for operation, values in pair.items():
+            if isinstance(values, dict):
+                if set(values) != set(CONFIG_FIELDS):
+                    raise ValueError(f'DeepEP named configs require exactly {CONFIG_FIELDS}')
+                values = [values[field] for field in CONFIG_FIELDS]
             if not isinstance(values, (list, tuple)) or len(values) != 5:
                 raise ValueError('DeepEP configs contain five integers: SMs, NVL send/receive, RDMA send/receive')
             if any(type(value) is not int or value <= 0 for value in values):
@@ -40,6 +47,17 @@ def validate_configs(configs, max_sms):
             raise ValueError('Dispatch and combine must use the same NVL receive capacity')
         result[ranks] = converted
     return result
+
+
+def configure_from_file(path):
+    """Load explicit runtime settings before any DeepEP buffer is initialized.
+
+    Accept either five-value arrays or the named fields used by training job
+    files. The device's actual SM limit is checked when the config is consumed.
+    """
+    configs = validate_configs(json.loads(Path(path).read_text()), float('inf'))
+    os.environ[ENV_NAME] = json.dumps(configs)
+    return configs
 
 
 @lru_cache(maxsize=8)
