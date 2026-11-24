@@ -168,3 +168,38 @@ def test_combined_configuration_roundtrip_preserves_every_switch(tmp_path, monke
         assert ComputeConfig.safe_equals(config, loaded)
         assert all(not ComputeConfig.safe_equals(old, loaded) for old in previous)
         previous.append(loaded)
+
+
+class SingletonModel(torch.nn.Module):
+    def forward(self, x):
+        return torch.tanh(x)
+
+
+@replace_all_device_with('cpu', force=True)
+@pytest.mark.parametrize('enabled', [False, True])
+def test_single_op_recompute_preserves_deployed_default(tmp_path, monkeypatch, enabled):
+    import nnscaler.runtime.checkpoint as checkpoint_runtime
+
+    def policy(graph, cfg):
+        return fn(graph, cfg, lambda *_: [
+            OpPlan(op, stage_id=0, recompute_id=index)
+            for index, op in enumerate(get_pas_ops(graph))])
+    x = torch.randn(4, 8, requires_grad=True)
+    instance = f'singleton_{enabled}'
+    parallelize(SingletonModel(), {'x':x.detach().requires_grad_()}, policy,
+                ComputeConfig(1,1,recompute_single_ops=enabled),
+                gen_savedir=tmp_path, instance_name=instance, load_module=False)
+    cls = _load_parallel_module_class(SingletonModel, gen_savedir=tmp_path,
+                                      instance_name=instance, rank=0)
+    generated = new_empty(cls, device='cpu', init_params=True)
+    original = checkpoint_runtime.checkpoint
+    calls = []
+    def observed(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(checkpoint_runtime, 'checkpoint', observed)
+    result = generated(x)
+    result.sum().backward()
+    torch.testing.assert_close(result, torch.tanh(x))
+    torch.testing.assert_close(x.grad, 1-torch.tanh(x.detach()).square())
+    assert len(calls) == int(enabled)

@@ -91,7 +91,7 @@ from nnscaler.utils import (
 logger = logging.getLogger(__name__)
 
 # Metadata emitted by this compiler, independently of a caller's saved config.
-_TRACE_METADATA_VERSION = 4
+_TRACE_METADATA_VERSION = 5
 
 
 _PREDEFINE_SCHEDS: Dict[str, Callable[[IRGraph, int, int], SchedulePlan]] = {}
@@ -250,12 +250,16 @@ class ComputeConfig:
 
     # Compose selected checkpoint regions in OpPlan policies after resolution.
     recompute_merge_adjacent: bool = False
+    # Keep the deployed PAS behavior unless single-op checkpoints are selected.
+    recompute_single_ops: bool = False
 
     def __post_init__(self):
         if type(self._trace_metadata_version) is not int or self._trace_metadata_version < 0:
             raise ValueError('_trace_metadata_version must be a nonnegative integer')
         if type(self.recompute_merge_adjacent) is not bool:
             raise ValueError('recompute_merge_adjacent must be a bool')
+        if type(self.recompute_single_ops) is not bool:
+            raise ValueError('recompute_single_ops must be a bool')
         if isinstance(self.cpu_offload, dict):
             super().__setattr__('cpu_offload', CPUOffloadConfig(**self.cpu_offload))
         elif self.cpu_offload is not None and not isinstance(self.cpu_offload, CPUOffloadConfig):

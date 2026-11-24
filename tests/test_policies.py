@@ -343,7 +343,8 @@ def test_plan_transform_observes_resolved_layout_before_activation_grouping(tmp_
         return plans
     def policy(graph, cfg):
         return fn(graph, cfg, megatron_ffn_policy_auto, plan_transform=transform)
-    parallelize(FnPolicyModule(), {'x': torch.randn(2,4)}, policy, ComputeConfig(2,2),
+    parallelize(FnPolicyModule(), {'x': torch.randn(2,4)}, policy,
+                ComputeConfig(2,2,recompute_single_ops=True),
                 gen_savedir=tmp_path, load_module=False)
     assert observed
     assert _gencode_contains(tmp_path, FnPolicyModule, 0, r'ckpt\.checkpoint\(')
@@ -2093,6 +2094,6 @@ def single_operation_checkpoint_policy(graph, cfg):
 @replace_all_device_with('cpu')
 def test_explicit_single_operation_checkpoint_is_emitted(tmp_path):
     parallelize(SingleOperationCheckpointModule(), {'x': torch.randn(8, 8)},
-                single_operation_checkpoint_policy, ComputeConfig(1, 1),
+                single_operation_checkpoint_policy, ComputeConfig(1, 1, recompute_single_ops=True),
                 gen_savedir=tmp_path, load_module=False)
     assert _gencode_contains(tmp_path, SingleOperationCheckpointModule, 0, r'ckpt\.checkpoint\(')

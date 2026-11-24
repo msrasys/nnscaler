@@ -57,6 +57,7 @@ def _policy(base, merge, reports, degree=1):
 
 
 def _compile_pair(tmp_path, model, base, config, *, inputs=None, degree=1, **kwargs):
+    config = replace(config, recompute_single_ops=True)
     inputs = inputs if inputs is not None else {'x': torch.randn(4, 8, requires_grad=True)}
     codes, reports = {}, []
     for merge in (False, True):

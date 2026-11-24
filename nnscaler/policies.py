@@ -1430,6 +1430,8 @@ def fn(
 
     # set recompute groups
     for group in recompute_groups.values():
+        if len(group) <= 1 and not (cfg.recompute_single_ops or cfg.recompute_merge_adjacent):
+            continue
         graph.recompute(group)
 
     for group in offload_groups.values():
