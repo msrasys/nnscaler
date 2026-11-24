@@ -50,3 +50,8 @@ configuration/policy suite 570 passed; the generated eight-combination CPU
 semantic matrix plus stream-boundary checks 10 passed/8 CUDA-skipped;
 DeepEP configuration follow-up 21 passed. CPU stream serialization tests
 validate graph/autograd composition, not CUDA concurrency.
+
+Checkpoint follow-up: all eight CPU combinations also pass a saved model and
+Adam-state round trip followed by another update; configuration serialization
+preserves every feature switch. CUDA concurrency/resume checks are collected
+but remain gated on overlap chat completion.

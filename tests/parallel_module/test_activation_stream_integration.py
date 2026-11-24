@@ -65,11 +65,35 @@ def compare_gradients(generated, reference, x):
     actual, expected = generated(x), reference(reference_x)
     actual.square().sum().backward()
     expected.square().sum().backward()
+    if torch.distributed.is_initialized():
+        generated.sync_grad()
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(x.grad, reference_x.grad)
     for name, parameter in generated.named_parameters():
         torch.testing.assert_close(
             parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+
+
+def checkpoint_roundtrip(generated, path, device):
+    optimizer = torch.optim.Adam(generated.parameters(), lr=1e-3)
+    optimizer.step()
+    torch.save({'model': generated.state_dict(), 'optimizer': optimizer.state_dict()}, path)
+    restored = (new_empty(type(generated), device=device, init_params=True)
+                if device == 'cpu' else type(generated)(init_params=True))
+    restored_optimizer = torch.optim.Adam(restored.parameters(), lr=1e-3)
+    saved = torch.load(path, map_location=device, weights_only=False)
+    restored.load_state_dict(saved['model'])
+    restored_optimizer.load_state_dict(saved['optimizer'])
+    x = torch.linspace(-1, 1, 32, device=device).reshape(4, 8)
+    for model, optim in ((generated, optimizer), (restored, restored_optimizer)):
+        optim.zero_grad(set_to_none=True)
+        model(x).square().sum().backward()
+        if torch.distributed.is_initialized():
+            model.sync_grad()
+        optim.step()
+    for actual, expected in zip(generated.parameters(), restored.parameters()):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(optimizer.state_dict(), restored_optimizer.state_dict(), rtol=0, atol=0)
 
 
 @replace_all_device_with('cpu', force=True)
@@ -88,6 +112,7 @@ def test_joint_features_cpu_semantics(tmp_path, monkeypatch, merge, offload, str
                                       instance_name=instance, rank=0)
     generated = new_empty(cls, device='cpu', init_params=True)
     compare_gradients(generated, reference, x)
+    checkpoint_roundtrip(generated, tmp_path / 'resume.pt', 'cpu')
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
@@ -107,6 +132,7 @@ def test_joint_features_cuda(tmp_path, merge, offload, streams):
             configuration(merge, offload, streams), gen_savedir=tmp_path,
             instance_name=f'combined_cuda_{int(merge)}{int(offload)}{int(streams)}')
         compare_gradients(generated, reference, x)
+        checkpoint_roundtrip(generated, tmp_path / 'resume.pt', 'cuda')
         torch.cuda.synchronize()
     finally:
         nnscaler.uninit()
@@ -126,3 +152,17 @@ def test_merge_keeps_distinct_stream_invocations(different_call):
         plans, region_key=lambda nodes: recompute_region_key(nodes, rules))
     assert [plan.recompute_id for plan in merged] == [0, 1, 1]
     assert report['barriers']['scheduling'] == 1
+
+
+def test_combined_configuration_roundtrip_preserves_every_switch(tmp_path, monkeypatch):
+    previous = []
+    for bits in product((False, True), repeat=3):
+        config = configuration(*bits)
+        path = tmp_path / (''.join(str(int(bit)) for bit in bits) + '.pt')
+        ComputeConfig.safe_dump_to_file(config, path)
+        # A caller's current defaults cannot silently enable saved-off features.
+        monkeypatch.setenv('NNSCALER_MODULE_STREAMS', '[{"module":"unexpected"}]')
+        loaded = ComputeConfig.safe_load_from_file(path, return_none_on_error=False)
+        assert ComputeConfig.safe_equals(config, loaded)
+        assert all(not ComputeConfig.safe_equals(old, loaded) for old in previous)
+        previous.append(loaded)
