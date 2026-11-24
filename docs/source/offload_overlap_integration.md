@@ -55,3 +55,12 @@ Checkpoint follow-up: all eight CPU combinations also pass a saved model and
 Adam-state round trip followed by another update; configuration serialization
 preserves every feature switch. CUDA concurrency/resume checks are collected
 but remain gated on overlap chat completion.
+
+The combined compiler uses trace metadata version 4. Packages generated before
+activation/stream integration are regenerated even when their individual
+feature settings happen to match, preserving the deployed lifetime fixes.
+
+CUDA component validation: 104 tests passed, including all eight combinations
+and model/Adam checkpoint continuation. The first test attempt incorrectly
+loaded Adam's CPU step scalar onto CUDA; loading the checkpoint on CPU and
+letting optimizer.load_state_dict place each value fixed the test.

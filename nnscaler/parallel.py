@@ -91,7 +91,7 @@ from nnscaler.utils import (
 logger = logging.getLogger(__name__)
 
 # Metadata emitted by this compiler, independently of a caller's saved config.
-_TRACE_METADATA_VERSION = 3
+_TRACE_METADATA_VERSION = 4
 
 
 _PREDEFINE_SCHEDS: Dict[str, Callable[[IRGraph, int, int], SchedulePlan]] = {}
