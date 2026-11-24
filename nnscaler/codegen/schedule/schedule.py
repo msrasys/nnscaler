@@ -95,13 +95,16 @@ class ScheduleCodeGen(FuncEmission):
             n.cell if isinstance(n, ExeReuseCell) else n, IRSegment)]
         action_positions = {id(node): index for index, node in enumerate(compute_nodes)}
         activation_entries = ()
+        activation_backward_positions = ()
         if use_scheduler:
             actions = []
             for node in compute_nodes:
                 segment = node.cell if isinstance(node, ExeReuseCell) else node
                 forward = segment if segment.isfw() else segment.mirror
                 actions.append((self._activation_scope_key(node), node.isfw(), self._has_activation_offload(forward)))
-            activation_entries = ActivationSchedulePlan.from_actions(actions).entries()
+            activation_plan = ActivationSchedulePlan.from_actions(actions)
+            activation_entries = activation_plan.entries()
+            activation_backward_positions = activation_plan.backward_positions
         send_bundle_ranges = self._collect_send_bundle_ranges(device_nodes, device_map) \
             if use_scheduler else {}
 
@@ -343,7 +346,8 @@ class ScheduleCodeGen(FuncEmission):
             code = f'return {outputs}'
             _append_code(fb, code, force_flush=True)
             if activation_entries:
-                with Block(f'with model.activation_offload_schedule({activation_entries!r}) as _activation_schedule:') as scope:
+                with Block(f'with model.activation_offload_schedule({activation_entries!r}, '
+                           f'backward_positions={activation_backward_positions!r}) as _activation_schedule:') as scope:
                     scope.insert_body(fb.code[1:])
                 fb.code[1:] = scope.code
 

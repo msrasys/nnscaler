@@ -102,6 +102,36 @@ OpPlan(op=node, partition=None, recompute_id=-1, offload_id=-1, stage_id=-1)
 *   **`pre_hook` / `post_hook`**:
     *   You can attach custom Python functions to be executed before or after the operator. See source code for signature details.
 
+### Composing adjacent recompute regions
+
+Enable `ComputeConfig(recompute_merge_adjacent=True)` for an `OpPlan` policy:
+
+```python
+from nnscaler import ComputeConfig
+from nnscaler.policies import fn
+
+config = ComputeConfig(6, 6, recompute_merge_adjacent=True)
+
+def policy(graph, config):
+    return fn(graph, config, operator_policy)
+```
+
+`fn` runs the pass after layout resolution and any `plan_transform`, reusing the
+resolved layout summaries. The option participates in generated-code cache
+checks. Policies returning a finished `IRGraph` remain responsible for their own
+transformations. Old trace metadata versions require regeneration.
+
+The pass joins maximal compatible chains of already selected checkpoints. It
+preserves stage, forward slices, gradient reductions, offload selection, known
+effects and hooks. External producers are checked too. Original head/tail
+trimming leaves gaps; unselected operations are never absorbed.
+
+For `h = checkpoint(norm, x); y = checkpoint(attention, h)`, composition emits
+one checkpoint that saves `x` and reconstructs `h`. External consumers still get
+required outputs. Opaque operations retain the caller's checkpoint replay
+contract; absence of known effects is not a purity proof. Larger regions may
+increase the transient backward working set, so check memory on the target model.
+
 ### Example: Custom Partitioning and Recomputation
 
 This example demonstrates how to:

@@ -1619,9 +1619,9 @@ class ParallelModule(CubeModule):
     def activation_offload_scope(self, key=None, *, immediate_backward=False, backward_distance=None, pipeline=False):
         return self._get_activation_offload_manager().scope(key, immediate_backward, backward_distance, pipeline)
 
-    def activation_offload_schedule(self, entries):
+    def activation_offload_schedule(self, entries, *, backward_positions=None):
         """Use actual local F/B positions, with runtime-configurable lookahead."""
-        return self._get_activation_offload_manager().schedule(entries)
+        return self._get_activation_offload_manager().schedule(entries, backward_positions=backward_positions)
 
     def prefetch_activation(self, key):
         self._get_activation_offload_manager().prefetch(key)

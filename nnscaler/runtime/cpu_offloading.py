@@ -263,8 +263,8 @@ class ActivationOffloadManager(ActivationStore):
         return True
 
     @contextmanager
-    def schedule(self, entries):
-        plan = ActivationSchedulePlan(entries)
+    def schedule(self, entries, *, backward_positions=None):
+        plan = ActivationSchedulePlan(entries, backward_positions=backward_positions)
         previous_deferred = self.deferred_commits
         deferred = (DeferredCommitQueue(self) if self.config.d2h_launch_phase == 'backward' else None)
         self.deferred_commits = deferred
@@ -272,11 +272,12 @@ class ActivationOffloadManager(ActivationStore):
         for use in plan.uses:
             backward_keys.setdefault(use.backward, []).append(use.key)
         launched = set()
+        backward_windows = frozenset(plan.backward_positions)
         def before_action(position):
-            if position not in backward_keys or position in launched:
+            if position not in backward_windows or position in launched:
                 return
             protected = set()
-            for key in backward_keys[position]:
+            for key in backward_keys.get(position, ()):
                 scope = self.scopes.get(key)
                 if scope is not None:
                     protected.update(record.uid for group in scope.groups for ref in group.records

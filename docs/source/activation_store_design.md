@@ -51,57 +51,6 @@ Saved-tensor hooks use the same storage path without creating gradient anchors.
   runtime configurations. Full-model throughput does not establish transport
   efficiency by itself.
 
-## Validation boundaries
-
-Transport batches share immutable completion fences within a common producer
-readiness group; restore fences retain the original backward consumer groups.
-An early ready value must not wait for a later producer or consumer group. A fence
-is published only after its CUDA event has been recorded: a different autograd
-thread must never wait on an unrecorded event. Pool reaping queries a shared
-fence once per pass, and consecutive loads on the same consumer stream omit
-redundant waits. Storage identities and version checks remain per saved value.
-
-`backpressure_mode="host"` retains the legacy `max_inflight_bytes` admission
-threshold. `"stream"` uses that threshold for CUDA execution pacing and requires
-an independent, positive `max_pending_bytes` at least as large. CUDA waits retire
-execution credits only; physically unfinished submitted source bytes remain
-charged until their completion is observed. The host still waits at the pending
-threshold to bound memory. Admission may overshoot by one indivisible batch.
-Uncommitted forward saves, other GPU owners and allocator cache are separate
-from these submitted-source counters; use the physical batch target and actual
-GPU memory measurements as well. This is not an unlimited background queue.
-
-The reference ideas were group completion fences and stream-side pacing in
-Megatron Core's `fine_grained_activation_offload.py`. This implementation keeps
-NNScaler's own storage/version and host-budget contracts; it does not resize
-user storages or assume all views can be discarded. No Megatron code was copied.
-
-Host submission and GPU execution are distinct. The calling thread prepares host
-buffers and submits CUDA copy operations; there is no dedicated CPU copy worker.
-The D2H and H2D streams run transfers asynchronously, and the queues track their
-ownership, readiness and byte budgets. A logical batch shares completion fences
-where dependencies permit; it can still contain several storage copies or DMA
-chunks. It does not concatenate a stage into another GPU staging tensor. GPU-side
-pacing avoids a host wait at the soft limit; the separate hard pending limit can
-still block submission to bound unfinished source allocations.
-
-The optional checkpoint-input submission adapter observes weak references to
-the saved-value tokens created by that invocation. Shared storage can still be
-owned by another region or explicit handle; those owners must not make a
-checkpoint that needs no replay keep submitting unused inputs. The observation
-changes only the next call's submission timing, never which values autograd
-retains. A dynamic branch that starts needing replay remains correct through
-ordinary region-exit submission.
-
-CPU checks cover configuration, ownership, exceptional exits and gradient-edge
-semantics. CUDA checks must additionally cover views, version violations, delayed
-streams, multiple producer/consumer streams, repeated eviction, shared budgets
-and non-leaking teardown. Numerical checks compare input and parameter gradients.
-Independent transfer probes report CPU submission time, event/copy counts, GPU
-copy intervals, requested/allocated memory and fallbacks; they do not label a
-transfer hidden solely because it overlaps a communication kernel.
-
-Opaque writes without version updates remain unsupported. Arbitrary external
-Python caches need to adopt handles explicitly; this is not transparent GPU
-virtual memory. A graph adapter may automate adoption only when it can establish
-the corresponding data-use and ownership boundaries.
+The [API contract](cpu_activation_offload.md) defines mutation, ownership and
+budget rules. [Action scheduling](activation_action_schedule.md) defines producer
+readiness, transfer windows and completion-fence ordering.

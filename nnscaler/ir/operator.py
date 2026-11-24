@@ -29,6 +29,7 @@ class IRFwOperation(IRCell):
         """
         # recompute schedule
         self._recompute = None
+        self._recompute_barriers: Tuple[str, ...] = ()
         self._offload = None
         self._constant_foldable = constant_foldable
         super().__init__(name, signature, len(inputs), num_outputs)
@@ -109,6 +110,23 @@ class IRFwOperation(IRCell):
         if isinstance(group_id, int) and self._recompute is not None:
             assert self._recompute == group_id, "The operator is set to recompute in another recompute group."
         self._recompute = group_id
+
+    @property
+    def recompute_barriers(self) -> Tuple[str, ...]:
+        """Known facts preventing checkpoint-region composition.
+
+        An empty tuple means no barrier has been recorded; it is not a proof
+        of purity or permission to select this operation for recomputation.
+        The fallback supports graphs serialized before this field existed.
+        """
+        return getattr(self, '_recompute_barriers', ())
+
+    @recompute_barriers.setter
+    def recompute_barriers(self, barriers: Tuple[str, ...]):
+        if (not isinstance(barriers, tuple)
+                or any(not isinstance(reason, str) or not reason for reason in barriers)):
+            raise TypeError('recompute_barriers must be a tuple of nonempty strings')
+        self._recompute_barriers = tuple(dict.fromkeys(barriers))
 
     @property
     def offload(self) -> Optional[int]:

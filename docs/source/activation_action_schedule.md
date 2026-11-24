@@ -16,6 +16,7 @@ number, optimizer step, or a guessed reverse-forward order.
 | `commit_batch_bytes` | Physical D2H batch target; also enables early scope flush at closed region boundaries; one indivisible storage may exceed it | `0` (disabled) |
 | `copy_chunk_bytes` | Maximum DMA-call size; does not split tensor ownership or bound total GPU allocations | `0` (one copy per storage) |
 | `pipeline_prefetch_steps` | Start up to N local F/B actions before the consuming backward, once its forward scope has closed | `1` |
+| `prefetch_trigger` | `all` permits any local F/B boundary; `backward` permits boundaries before/after backward actions, including scopes without offload | `all` |
 | `max_prefetch_bytes` | Shared speculative reload-byte window; independent of lookahead distance | 512 MiB |
 | `max_inflight_bytes` | D2H queue threshold before admitting the next complete transfer batch | 512 MiB |
 | `scope_prefetch_groups` | Backward-entry group window when using group mode | `1` |
@@ -35,6 +36,9 @@ The application exposes `--offload_transfer_unit`, `--offload_forward_commit_uni
 The generated program records `(scope key, forward action, backward action)` for
 each eligible local scope. Keys include the virtual segment and microbatch. A
 small runtime cursor applies the configured distance to this actual order.
+The plan separately records all local backward positions. An unselected backward
+is still a valid transfer opportunity for a later selected consumer. Filtering
+offload regions must not remove these scheduling opportunities.
 
 For a backward at position B with producer F, the desired trigger is before
 `max(0, B-N)`. If that point precedes forward completion, it is clipped to after
@@ -44,6 +48,10 @@ retries before/after subsequent actions while the target is
 within the window. It never requests values from an unfinished forward scope.
 Hints before compute precede that action's receive waits; after-action retries
 follow scheduled data-reference release.
+With `prefetch_trigger='backward'`, after-backward hints retry within the same
+target window as the preceding before-backward hint; they do not extend the
+lookahead by another action. In an alternating F/B schedule, two local actions
+of lookahead reach the preceding backward's entry, while one may not.
 
 For example, consider local actions `F(a0), F(b0), F(a1), B(a0), F(b1), B(b0),
 B(a1), B(b1)`. With N=1, `a0` first prefetches before `F(a1)`. With N=4, its first
@@ -143,12 +151,14 @@ also apply. Regenerate existing code to use the checkpoint submission adapter.
 ### Launching D2H in backward compute windows
 
 `d2h_launch_phase='backward'` queues completed pipeline forward scopes and
-launches up to `d2h_scopes_per_backward` scopes before each eligible local B
+launches up to `d2h_scopes_per_backward` scopes before each local B
 action. It requires `forward_commit_unit='scope'` and positive
 `max_pending_bytes`. H2D lookahead and its byte window remain independent.
 This can avoid forward CPU rendezvous that prevent compute submission while
 transfers are running. It is an opt-in scheduling choice, not a throughput
 guarantee; it retains forward sources longer than immediate submission.
+Backward actions with no offloaded inputs also launch pending transfers. The
+current consumer's records remain protected at selected backward actions.
 
 The pending-source budget counts deferred sources plus physically unfinished
 D2H copies. Closed regions are admission points even while collecting a larger
@@ -190,9 +200,10 @@ their data until actual consumers release them. The generic store remains
 responsible for versions, streams, pinned budgets and alias-safe reclamation.
 
 Generated schedules must be regenerated once for this API. The generated
-activation API is version 2, including the checkpoint submission adapter.
-Version 1 has F/B scheduling but calls checkpoint directly; configurations
-without an ABI field load as version 0. Both older versions invalidate generated
+activation API is version 3, including all backward transfer opportunities.
+Version 2 has the checkpoint submission adapter but omits unselected backward
+positions. Version 1 has F/B scheduling but calls checkpoint directly;
+configurations without an ABI field load as version 0. These older versions invalidate generated
 code while leaving the raw trace reusable. Direct use reports that regeneration
 is required. Existing config imports and non-pipeline group behavior remain
 supported.
@@ -212,13 +223,4 @@ F/B order using the real adapter. It checks full-byte transfers, checksums and
 empty pools after every iteration. `--sync-actions` optionally waits only for
 each compute action to finish, leaving independent transfers in flight; this
 makes the available action window explicit. These are controlled synthetic
-actions, not full-model throughput. Timing, GPU peaks and trace evidence belong
-to the accompanying validation results, not to an assumption that more lookahead
-always helps.
-
-Correctness, lookahead/byte-window measurements and resource records are in the
-[F/B action validation report](activation_action_validation_20261030.md).
-The independent submission/chunk/timing changes were added afterwards; the
-October 30 performance measurements do not measure those new opt-in modes.
-Their CPU results and pending CUDA checks are listed in the
-[submission validation record](activation_submission_validation_20261031.md).
+actions, not full-model throughput. Compare equal work and record physical memory peaks when tuning lookahead.

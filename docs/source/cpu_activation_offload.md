@@ -1,19 +1,6 @@
 # CPU activation offloading
 
-An [equal-work component validation](activation_store_overlap_20261102.md)
-compares overlapped transfers with a compute-only reference and measures the
-batch-size tradeoff under fixed bytes, computation and NUMA placement.
-
-Pipeline scheduling now uses configurable local virtual-stage F/B units. See
-[action-unit scheduling](activation_action_schedule.md) for lookahead distance,
-producer-readiness clipping, retry priority and the scope/group choice. Existing
-generated schedules need regeneration to use the new scheduling ABI.
-
-The October 30 store/adapter refactor has passed CPU and CUDA correctness checks;
-see the [architecture validation](activation_store_validation_20261030.md).
-Independent transfer probes have also completed; see the
-[runtime performance validation](activation_store_performance_20261030.md).
-Full-model numbers linked below measure the October 29 implementation.
+See [action-unit scheduling](activation_action_schedule.md) for pipeline lookahead and transfer granularity.
 
 The [storage architecture](activation_store_design.md) separates host memory,
 CUDA transport, saved-value ownership and graph/autograd adapters. An explicit
@@ -215,14 +202,7 @@ Bridged inputs must remain immutable, and custom operators must support a
 non-leaf input view. Normal alias ownership and CUDA stream lifetimes remain
 intact. Outside references, including a caller's tensor or a Vision callback,
 can still keep the allocation alive. This does not promise that every pipeline
-input will leave the GPU. The preceding implementation passed CUDA ownership,
-PP/VPP and full-model checks. The October 29 API separation has CPU coverage for
-configuration migration, code generation with offload/lifetime independently
-enabled, outer backward and ownership. The refactor has since passed runtime,
-PP/VPP and Vision GPU correctness checks.
-The October 29 implementation passed full-model 64-step local VL comparisons; see the
-[application benchmark report](https://github.com/msrallm/llm-train/blob/yileiyang/cpu_offloading/docs/activation-offload-results/20261029/FINAL_REPORT.md)
-for the tested configurations and CPU/GPU measurements.
+input will leave the GPU.
 
 ### Experimental pipeline output release
 

@@ -50,8 +50,9 @@ class CPUOffloadConfig:
     # disables cross-action lookahead; group/current-backward refill remains.
     pipeline_prefetch_steps: int = 1
     # Generated activation API: 1 added F/B action scheduling; 2 routes
-    # checkpoints through their saved-tensor adapter. Missing legacy ABI is 0.
-    _schedule_version: int = 2
+    # checkpoints through their saved-tensor adapter; 3 includes unselected
+    # backward transfer opportunities. Missing legacy ABI is 0.
+    _schedule_version: int = 3
     # Appended to retain the original positional constructor field order.
     # host bounds CPU admission; stream separates GPU execution pacing from
     # the actual unfinished submitted-source limit in max_pending_bytes.

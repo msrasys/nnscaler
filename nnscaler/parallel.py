@@ -86,6 +86,9 @@ from nnscaler.utils import (
 
 logger = logging.getLogger(__name__)
 
+# Metadata emitted by this compiler, independently of a caller's saved config.
+_TRACE_METADATA_VERSION = 3
+
 
 _PREDEFINE_SCHEDS: Dict[str, Callable[[IRGraph, int, int], SchedulePlan]] = {}
 _PREDEFINED_INFERENCE_SCHEDS = ['infer_pipe']
@@ -229,7 +232,19 @@ class ComputeConfig:
     # final data read. Independent of activation offload and input-gradient slots.
     release_pipeline_outputs: bool = False
 
+    # Version of metadata recorded in the serialized forward trace. Increment
+    # when old graph dumps lack facts needed by current graph transformations.
+    # Append it to preserve existing positional arguments (including Python 3.9).
+    _trace_metadata_version: int = _TRACE_METADATA_VERSION
+
+    # Compose selected checkpoint regions in OpPlan policies after resolution.
+    recompute_merge_adjacent: bool = False
+
     def __post_init__(self):
+        if type(self._trace_metadata_version) is not int or self._trace_metadata_version < 0:
+            raise ValueError('_trace_metadata_version must be a nonnegative integer')
+        if type(self.recompute_merge_adjacent) is not bool:
+            raise ValueError('recompute_merge_adjacent must be a bool')
         if isinstance(self.cpu_offload, dict):
             super().__setattr__('cpu_offload', CPUOffloadConfig(**self.cpu_offload))
         elif self.cpu_offload is not None and not isinstance(self.cpu_offload, CPUOffloadConfig):
@@ -364,6 +379,7 @@ class ComputeConfig:
             'inference_only': self.inference_only, # there will be no backward nodes in the graph in inference mode
             'end2end_mode': self.use_end2end,  # end2end_mode can affect the graph generation.
             'trace_strategy': self.trace_strategy,  # different strategy might lead to different graph
+            '_trace_metadata_version': vars(self).get('_trace_metadata_version', 0),
         }
 
     @property
@@ -430,12 +446,19 @@ class ComputeConfig:
         if Path(file).exists():
             try:
                 cfg = torch.load(file, weights_only=False)
+                # A legacy object can see the new dataclass default through
+                # attribute lookup/asdict even though it never saved this field.
+                raw_fields = vars(cfg) if isinstance(cfg, cls) else cfg
+                legacy_trace_metadata = (isinstance(raw_fields, dict)
+                                         and '_trace_metadata_version' not in raw_fields)
                 raw_cpu = cfg.cpu_offload if isinstance(cfg, cls) else cfg.get('cpu_offload') if isinstance(cfg, dict) else None
                 legacy_activation_schedule = (raw_cpu is not None and '_schedule_version' not in
                                               (raw_cpu if isinstance(raw_cpu, dict) else vars(raw_cpu)))
                 if isinstance(cfg, cls):
                     cfg = asdict(cfg)
                 if isinstance(cfg, dict): # in old version, we save the object directly (not save as dict)
+                    if legacy_trace_metadata:
+                        cfg['_trace_metadata_version'] = 0
                     if legacy_activation_schedule:
                         cpu_fields = cfg['cpu_offload']
                         if not isinstance(cpu_fields, dict):
@@ -462,8 +485,10 @@ class ComputeConfig:
         """
         try:
             if isinstance(a, cls) and isinstance(b, cls):
-                a = replace(a, user_config=_user_config_for_reuse(a.user_config))
-                b = replace(b, user_config=_user_config_for_reuse(b.user_config))
+                a = replace(a, user_config=_user_config_for_reuse(a.user_config),
+                            _trace_metadata_version=vars(a).get('_trace_metadata_version', 0))
+                b = replace(b, user_config=_user_config_for_reuse(b.user_config),
+                            _trace_metadata_version=vars(b).get('_trace_metadata_version', 0))
             return a == b
         except AttributeError:
             logger.warning("Failed to compare ComputeConfig. They are incompatible.")
@@ -772,8 +797,10 @@ def _prepare_and_check_reusable(
     reusable = False
     config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
     old_config: Optional[ComputeConfig] = ComputeConfig.safe_load_from_file(config_file)
-    is_config_match = ComputeConfig.safe_equals(old_config, compute_config)
-    is_graph_config_match = old_config is not None and old_config.graph_config == compute_config.graph_config
+    current_trace_metadata = (old_config is not None
+                              and old_config._trace_metadata_version == _TRACE_METADATA_VERSION)
+    is_config_match = current_trace_metadata and ComputeConfig.safe_equals(old_config, compute_config)
+    is_graph_config_match = current_trace_metadata and old_config.graph_config == compute_config.graph_config
     trace_meta_files = [
         outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
         outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE,
@@ -1542,6 +1569,11 @@ def parallelize(
         (inspect.isclass(module_or_module_class) and issubclass(module_or_module_class, CubeModule))
     ):
         raise RuntimeError("Old style CubeModule is not supported")
+
+    # This version describes this compiler's output, not a user setting. A
+    # loaded legacy config must retrace once, then save a reusable current graph.
+    if vars(compute_config).get('_trace_metadata_version', 0) != _TRACE_METADATA_VERSION:
+        compute_config = replace(compute_config, _trace_metadata_version=_TRACE_METADATA_VERSION)
 
     if isinstance(pas_policy, str):
         if not pas_policy in _PREDEFINED_POLICIES:

@@ -631,6 +631,37 @@ def test_codegen_fn_pipeline_input_references_are_opt_in(tmp_path, release_input
                 assert sorted(before) == sorted(after) == list(range(len(before)))
 
 
+@replace_all_device_with('cpu')
+def test_codegen_sparse_offload_preserves_all_backward_windows(tmp_path):
+    import ast
+    from nnscaler.policies import OpPlan, get_layer_index
+    def policy(graph, cfg):
+        for node in get_pas_ops(graph):
+            if FFNDropout in node.module_class_chain:
+                index = get_layer_index(node.fqn)
+                yield OpPlan(node, offload_id=0 if index == 0 else -1, stage_id=index // 2)
+    parallelize(
+        FnPolicyModuleList(ffn_layers=8), {'x': torch.randn(4, 4)}, policy,
+        ComputeConfig(2, 2, use_end2end=True, cpu_offload={'min_tensor_bytes': 0},
+            pas_config={'pipeline_nmicros': 4, 'pp_size': 2,
+                        'pipeline_scheduler': '1f1b_interleaved'}),
+        gen_savedir=tmp_path, instance_name='sparse_backward_windows', load_module=False,
+    )
+    found_sparse = False
+    for path in tmp_path.rglob('gencode*.py'):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == 'activation_offload_schedule'):
+                continue
+            entries = ast.literal_eval(node.args[0])
+            positions = ast.literal_eval(next(k.value for k in node.keywords if k.arg == 'backward_positions'))
+            consumers = {b for _, _, b in entries}
+            assert consumers.issubset(positions)
+            assert not ({f for _, f, _ in entries} & set(positions))
+            found_sparse |= len(positions) > len(consumers)
+    assert found_sparse, 'Unselected local backwards must remain available to hide transfers'
+
+
 def _pipeline_cpu_offload_runtime_worker(tempdir, offload, release_inputs, release_outputs):
     from tests.launch_torchrun import clone_to_cpu_recursively
     init_distributed()

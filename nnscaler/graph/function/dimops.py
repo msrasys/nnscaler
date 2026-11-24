@@ -911,6 +911,7 @@ class IRDimops(IRFwOperation):
         @return op IRDimop: the new constructed operator
         """
         op = self._create_fn[0](*inputs, **kwargs, signature=self.signature)
+        op.recompute_barriers = tuple(dict.fromkeys((*self.recompute_barriers, *op.recompute_barriers)))
         if no_grad_reduce_inputs is not None:
             op._no_grad_reduce_inputs = no_grad_reduce_inputs
         # annos = self._annos_candidates

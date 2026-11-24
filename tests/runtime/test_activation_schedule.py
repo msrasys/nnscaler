@@ -88,6 +88,75 @@ def test_nonoffloaded_actions_still_contribute_to_distance():
     assert plan.describe(2)[0]['first_prefetch'] == ('before', 1)
 
 
+def test_sparse_offload_can_prefetch_during_an_unselected_backward():
+    actions = [('saved', True, True), ('other', True, False),
+               ('other', False, False), ('saved', False, True)]
+    plan = ActivationSchedulePlan.from_actions(actions)
+    requests = []
+    cursor = ActivationScheduleCursor(plan, 1, lambda key, lead: requests.append((key, lead)),
+                                      trigger='backward')
+    cursor.before(1)
+    assert requests == []
+    cursor.before(2)
+    assert requests == [('saved', 1)]
+    assert plan.describe(1, trigger='backward')[0]['first_prefetch'] == ('before', 2)
+
+
+def test_backward_retry_does_not_expand_the_before_action_lookahead_window():
+    plan = ActivationSchedulePlan.from_actions([
+        ('saved', True, True), ('other', True, False),
+        ('other', False, False), ('late', True, False), ('saved', False, True)])
+    requests = []
+    cursor = ActivationScheduleCursor(plan, 1, lambda key, lead: requests.append((key, lead)),
+                                      trigger='backward')
+    cursor.before(2)
+    assert requests == []
+    cursor.after(2)
+    assert requests == []
+    cursor.before(4)
+    assert requests == [('saved', 0)]
+    assert plan.describe(1, trigger='backward')[0]['first_prefetch'] == ('before', 4)
+    assert plan.describe(2, trigger='backward')[0]['first_prefetch'] == ('before', 2)
+
+
+def test_sparse_deferred_d2h_uses_unselected_backward_window(monkeypatch):
+    import nnscaler.runtime.cpu_offloading as offload
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    calls = []
+    class Queue:
+        def __init__(self, manager):pass
+        def cancel(self, key):calls.append(('cancel', key))
+        def launch(self, protected):calls.append(('launch', tuple(protected)))
+        def abort(self):pass
+    monkeypatch.setattr(offload, 'DeferredCommitQueue', Queue)
+    manager = ActivationOffloadManager(torch.nn.Module(), CPUOffloadConfig(
+        pipeline_prefetch_steps=0, forward_commit_unit='scope', d2h_launch_phase='backward',
+        max_pending_bytes=1024, max_inflight_bytes=512))
+    with manager.schedule([('saved', 0, 3)], backward_positions=(2, 3)) as cursor:
+        cursor.before(1)
+        assert calls == []
+        cursor.before(2)
+        assert calls == [('launch', ())]
+        cursor.before(2)
+        assert calls == [('launch', ())]  # One D2H quota per action.
+        cursor.before(3)
+        assert calls[-2:] == [('cancel', 'saved'), ('launch', ())]
+
+
+@pytest.mark.parametrize('positions', [(3, 2), (2, 2, 3), (2,), (True, 3), (-1, 3), (0, 3)])
+def test_invalid_backward_opportunities_fail_before_execution(positions):
+    with pytest.raises(ValueError, match='Backward action positions'):
+        ActivationSchedulePlan([('saved', 0, 3)], backward_positions=positions)
+
+
+def test_explicit_backward_positions_roundtrip_preserves_sparse_windows():
+    plan = ActivationSchedulePlan.from_actions([
+        ('saved', True, True), ('other', True, False),
+        ('other', False, False), ('saved', False, True)])
+    restored = ActivationSchedulePlan(plan.entries(), backward_positions=plan.backward_positions)
+    assert restored.describe(1, trigger='backward') == plan.describe(1, trigger='backward')
+
+
 def test_cursor_retries_nearest_blocked_reader_without_stealing_its_budget():
     plan = ActivationSchedulePlan.from_actions(ACTIONS)
     requested = []
@@ -133,7 +202,7 @@ def test_invalid_scope_schedules_fail_before_execution(entries):
         ActivationSchedulePlan(entries)
 
 
-@pytest.mark.parametrize('version', [None, 1])
+@pytest.mark.parametrize('version', [None, 1, 2])
 def test_legacy_codegen_config_requires_current_activation_adapter(tmp_path, version):
     current = ComputeConfig(1, 1, cpu_offload=CPUOffloadConfig())
     old = asdict(current)
@@ -159,7 +228,7 @@ def test_submission_options_roundtrip_without_changing_schedule_abi(tmp_path):
     torch.save(asdict(current), path)
     restored = ComputeConfig.safe_load_from_file(path, return_none_on_error=False)
     assert ComputeConfig.safe_equals(restored,current)
-    assert restored.cpu_offload._schedule_version == 2
+    assert restored.cpu_offload._schedule_version == current.cpu_offload._schedule_version
     old = asdict(current)
     for key in ('forward_commit_unit','commit_batch_bytes','copy_chunk_bytes'):
         old['cpu_offload'].pop(key)
@@ -167,7 +236,7 @@ def test_submission_options_roundtrip_without_changing_schedule_abi(tmp_path):
     restored = ComputeConfig.safe_load_from_file(path, return_none_on_error=False)
     assert restored.cpu_offload.commit_unit(pipeline=True) == 'scope'
     assert restored.cpu_offload.commit_batch_bytes == restored.cpu_offload.copy_chunk_bytes == 0
-    assert restored.cpu_offload._schedule_version == 2
+    assert restored.cpu_offload._schedule_version == current.cpu_offload._schedule_version
 
 
 def test_schedule_exception_drops_scope_metadata_with_gc_disabled(monkeypatch):

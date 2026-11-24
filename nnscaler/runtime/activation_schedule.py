@@ -13,7 +13,7 @@ class ActivationScopeUse:
 
 class ActivationSchedulePlan:
     """One key per virtual-stage/microbatch; positions count local F/B actions."""
-    def __init__(self, entries):
+    def __init__(self, entries, *, backward_positions=None):
         uses = [ActivationScopeUse(*entry) for entry in entries]
         keys = set()
         for use in uses:
@@ -25,12 +25,26 @@ class ActivationSchedulePlan:
                 raise ValueError('Activation scope must be produced before its backward action')
         self.uses = tuple(sorted(uses, key=lambda use: use.backward))
         self.positions = tuple(use.backward for use in self.uses)
+        # Consumer positions and transfer opportunities are different: an
+        # unselected backward can hide copies for a later selected consumer.
+        if backward_positions is None:
+            backward_positions = tuple(sorted(set(self.positions)))
+        else:
+            backward_positions = tuple(backward_positions)
+        if (any(isinstance(p, bool) or not isinstance(p, int) or p < 0 for p in backward_positions)
+                or tuple(sorted(set(backward_positions))) != backward_positions
+                or not set(self.positions).issubset(backward_positions)
+                or any(use.forward in backward_positions for use in self.uses)):
+            raise ValueError('Backward action positions must be ordered, unique, and cover consumers without including forwards')
+        self.backward_positions = backward_positions
 
     @classmethod
     def from_actions(cls, actions):
         """Build from (scope_key, is_forward, has_offload) for every local action."""
-        forwards, backwards, entries = {}, set(), []
+        forwards, backwards, entries, backward_positions = {}, set(), [], []
         for index, (key, is_forward, eligible) in enumerate(actions):
+            if not is_forward:
+                backward_positions.append(index)
             if is_forward and eligible:
                 if key in forwards:
                     raise ValueError(f'Duplicate forward action for activation scope: {key}')
@@ -40,7 +54,7 @@ class ActivationSchedulePlan:
                     raise ValueError(f'Backward action has no unique local producer: {key}')
                 backwards.add(key)
                 entries.append((key, forwards[key][0], index))
-        return cls(entries)
+        return cls(entries, backward_positions=backward_positions)
 
     def entries(self):
         return tuple((use.key, use.forward, use.backward) for use in self.uses)
@@ -66,8 +80,8 @@ class ActivationSchedulePlan:
             if not steps:
                 first = None
             elif trigger == 'backward':
-                index = bisect_left(self.positions, max(wanted, use.forward + 1))
-                first = ('before', self.positions[index])
+                index = bisect_left(self.backward_positions, max(wanted, use.forward + 1))
+                first = ('before', self.backward_positions[index])
             else:
                 first = ('before', wanted) if use.forward < wanted else ('after', use.forward)
             rows.append(dict(key=use.key, forward=use.forward, backward=use.backward,
@@ -82,7 +96,7 @@ class ActivationScheduleCursor:
         self.plan, self.steps, self.request = plan, steps, request
         self.trigger = trigger
         self.before_action = before_action
-        self._backward_positions = frozenset(plan.positions)
+        self._backward_positions = frozenset(plan.backward_positions)
         self.admitted = set()
 
     def _advance(self, position, after):

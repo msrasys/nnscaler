@@ -155,6 +155,37 @@ def module():
 
 @cuda
 @pytest.mark.parametrize('checkpoint', [False, True])
+def test_sparse_scope_transfers_before_unselected_backward(module, checkpoint):
+    manager = module._get_activation_offload_manager()
+    manager.config = replace(manager.config, prefetch_trigger='backward', pipeline_prefetch_steps=2)
+    leaf = torch.randn(64, 64, device='cuda', requires_grad=True)
+    size = leaf.numel() * leaf.element_size()
+    with module.activation_offload_schedule([('saved', 0, 4)], backward_positions=(2, 4)) as cursor:
+        cursor.before(0)
+        with module.activation_offload_scope('saved', pipeline=True):
+            with module.cpu_offloading_hooks() as saved:
+                value = leaf + 1
+                output = saved.checkpoint(torch.sin, value) if checkpoint else value.sin()
+            saved.watch(output)
+            del value
+        cursor.after(0)
+        assert module.activation_offload_stats()['d2h_bytes'] == 0
+        cursor.before(2)  # Independent backward without any offload scope.
+        stats = module.activation_offload_stats()
+        assert stats['d2h_bytes'] == stats['h2d_bytes'] == size
+        assert stats['schedule_prefetch_loads'] == 1
+        cursor.after(2)
+        cursor.before(4)
+        actual, = torch.autograd.grad(output.sum(), leaf)
+        torch.testing.assert_close(actual, (leaf + 1).cos(), rtol=0, atol=0)
+        module.finish_activation_offload('saved')
+        cursor.after(4)
+    torch.cuda.synchronize()
+    assert module.activation_offload_stats()['live_cpu_bytes'] == 0
+
+
+@cuda
+@pytest.mark.parametrize('checkpoint', [False, True])
 @pytest.mark.parametrize('restore', ['scope', 'group'])
 def test_backward_window_submits_future_scope_and_keeps_current_input(module, checkpoint, restore):
     manager=module._get_activation_offload_manager()

@@ -20,6 +20,7 @@ IRDataOperation is recommended to be replicated to all devices.
 
 import ast
 from dataclasses import dataclass, field
+import json
 import logging
 from typing import Any, List, Literal, Optional, TYPE_CHECKING, Callable, Iterable, Union
 import random
@@ -33,6 +34,7 @@ from nnscaler.graph import IRGraph
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.graph.function.pyfunc import IRPyFunc
+from nnscaler.graph.recompute import _collect_plan_layouts, merge_recompute_regions
 from nnscaler.graph.segment import IRSegment
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir import IRCell, IRSubTensor, IRFullTensor
@@ -1011,11 +1013,15 @@ def fn(
         ],
         *,
         plan_transform: Optional[Callable[[list[OpPlan], 'ComputeConfig'], Iterable[OpPlan]]] = None,
+        hooks_allow_recompute: Optional[Callable[[Optional[Callable], Optional[Callable]], bool]] = None,
 ) -> IRGraph:
     """
     General policy function based on user-defined policy.
     The user-defined policy can either return the final IRGraph, or
     return a list of OpPlan to describe the distributed plan for each operator.
+    ``cfg.recompute_merge_adjacent`` composes existing checkpoints only on the
+    OpPlan path, after layout resolution and plan_transform. Graph-returning
+    policies retain ownership of their graph transformations.
 
     To write a new-style policy, the most important part is to locate the operator node in the graph.
     Here are some tips:
@@ -1049,6 +1055,8 @@ def fn(
                 partition plans have been resolved, before graph staging and
                 partitioning. It must preserve operators, order, placement and
                 hooks; only recompute_id/offload_id may change.
+        hooks_allow_recompute: optional application contract for hooks in
+                composed checkpoints. By default, hooked regions are not merged.
 
     Returns:
         the distributed IRGraph
@@ -1135,6 +1143,7 @@ def fn(
         _duplicate_dataloader_index_ops_per_stage(graph, op_plans)
 
     fw_nodes = dict.fromkeys(graph.select(ntype=IRFwOperation))
+    resolved_layouts = {} if cfg.recompute_merge_adjacent else None
 
     for node in fw_nodes:
         node.hook_meta = op_plans[node].hook_meta
@@ -1172,6 +1181,7 @@ def fn(
         # final partition plan for the op
         # key: input idx, value: partitioned dim
         op_partition_map: dict[int, int | Literal['rn', 'rr']] = {}
+        partitioned_nodes = None
         if op_partitions:
             # we partition the op based on the first partition plan
             # and then check the rest partitions are satisfied or not
@@ -1245,6 +1255,12 @@ def fn(
                     dim=op_partition_map[first_input_idx]
                 )
 
+        if resolved_layouts is not None:
+            # An auto candidate can have been rejected above. Snapshot only the
+            # final layout, including unselected ops needed as side producers.
+            rank_nodes = partitioned_nodes if op_plan.partition is not None else [node] * op_partition_ngpus
+            resolved_layouts[node] = _collect_plan_layouts(op_plan, rank_nodes, op_partition_ngpus)
+
         op_partition_maps[op_plan.op] = op_partition_map
         # update tensor_splits for input tensors
         for idx, input in enumerate(op_plan.op.inputs()):
@@ -1271,7 +1287,8 @@ def fn(
         ordered = [op_plans[node] for node in fw_nodes]
         def structure(plan):
             return (id(plan.op), plan.stage_id, repr(plan.partition), repr(plan.partitions),
-                    plan.pre_hook, plan.post_hook, repr(plan.hook_meta))
+                    plan.pre_hook, plan.post_hook, repr(plan.hook_meta),
+                    plan.op.recompute_barriers)
         before = [structure(plan) for plan in ordered]
         transformed = list(plan_transform(ordered, cfg))
         if not all(isinstance(plan, OpPlan) for plan in transformed):
@@ -1283,6 +1300,16 @@ def fn(
             if plan.recompute_id < -1 or plan.offload_id < -1:
                 raise ValueError('Invalid activation annotation after plan_transform')
         op_plans = {plan.op: plan for plan in transformed}
+
+    if cfg.recompute_merge_adjacent:
+        merged, report = merge_recompute_regions(
+            [op_plans[node] for node in fw_nodes],
+            partition_degree=op_partition_ngpus,
+            hooks_allow_recompute=hooks_allow_recompute,
+            _resolved_layouts=resolved_layouts,
+        )
+        op_plans = {plan.op: plan for plan in merged}
+        _logger.info('Adjacent recompute merge: %s', json.dumps(report))
 
     # Activation groups are formed only after automatic layouts are resolved
     # and the optional annotation transform has inspected those real layouts.

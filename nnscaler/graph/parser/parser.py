@@ -13,6 +13,7 @@ from nnscaler.ir.operator import IRFwOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.cten import IRObject, IRCell, IRTensor, IR, ValueTrack
 from nnscaler.graph.parser.frame import Frame
+from nnscaler.graph.parser.effects import recompute_barriers_from_fx
 from nnscaler.graph.parser.value_tracker import ValueTracker
 from nnscaler.graph.parser.mapping import SignFx2Op
 from nnscaler.graph.function.pyfunc import IRPyFunc
@@ -536,6 +537,8 @@ class FxModuleParser:
         if not isinstance(ir_node, IRCell):
             return
 
+        if isinstance(ir_node, IRFwOperation):
+            ir_node.recompute_barriers = recompute_barriers_from_fx(node, ir_node)
         ir_node.op_context = node.meta.get('op_context')
         module_stack = node.meta.get('nn_module_stack')
         ir_node.module_stack = module_stack

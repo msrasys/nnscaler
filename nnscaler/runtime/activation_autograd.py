@@ -165,7 +165,7 @@ class SavedActivationContext:
         no replay. Later calls of that code defer to group commit until saved
         inputs are observed again. Dynamic branches remain correct either way.
         """
-        from torch.utils.checkpoint import checkpoint
+        from .checkpoint import checkpoint
 
         if self._hooks is None:
             raise RuntimeError('Checkpoint requires an active saved activation context')
