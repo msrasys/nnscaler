@@ -42,7 +42,7 @@ class ModuleStreamRule:
     recompute_ready_on: str | None = None
     backward_on: str | None = None
     operators: str | tuple[str, ...] | None = None
-    _codegen_version: int = field(default_factory=lambda: 22, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 23, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):

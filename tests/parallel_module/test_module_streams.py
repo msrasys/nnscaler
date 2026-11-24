@@ -631,9 +631,20 @@ class AnchorModel(ForkModel):
         return y + self.side(x)
 
 
-class ReadyCheckpointModel(ForkModel):
+class CheckpointContainer(torch.nn.Module):
     def __init__(self):
         super().__init__()
+        self.compute = Branch()
+
+    def forward(self, x):
+        return self.compute(x)
+
+
+class ReadyCheckpointModel(ForkModel):
+    def __init__(self, nested=False):
+        super().__init__()
+        if nested:
+            self.side = CheckpointContainer()
         self.other = Branch()
 
     def forward(self, x):
@@ -675,16 +686,17 @@ class AmbiguousCheckpointModel(ForkModel):
 
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('workers', [1, 2])
-def test_checkpoint_readiness_codegen_and_gradients(tmp_path, monkeypatch, workers):
+@pytest.mark.parametrize('nested', [False, True])
+def test_checkpoint_readiness_codegen_and_gradients(tmp_path, monkeypatch, workers, nested):
     monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', SerialStreams)
     monkeypatch.setattr('nnscaler.runtime.backward.BackwardLaunchPoint.record_ready', lambda self: None)
-    model = ReadyCheckpointModel()
+    model = ReadyCheckpointModel(nested=nested)
     reference = copy.deepcopy(model)
     rules = (
-        ModuleStreamRule('side', recompute_only=True, recompute_ready_on='*.combine_anchor'),
+        ModuleStreamRule('side.compute' if nested else 'side', recompute_only=True, recompute_ready_on='*.combine_anchor'),
         ModuleStreamRule('other', launch_before='*.combine_anchor', overlap_backward=True),
     )
-    instance = f'checkpoint_ready_{workers}'
+    instance = f'checkpoint_ready_{workers}_{nested}'
     parallelize(
         model,
         {'x': torch.randn(4, 8)},

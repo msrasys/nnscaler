@@ -31,12 +31,21 @@ def plan_checkpoint_readiness(nodes, outputs, rules):
             sample = next(node for node in group if node.module_stack)
             stack = list(sample.module_stack)
             path = next(path for path in reversed(stack) if fnmatchcase(path, rule.module))
-            parent = stack[stack.index(path) - 1] if stack.index(path) else ''
-            call = (sample.module_call_stack or {}).get(parent)
-            anchors = [node for node in nodes if node not in group
-                       and fnmatchcase(node.signature, rule.recompute_ready_on)
-                       and (not parent or parent in (node.module_stack or {}))
-                       and (call is None or (node.module_call_stack or {}).get(parent) == call)]
+            parents = list(reversed(stack[:stack.index(path)]))
+            if not parents or parents[-1] != '':
+                parents.append('')
+            anchors = []
+            # A selected compute child can live inside a checkpoint wrapper;
+            # its asynchronous consumer then belongs to an enclosing module.
+            # Keep invocation identity and the sole-consumer proof below.
+            for parent in parents:
+                call = (sample.module_call_stack or {}).get(parent)
+                anchors = [node for node in nodes if node not in group
+                           and fnmatchcase(node.signature, rule.recompute_ready_on)
+                           and (not parent or parent in (node.module_stack or {}))
+                           and (call is None or (node.module_call_stack or {}).get(parent) == call)]
+                if anchors:
+                    break
             if len(anchors) != 1:
                 raise ValueError(f'{path}: expected one recompute readiness anchor, found {len(anchors)}')
             anchor = anchors[0]

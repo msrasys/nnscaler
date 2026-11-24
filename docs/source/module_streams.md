@@ -58,6 +58,9 @@ stream for a complete non-reentrant checkpoint replay. Each backward consumer
 waits for the reconstructed tensors and protects their storage lifetime.
 `recompute_ready_on` additionally gates replay on a unique downstream backend's
 input readiness. The compiler rejects ambiguous consumers and partial regions.
+It searches the nearest enclosing invocation, so a selected compute child may
+use a backend outside its checkpoint wrapper; the sole-gradient-consumer check
+still applies.
 
 ## Runtime branch API
 
