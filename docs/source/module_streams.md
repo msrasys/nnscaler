@@ -112,15 +112,8 @@ consumer's forward stream, call `put(tuple_of_tensors)` in the producer backward
 and `pop()` on the original consumer stream. It records cross-stream readiness
 and discards unconsumed values at GraphTask completion.
 
-## DeepEP adapters
+## DeepEP configuration
 
 `nnscaler.runtime.deepep.get_config_override(ranks, operation)` validates and
 returns optional `NNSCALER_DEEPEP_CONFIG` overrides. Backends apply the returned
 config explicitly; NNScaler does not replace methods in the installed library.
-
-`PeerBuffer(native_buffer, num_tokens)` adapts an existing DeepEP buffer for
-same-node EP2 exchanges with equal layouts. Remove local routes first and size
-the buffer with `PeerBuffer.required_buffer_bytes(x, topk, num_experts)`.
-Activations use allocator-owned output tensors; IPC staging views stay private.
-`scripts/build_deepep_overlap.sh` builds the optional peer-copy API in an isolated
-directory after verifying the reviewed source and patch hashes.
