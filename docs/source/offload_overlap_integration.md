@@ -56,7 +56,7 @@ Adam-state round trip followed by another update; configuration serialization
 preserves every feature switch. CUDA concurrency/resume checks are collected
 but remain gated on overlap chat completion.
 
-The combined compiler uses trace metadata version 6. Packages generated before
+The combined compiler uses trace metadata version 7. Packages generated before
 activation/stream integration are regenerated even when their individual
 feature settings happen to match, preserving the deployed lifetime fixes.
 
@@ -87,3 +87,12 @@ input alias adapter is selected only by those explicit activation features.
 Module-stream-only execution preserves its original checkpoint context path.
 A runtime regression rejects accidental entry into the new adapter when off.
 CPU checks48passed/8CUDA-skipped; isolated CUDA matrix22passed.
+
+## Stable reduction ordering
+
+Attribute iteration previously reversed mixed-dtype reducer groups between
+otherwise equivalent graphs. Canonicalize parameter construction order before
+forming device/replica and dtype groups, so graph-only object-ID changes do
+not reorder clipping and optimizer buffers. Reducer/config CPU checks49passed
+(8CUDA skipped). The same literal-dict Attention compatibility fix is applied
+to both model branches to remove a tracing-construction confound.

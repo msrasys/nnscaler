@@ -240,7 +240,10 @@ class IRWeightReducer(IRCell):
         # But when we support more flexible grad dtype configuration in the future,
         # we should consider grad dtype when grouping weights for reducers
         dtype_groups: Dict[torch.dtype, List[IRSubTensor]] = {}
-        for sub in weights:
+        # Upstream attribute sets can change iteration order when unrelated
+        # graph objects receive new IDs. Keep dtype-group order tied to the
+        # original parameters so clipping/optimizer buffer order stays stable.
+        for sub in sorted(weights, key=lambda value: value.parent.tid):
             dtype_groups.setdefault(sub.dtype, []).append(sub)
 
         reducers = []

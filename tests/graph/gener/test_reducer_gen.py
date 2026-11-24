@@ -29,6 +29,17 @@ def make_param(shape, dtype) -> IRFullTensor:
     return param
 
 
+def test_dtype_reducer_order_is_independent_of_attribute_iteration():
+    first = make_param((8, 8), torch.bfloat16).tosub()
+    second = make_param((8, 8), torch.float32).tosub()
+    third = make_param((8, 8), torch.bfloat16).tosub()
+    expected = [[first, third], [second]]
+    for weights in ([first, second, third], [second, third, first], [third, second, first]):
+        reducers = IRWeightReducer.from_weights(weights, (0, 1))
+        assert [list(reducer.inputs()) for reducer in reducers] == expected
+        assert all(reducer.device == (0, 1) for reducer in reducers)
+
+
 class ReducerModule(torch.nn.Module):
 
     def __init__(self):

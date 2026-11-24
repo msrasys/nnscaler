@@ -678,7 +678,10 @@ class IRAdapterGener:
         # In current implementation, we have disabled that case
         # `PP + all replicated + no-grad-reduce + reduce_replicated_params=False`
         subweights_map: Dict[Tuple[Tuple[int,...], int, int], List[IRSubTensor]] = {}
-        for sub_weight, devices, replicas in gen_reducer_info:
+        for sub_weight, devices, replicas in sorted(
+                gen_reducer_info,
+                key=lambda entry: (entry[0].parent.tid, repr(entry[0].indmap),
+                                   repr(entry[0].valmap), tuple(entry[1]), entry[2])):
             subweights_map.setdefault(
                 (tuple(devices), replicas, len(sub_weight_devices[sub_weight])), []
             ).append(sub_weight)
