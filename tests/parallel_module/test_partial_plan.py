@@ -85,6 +85,18 @@ def test_codegen_inactive_plan_ranks(tmp_path):
         assert f'Reducer(ranks={dp_ranks}' in code
 
 
+@replace_all_device_with('cpu')
+def test_codegen_declares_optimizer_groups_of_inactive_ranks(tmp_path):
+    # ZeRO-1 with 2 groups broadcasts optimizer states with stride 8 // 2 when loading checkpoints;
+    # the groups at plan rank 1, where the encoder is inactive, must be declared as well.
+    parallelize(Encoder(), {'x': torch.ones(2, 3)}, _first_rank_only,
+                ComputeConfig(2, 8, use_zero=1, zero_ngroups=2), gen_savedir=tmp_path, load_module=False)
+    for rank in range(8):
+        code = _gencode(tmp_path, rank)
+        for stride_group in ([0, 4], [1, 5], [2, 6], [3, 7]):
+            assert f'comm_groups.append({stride_group})' in code
+
+
 class VLModel(nn.Module):
     """``encoder`` runs on plan rank 0 only; ``head`` runs on the full plan.
 
@@ -115,7 +127,9 @@ def _hybrid_param_clss(name):
 
 
 def _plain_layers(mode):
-    if mode != 'npp_zero1':
+    # Non-parallel layers after the encoder sit at different local optimizer indices
+    # on active and inactive ranks, which checkpoint reloading must map back.
+    if mode not in ('deduped', 'npp_zero1'):
         return {}
     return {'frozen': nn.Linear(3, 3).requires_grad_(False), 'post': nn.Linear(3, 3)}
 

@@ -278,8 +278,11 @@ class ModuleCodeGen(FuncEmission):
             comm_groups.append(ranks)
             # add comm groups for group ZeRO
             comm_groups.extend(_add_comm_for_group_zero(ranks))
-        # communication groups for parameters that are outside reducers
-        for device in self.devices:
+        # communication groups for parameters that are outside reducers.
+        # Cover every plan rank, including those where this module is inactive:
+        # checkpoint loading broadcasts optimizer states in these groups (e.g. ZeRO cross groups) on all ranks,
+        # and creating a group that no generated code declares is a world-wide collective.
+        for device in range(self.plan_ndevs):
             ranks = list(range(device, self.runtime_ndevs, self.plan_ndevs))
             if len(ranks) > 1:
                 comm_groups.append(ranks)
@@ -743,10 +746,15 @@ class ModuleCodeGen(FuncEmission):
         The fields storing intermediate codes that are populated by this method:
         - `model_init_statements`
         """
-        groups = [[rank] for rank in range(self.runtime_ndevs)]
-        groups.extend(list(ranks) for ranks in self.comm_groups)
+        # One statement per group keeps the generated line length bounded for large runtime_ndevs.
         self.model_init_statements.append('# communication groups')
-        self.model_init_statements.append(f'self.init_groups(ranks={groups})')
+        self.model_init_statements.append('comm_groups = []')
+        with ForBlock('rank', f'range({self.runtime_ndevs})') as fb:
+            fb.insert_body('comm_groups.append([rank])')
+        self.model_init_statements.extend(fb.code)
+        for ranks in self.comm_groups:
+            self.model_init_statements.append(f'comm_groups.append({list(ranks)})')
+        self.model_init_statements.append('self.init_groups(ranks=comm_groups)')
         self.model_init_statements.append(' ')
 
     def init_attributes(self, node: IRCell) -> dict[str, dict[str, Any]]:

@@ -3323,7 +3323,8 @@ def load_deduped_state_dict(
         # but insert to 0 feels better
         # the dedup size for non-parallel module is 1
         if non_parallel_module_locs:
-            opt_broadcast_groups.insert(0, (list(non_parallel_module_locs), 1))
+            # sorted, so that the list follows the same parameter order on every rank
+            opt_broadcast_groups.insert(0, (sorted(non_parallel_module_locs), 1))
 
         for bg in opt_broadcast_groups:
             _broadcast_opt_state(optimizer_state_dict, *bg)
@@ -3334,6 +3335,18 @@ def load_deduped_state_dict(
 
 
 def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List[int], dedup_group_size: int):
+    """
+    Broadcast optimizer states inside each stride group.
+
+    `state_indexes` are local optimizer indices, in the same parameter order on every rank of the group.
+    The local indices of a parameter can differ across ranks
+    (e.g. non-parallel parameters after a module that is inactive on some ranks),
+    so states are matched by their position in `state_indexes`.
+    """
+    # Group creation is world-wide when the stride groups are not cached yet
+    # (e.g. ZeRO cross groups at plan ranks where a module is inactive),
+    # so every rank must take part before skipping empty shards.
+    broadcast_group = setup_stride_broadcast_group(dedup_group_size)
     if not state_indexes:
         # A module that is inactive on this rank has no local optimizer states,
         # but the trailing barrier is world-wide,
@@ -3342,17 +3355,17 @@ def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List
         return
 
     rank = torch.distributed.get_rank()
-    broadcast_group = setup_stride_broadcast_group(dedup_group_size)
     src_rank, curr_parallel_group, curr_parallel_group_ranks = broadcast_group.src_rank, broadcast_group.group, broadcast_group.ranks
 
     logger.info(f'Rank-{rank} is broadcasting optimizer states to ranks {curr_parallel_group_ranks}, broadcast source: {src_rank}...')
 
-    # broadcast param groups and state keys/shapes/dtypes via broadcast_object_list
+    # broadcast state keys/shapes/dtypes via broadcast_object_list,
+    # keyed by the position in `state_indexes`
     if rank == src_rank:
         state_info = {}
-        for idx in state_indexes:
+        for pos, idx in enumerate(state_indexes):
             if idx in optimizer_state_dict['state']:
-                state_info[idx] = {
+                state_info[pos] = {
                     key: (value.shape, value.dtype)
                     for key, value in optimizer_state_dict['state'][idx].items()
                 }
@@ -3364,14 +3377,20 @@ def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List
             src=src_rank,
             group=curr_parallel_group,
     )
-    state_indexes = list(sent[0])
+    if sent[0] and max(sent[0]) >= len(state_indexes):
+        raise RuntimeError(
+            f'Rank {rank} has {len(state_indexes)} optimizer states to load, '
+            f'but the broadcast source rank {src_rank} has more.'
+        )
     if rank != src_rank:
-        for k, v in sent[0].items():
-            optimizer_state_dict['state'][k] = {
+        for pos, v in sent[0].items():
+            optimizer_state_dict['state'][state_indexes[pos]] = {
                 key: torch.zeros(value[0], dtype=value[1], device=torch.cuda.current_device())
                 for key, value in v.items()
             }
-    else:
+    # from now on, only the local indices of the states that the source rank has
+    state_indexes = [state_indexes[pos] for pos in sent[0]]
+    if rank == src_rank:
         for idx in state_indexes:
            for key, value in optimizer_state_dict['state'][idx].items():
                optimizer_state_dict['state'][idx][key] = optimizer_state_dict['state'][idx][key].cuda()
