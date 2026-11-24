@@ -1943,12 +1943,9 @@ def build_optimizer(
                     seen.add(param)
                     offset += 1
                     yield param
-            # A zero-length location (e.g. on an inactive rank, or for frozen parameters)
-            # still consumes the module's original parameters in a merged checkpoint,
-            # but consumes no local optimizer slots.
-            # A module without original parameters takes no place in a merged checkpoint,
-            # and merging has no state for it when it saves no tensors at all, so it gets no location.
-            if isinstance(m, ParallelModule) and m.origin_module_metadata.origin_param_names:
+            if isinstance(m, ParallelModule):
+                # A zero-length location still consumes the module's original parameters
+                # in a merged checkpoint, but consumes no local optimizer slots.
                 opt_module_locs[name] = ModuleParameterLocation(start, offset - start)
 
         if non_parallel_module_use_zero:
@@ -2412,11 +2409,16 @@ def merge_state_dicts(
         if opt_state_dicts is not None:
             opt_new_pm_states[module_prefix] = (merged_opt_state_dict['state'], extra_states[0].origin_param_names)
 
-    if opt_new_pm_states:
+    # `opt_new_pm_states` can be empty even with optimizer states to merge,
+    # when no parallel module saves tensors but other layers are trainable.
+    if optimizer_state_dicts is not None:
         pm_orig_param_names: Dict[str, List[str]] = {}
+        # all original parameter names of every parallel module, including those that save no tensors
+        pm_all_orig_param_names: Dict[str, List[str]] = {}
         for k, extra_states in pm_extra_states.items():
             module_prefix = '.'.join(k)
             pm_orig_param_names[module_prefix] = ParallelModule.get_origin_parameter_names([e.param_area_map for e in extra_states])
+            pm_all_orig_param_names[module_prefix] = extra_states[0].origin_param_names
 
         # add non-parallel parameters state dict to opt_new_pm_states
         if _NON_PARALLEL_MODULE_ATTR_NAME in opt_state_dicts:
@@ -2470,7 +2472,12 @@ def merge_state_dicts(
             else:
                 # parallel module parameters
                 module_prefix, pm_loc = sorted_pm_locs[sorted_pm_locs_cur_index]
-                state, orignal_param_names = opt_new_pm_states[module_prefix]
+                if module_prefix in opt_new_pm_states:
+                    state, orignal_param_names = opt_new_pm_states[module_prefix]
+                else:
+                    # A module that saves no tensors (no parameters, or only unused ones) has no states to merge,
+                    # but still occupies its original parameters in the merged layout, as loading expects.
+                    state, orignal_param_names = {}, pm_all_orig_param_names[module_prefix]
                 named_state = {}  #  the state dict with named keys
                 for i, v in state.items():
                     named_state[pm_orig_param_names[module_prefix][i]] = v
