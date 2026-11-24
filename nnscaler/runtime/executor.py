@@ -5,6 +5,7 @@ r"""
 Executor for runtime
 """
 import atexit
+from copy import copy
 import sys
 
 from contextlib import contextmanager
@@ -530,6 +531,9 @@ class Executor:
         gradient per input, so a changed count would fail later with a confusing error
         or drop a gradient silently.
         It must also return every released output as the same object.
+        Both are checked against a snapshot taken before the call,
+        because a hook may write into the lists it receives (the built-in loss-scaling
+        hook does), and then the lists passed in no longer show what was there.
 
         A tensor the hook builds on top of a released output (even a view) records
         the float8 placeholder dtype in its new autograd node,
@@ -540,18 +544,18 @@ class Executor:
         """
         if Executor._backward_pre_hook is None:
             return input_tensors, output_tensors, output_tensor_grads
+        counts_before = [len(input_tensors), len(output_tensors), len(output_tensor_grads)]
+        # (position, tensor) of every released output, as the hook will see them
+        released = [(idx, t) for idx, t in enumerate(output_tensors) if getattr(t, _RELEASED_TAG, False)]
         new_inputs, new_outputs, new_grads = Executor._backward_pre_hook(
             input_tensors, output_tensors, output_tensor_grads)
-        counts = [(len(input_tensors), len(new_inputs)), (len(output_tensors), len(new_outputs)),
-                  (len(output_tensor_grads), len(new_grads))]
-        if any(before != after for before, after in counts):
+        counts_after = [len(new_inputs), len(new_outputs), len(new_grads)]
+        if counts_before != counts_after:
             raise RuntimeError(
                 f'The backward pre-hook must keep the number of inputs, outputs and grads, '
-                f'got {[before for before, _ in counts]} -> {[after for _, after in counts]}.'
+                f'got {counts_before} -> {counts_after}.'
             )
-        for idx, old in enumerate(output_tensors):
-            if not getattr(old, _RELEASED_TAG, False):
-                continue
+        for idx, old in released:
             if new_outputs[idx] is not old:
                 raise RuntimeError(
                     f'The backward pre-hook replaced output {idx}, whose storage was released after it '

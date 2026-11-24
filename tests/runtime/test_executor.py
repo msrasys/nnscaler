@@ -640,7 +640,7 @@ def test_release_storage_disabled_is_a_no_op(monkeypatch):
 @release_storage_test
 @pytest.mark.parametrize('use_fbw', [False, True])
 @pytest.mark.parametrize('deallocate', [False, True])
-@pytest.mark.parametrize('hook', ['passthrough', 'scale_grads', 'view_outputs', 'scale_outputs'])
+@pytest.mark.parametrize('hook', ['passthrough', 'scale_grads', 'view_outputs', 'view_outputs_inplace', 'scale_outputs'])
 def test_release_storage_backward_pre_hook_contract(hook, deallocate, use_fbw):
     # A tensor derived from a released output records the float8 placeholder dtype,
     # so backward from it would truncate the gradient silently;
@@ -653,6 +653,9 @@ def test_release_storage_backward_pre_hook_contract(hook, deallocate, use_fbw):
             grads = [g * 3.0 for g in grads]
         elif hook == 'view_outputs':
             outputs = [out.view_as(out) for out in outputs]
+        elif hook == 'view_outputs_inplace':
+            # writes into the list it was given, like the built-in loss-scaling hook
+            outputs[0] = outputs[0].view_as(outputs[0])
         elif hook == 'scale_outputs':
             outputs = [3.0 * out for out in outputs]
         return inputs, outputs, grads
@@ -674,7 +677,7 @@ def test_release_storage_backward_pre_hook_contract(hook, deallocate, use_fbw):
                 return grad
             return Executor.backward('stage', [x], [output], [output_grad])
 
-        if deallocate and hook == 'view_outputs':
+        if deallocate and hook in ('view_outputs', 'view_outputs_inplace'):
             # metadata-only ops succeed on the placeholder; the contract check catches them
             with pytest.raises(RuntimeError, match='storage was released'):
                 run()
@@ -692,14 +695,18 @@ def test_release_storage_backward_pre_hook_contract(hook, deallocate, use_fbw):
 
 
 @pytest.mark.parametrize('use_fbw', [False, True])
+@pytest.mark.parametrize('inplace', [False, True])
 @pytest.mark.parametrize('dropped', ['inputs', 'outputs', 'grads'])
-def test_backward_pre_hook_must_keep_counts(dropped, use_fbw):
+def test_backward_pre_hook_must_keep_counts(dropped, inplace, use_fbw):
     if use_fbw and not _patch_torch.FBW_SUPPORTED:
         pytest.skip('FBW is not supported by this torch version')
 
     def backward_pre_hook(inputs, outputs, grads):
         lists = {'inputs': inputs, 'outputs': outputs, 'grads': grads}
-        lists[dropped] = lists[dropped][:-1]
+        if inplace:
+            lists[dropped].pop()
+        else:
+            lists[dropped] = lists[dropped][:-1]
         return lists['inputs'], lists['outputs'], lists['grads']
 
     Executor.clear()
