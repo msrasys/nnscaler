@@ -10,6 +10,7 @@ import torch
 import numpy as np
 import inspect
 import pickle
+from fnmatch import fnmatchcase
 
 from nnscaler.ir.cten import IRCell, IRTensor
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
@@ -32,6 +33,8 @@ from nnscaler.codegen.syntax.blocks import ClassBlock, ForBlock, FunctionBlock, 
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
 from nnscaler.codegen.lifecycle import LifeCycle
+from nnscaler.graph.schedule.module_streams import checkpoint_stream
+from nnscaler.codegen.module.stream import emit_module_streams
 
 from nnscaler.flags import CompileFlag
 from nnscaler.utils import fields
@@ -107,6 +110,12 @@ class ModuleCodeGen(FuncEmission):
         """
         super().__init__()
         self.execplan: ExecutionPlan = execplan
+        if any(fnmatchcase(node.signature, pattern)
+               for node in execplan.graph.select(ntype=IRFwOperation)
+               for pattern in CompileFlag.multi_stream_ops):
+            # Decide before rank-specific emission and worker serialization so
+            # every scheduled executor preserves side-stream input lifetimes.
+            self.execplan.use_multi_streams = True
         self.devices: Tuple[int] = tuple(sorted(execplan.graph.device))
         if self.devices != tuple(range(len(self.devices))):
             raise ValueError(f'device must be consecutive')
@@ -140,6 +149,9 @@ class ModuleCodeGen(FuncEmission):
             'import nnscaler', 'import nnscaler.flags',
             'import nnscaler.runtime.function',
             'import nnscaler.runtime.device',
+            'import nnscaler.runtime.stream',
+            'import nnscaler.runtime.backward',
+            'import nnscaler.runtime.checkpoint_stream',
             'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
         ]
@@ -173,6 +185,8 @@ class ModuleCodeGen(FuncEmission):
         self.model_init_statements: List[str] = list()
         # module method bodies for forward computations, e.g. Segments, Adapters.
         self.model_methods_bodies: List[List[str]] = list()
+        self.module_parameter_uses = {}
+        self.module_parameter_origins = {}
         # module member name
         self.symbols = SymbolTable()
         # ref module to check shared variables
@@ -611,6 +625,9 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRFwOperation):
                 raise RuntimeError(f"Unexcepted global-level op call: {node}")
             elif isinstance(node, IRAdapter):
+                for param in node.iobjs():
+                    if isinstance(param, IRTensor) and param.is_param():
+                        self.module_parameter_uses.setdefault(self.tensor_name(param), set()).add(None)
                 from nnscaler.ir.adapter.prim import MovePrim, CommPrim, ChunkPrim, VChunkPrim
                 has_p2p = any(isinstance(prim, MovePrim) for prim in node.prims)
                 has_other_comm = any(
@@ -673,6 +690,12 @@ class ModuleCodeGen(FuncEmission):
             cb.insert_body(f'nmicros_per_scheduler_step = {graph_sched.nmicros if graph_sched is not None else 1}')
             cb.insert_body(f'use_multi_streams = {self.execplan.use_multi_streams}')
             cb.insert_body(f'cuda_sync_required = {self.execplan.cuda_sync_required}')
+            parameter_streams = {name: next(iter(streams)) for name, streams in self.module_parameter_uses.items()
+                                 if len(streams) == 1 and None not in streams}
+            cb.insert_body(f'module_parameter_streams = {parameter_streams!r}')
+            tracked_parameters = sorted(name for name, streams in self.module_parameter_uses.items()
+                                        if any(stream is not None for stream in streams))
+            cb.insert_body(f'module_stream_parameters = {tracked_parameters!r}')
 
             if as_parallel_module:
                 cb.insert_body(f'rank = {device}')  # save rank in class level
@@ -1033,8 +1056,20 @@ class ModuleCodeGen(FuncEmission):
         The fields storing intermediate codes that are populated by this method:
         - NONE
         """
-        nodes : List[IRCell] = segment.nodes()
-        lifetime = LifeCycle(nodes, segment.inputs(), segment.outputs())
+        if CompileFlag.module_streams:
+            codes = emit_module_streams(self, segment, runtime_devid)
+        else:
+            codes = self._emit_segment_nodes(segment, list(segment.nodes()), runtime_devid)
+        if any(node.offload is not None for node in segment.nodes()):
+            with Block('with self.activation_offload_scope():') as scope_block:
+                scope_block.insert_body(codes)
+            codes = scope_block.code
+        return codes
+
+    def _emit_segment_nodes(self, segment, nodes, runtime_devid, lifetime=None, *, release_unused=True,
+                            checkpoint_readiness=None):
+        """Emit ordinary nodes/checkpoints with a caller-provided lifetime plan."""
+        lifetime = lifetime or LifeCycle(nodes, segment.inputs(), segment.outputs())
         groups: List[List[IRCell]] = list(more_itertools.split_when(
             nodes,
             lambda prev, curr: (
@@ -1044,10 +1079,11 @@ class ModuleCodeGen(FuncEmission):
         ))
 
         codes: List[str] = []
-        unused_inputs = lifetime.release_tensors_after_line(-1)
+        unused_inputs = (lifetime.release_tensors_after_line(-1)
+                         if release_unused and nodes and lifetime.get_line(nodes[0]) == 0 else [])
         if unused_inputs:
             codes.append(self.emit_release(unused_inputs))
-        last_offload_group = next((g for g in reversed(groups) if g[0].offload is not None), None)
+        last_offload_node = next((node for node in reversed(segment.nodes()) if node.offload is not None), None)
         for group in groups:
             assert len(group) > 0
             rc_gid: Optional[int] = group[0].recompute
@@ -1065,10 +1101,11 @@ class ModuleCodeGen(FuncEmission):
                 # get recompute excution code
                 group_codes = self._emit_recompute(group,
                     group_segment.inputs(), group_segment.outputs(), lifetime, runtime_devid,
-                    offload=offload_gid is not None)
+                    offload=offload_gid is not None,
+                    backward_ready=(checkpoint_readiness or {}).get(rc_gid))
             if offload_gid is not None:
                 # Outside checkpoint(): capture checkpoint inputs, not replay intermediates.
-                tail_arg = 'tail=True' if group is last_offload_group else ''
+                tail_arg = 'tail=True' if last_offload_node in group else ''
                 with Block(f'with self.cpu_offloading_hooks({tail_arg}) as _offload:') as offload_block:
                     offload_block.insert_body(group_codes)
                 group_codes = offload_block.code
@@ -1079,16 +1116,14 @@ class ModuleCodeGen(FuncEmission):
                 # release input tensors after exiting a RC group:
                 last_node = group[-1]
                 line = lifetime.get_line(last_node)
-                if last_node != nodes[-1]: # skip if it is the last node
+                if lifetime.get_line(last_node) != len(lifetime.nodes) - 1:
+                    # The checkpoint call has consumed the group's final node
+                    # too; its last-use inputs may now leave the outer scope.
                     inputs_to_rel = [t for t in group_segment.inputs() if lifetime.releasable_after_line(t, line + 1)]
                     if len(inputs_to_rel) > 0:
                         del_stmt = self.emit_release(inputs_to_rel)
                         codes.append(del_stmt)
 
-        if any(node.offload is not None for node in nodes):
-            with Block('with self.activation_offload_scope():') as scope_block:
-                scope_block.insert_body(codes)
-            codes = scope_block.code
         return codes
 
     def _emit_nodes(self, nodes: List[IRCell], lifecycle: LifeCycle, runtime_devid: int) -> List[str]:
@@ -1156,7 +1191,6 @@ class ModuleCodeGen(FuncEmission):
                     node.kwargs['clone_level'] = 1
 
                 code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=self.plan_ndevs, runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
-
                 if not param_inputs or CompileFlag.use_zero <= 1:
                     node_code += code
                 else:
@@ -1292,7 +1326,7 @@ class ModuleCodeGen(FuncEmission):
         return node_codes
 
     def _emit_recompute(self, nodes: Tuple[IRCell], inputs: List[IRSubTensor], outputs: List[IRSubTensor],
-                        lifecycle: LifeCycle, runtime_devid: int, *, offload: bool = False) -> List[str]:
+                        lifecycle: LifeCycle, runtime_devid: int, *, offload: bool = False, backward_ready=None) -> List[str]:
         """
         Emit code to define a Python function for Recomputing and invoke it
         e.g. (the lines are split into `List[str]`)
@@ -1347,10 +1381,17 @@ class ModuleCodeGen(FuncEmission):
             fb.insert_body(f'return {output_names_tuple}')
         codes = [''] + fb.code + ['']
         checkpoint = '_offload.checkpoint' if offload else 'ckpt.checkpoint'
-        codes.append(
-            f'{output_names_tuple} = {checkpoint}(recompute, {input_names_tuple}, use_reentrant=False)'
-        )
-
+        stream = checkpoint_stream(nodes, CompileFlag.module_streams)
+        context = ''
+        if stream is not None:
+            self.execplan.use_multi_streams = True
+            dependencies = list(dict.fromkeys([*inputs, *[obj for node in nodes for obj in node.iobjs() if obj.is_attr()]]))
+            dependencies = self.tuple_name(dependencies, prefix_attr='self.')
+            context = (f', context_fn=lambda: nnscaler.runtime.checkpoint_stream.contexts('
+                       f'{stream!r}, {dependencies}'
+                       f'{", backward_ready=" + backward_ready if backward_ready else ""})')
+        codes.append(f'{output_names_tuple} = {checkpoint}(recompute, {input_names_tuple}, '
+                     f'use_reentrant=False{context})')
         return codes
 
     def _get_param_first_used_pos(self, segment: IRSegment) -> Dict[IRFullTensor, int]:
@@ -1376,6 +1417,8 @@ class ModuleCodeGen(FuncEmission):
         self.model_init_statements: List[str] = list()
         # module forward code
         self.model_methods_bodies: List[List[str]] = list()
+        self.module_parameter_uses = {}
+        self.module_parameter_origins = {}
         # module member name
         self.symbols = SymbolTable()
         # batch size

@@ -1669,6 +1669,12 @@ class ParallelModule(CubeModule):
         self.cuda()
         self._param_reducer_map: dict[torch.nn.Parameter, int] = {}
         model_params = {p: n for n, p in self.named_parameters()}
+        from nnscaler.runtime.stream import register_parameter_stream
+        parameter_streams = getattr(self, 'module_parameter_streams', {})
+        tracked_parameters = set(getattr(self, 'module_stream_parameters', parameter_streams))
+        for param, name in model_params.items():
+            if name in tracked_parameters:
+                register_parameter_stream(param, parameter_streams.get(name))
         # key: attr name of the parameter
         # value: Zero3AttrMeta
         self._zero3_param_metadata: dict[str, Zero3AttrMeta] = {}

@@ -30,6 +30,8 @@ class CompileFlag:
 
     # ============ code generation ===============
     use_nnfusion = _to_bool('USE_NNFUSION')
+    module_streams = ()
+    multi_stream_ops = ()
     use_jit = _to_bool('USE_JIT')
     disable_code_line_info = _to_bool('DISABLE_CODE_LINE_INFO')  # will add original code information in generated code, note that this will make trace slow
     # how to execute the functions during trace, available choices ['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache']

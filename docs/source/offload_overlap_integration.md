@@ -31,4 +31,22 @@ GPU work must wait until the overlap chat completes and the GPUs are released.
 Maintain disk and host-memory limits and remove only this experiment's
 regenerable artifacts after preserving verification evidence.
 
-Status: source snapshots pinned; feature integration and validation pending.
+Status: CPU integration validated; GPU validation pending.
+
+## Integration decisions
+
+- Preserve deployed optimizer and cross-entropy implementations rather than
+  importing unrelated older performance changes.
+- Keep one activation scope around each scheduled forward, including stream
+  fragments. Preserve the final offload-group boundary across those fragments.
+- Recompute composition stops at distinct stream invocations/readiness domains.
+- DeepEP runtime settings have one CLI registration and agree between buffer
+  allocation and collectives; both named fields and five-value arrays load.
+- Use stock DeepEP. External NIC/RDMA benchmark prototypes are not installed
+  as default activation transfer backends.
+
+CPU validation: NNScaler combined suite 253 passed/83 CUDA-skipped; LLM
+configuration/policy suite 570 passed; the generated eight-combination CPU
+semantic matrix plus stream-boundary checks 10 passed/8 CUDA-skipped;
+DeepEP configuration follow-up 21 passed. CPU stream serialization tests
+validate graph/autograd composition, not CUDA concurrency.

@@ -123,6 +123,7 @@ For any questions or inquiries, please contact us at nnscaler@service.microsoft.
 
    parallel_module
    cpu_activation_offload
+   module_streams
    dimops
    verify_op
 

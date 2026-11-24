@@ -87,7 +87,8 @@ def _resolve_plan_layouts(plan, degree):
 
 
 def merge_recompute_regions(plans, *, partition_degree=1,
-                            hooks_allow_recompute=None, _resolved_layouts=None):
+                            hooks_allow_recompute=None, _resolved_layouts=None,
+                            region_key=None):
     """Return copied plans and a report after composing maximal legal chains.
 
     Existing selection supplies the replay contract, including opaque ops.
@@ -193,7 +194,8 @@ def merge_recompute_regions(plans, *, partition_degree=1,
                         for rank in range(partition_degree)):
                     return None, 'layout'
         return dict(plans=region, layouts=layouts, inputs=inputs, outputs=outputs,
-                    offload=offload.pop()), None
+                    offload=offload.pop(),
+                    scheduling_key=region_key([p.op for p in region]) if region_key else None), None
 
     for region in regions:
         current, reason = describe(region)
@@ -207,6 +209,8 @@ def merge_recompute_regions(plans, *, partition_degree=1,
                 reason = 'stage'
             elif previous['offload'] != current['offload']:
                 reason = 'offload'
+            elif previous['scheduling_key'] != current['scheduling_key']:
+                reason = 'scheduling'
             elif not previous['outputs'] & current['inputs']:
                 reason = 'no_dependency'
             elif any(k in previous['layouts'] and previous['layouts'][k] != v

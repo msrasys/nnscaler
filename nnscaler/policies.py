@@ -1331,11 +1331,14 @@ def fn(
         op_plans = {plan.op: plan for plan in transformed}
 
     if cfg.recompute_merge_adjacent:
+        from nnscaler.graph.schedule.module_streams import recompute_region_key
         merged, report = merge_recompute_regions(
             [op_plans[node] for node in fw_nodes],
             partition_degree=op_partition_ngpus,
             hooks_allow_recompute=hooks_allow_recompute,
             _resolved_layouts=resolved_layouts,
+            region_key=(lambda nodes: recompute_region_key(nodes, cfg.module_streams))
+                       if cfg.module_streams else None,
         )
         op_plans = {plan.op: plan for plan in merged}
         _logger.info('Adjacent recompute merge: %s', json.dumps(report))

@@ -44,6 +44,10 @@ from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph.parser import FxModuleParser
 from nnscaler.graph.schedule.predefined import PredefinedSched
 from nnscaler.graph.schedule.schedplan import SchedulePlan
+from nnscaler.graph.schedule.module_streams import (
+    ModuleStreamRule, module_stream_rules_from_env, normalize_module_stream_rules,
+    multi_stream_ops_from_env, normalize_multi_stream_ops,
+)
 
 from nnscaler.ir.cten import IRObject, IRTensor, IR
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation
@@ -175,6 +179,13 @@ class ComputeConfig:
     # This option only works for pipeline.
     use_async_comm: bool = False
 
+    # Independent module branches executed on named CUDA streams. Environment
+    # defaults are resolved here and serialized, so code reuse is configuration safe.
+    module_streams: Tuple[ModuleStreamRule, ...] = field(default_factory=module_stream_rules_from_env)
+    # Custom operators with internal side streams need scheduled input lifetime
+    # tracking even when no module is moved by the compiler.
+    multi_stream_ops: Tuple[str, ...] = field(default_factory=multi_stream_ops_from_env)
+
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
     # This only works when the `use_end2end` is `True` for now.
@@ -263,6 +274,12 @@ class ComputeConfig:
             )
             super().__setattr__('cpu_offload', replace(self.cpu_offload, release_pipeline_inputs=False))
         super().__setattr__('release_pipeline_inputs', legacy_release if release_inputs is None else release_inputs)
+        super().__setattr__('module_streams', normalize_module_stream_rules(self.module_streams))
+        super().__setattr__('multi_stream_ops', normalize_multi_stream_ops(self.multi_stream_ops))
+        if self.module_streams and self.use_zero > 1:
+            raise ValueError('module_streams currently supports ZeRO 0/1 only')
+        if self.multi_stream_ops and self.use_zero > 1:
+            raise ValueError('multi_stream_ops currently supports ZeRO 0/1 only')
         if self.plan_ngpus <= 0:
             raise ValueError(f"plan_ngpus {self.plan_ngpus} must be > 0")
         if self.runtime_ngpus is None:
@@ -467,7 +484,17 @@ class ComputeConfig:
                     # this can raise if cfg has extra keys.
                     # which means some fields of ComputeConfig has been removed(we should avoid this).
                     # in this case, we just return None.
-                    return cls(**cfg)
+                    # Loading a saved config must preserve the compiler ABI
+                    # that actually produced its code. Normal construction
+                    # intentionally normalizes user/YAML rules to today's ABI.
+                    cfg.setdefault('module_streams', ())
+                    cfg.setdefault('multi_stream_ops', ())
+                    result = cls(**cfg)
+                    for saved, rule in zip(cfg['module_streams'], result.module_streams):
+                        version = (saved.get('_codegen_version') if isinstance(saved, dict)
+                                   else getattr(saved, '_codegen_version', None))
+                        object.__setattr__(rule, '_codegen_version', version)
+                    return result
                 return cfg
             except Exception as e:
                 if not return_none_on_error:
@@ -521,6 +548,8 @@ def _compile_flags(compute_config: ComputeConfig):
         zero_param_level_sharding=compute_config.zero_param_level_sharding,
         reducer_replicated_params=compute_config.reducer_replicated_params,
         use_fbw=compute_config.use_fbw,
+        module_streams=compute_config.module_streams,
+        multi_stream_ops=compute_config.multi_stream_ops,
     )
 
 
