@@ -81,7 +81,9 @@ def checkpoint_roundtrip(generated, path, device):
     restored = (new_empty(type(generated), device=device, init_params=True)
                 if device == 'cpu' else type(generated)(init_params=True))
     restored_optimizer = torch.optim.Adam(restored.parameters(), lr=1e-3)
-    saved = torch.load(path, map_location=device, weights_only=False)
+    # Let load_state_dict place each optimizer tensor; non-capturable Adam's
+    # step counter intentionally stays on CPU even when parameters are on CUDA.
+    saved = torch.load(path, map_location='cpu', weights_only=False)
     restored.load_state_dict(saved['model'])
     restored_optimizer.load_state_dict(saved['optimizer'])
     x = torch.linspace(-1, 1, 32, device=device).reshape(4, 8)
