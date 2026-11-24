@@ -203,3 +203,30 @@ def test_single_op_recompute_preserves_deployed_default(tmp_path, monkeypatch, e
     torch.testing.assert_close(result, torch.tanh(x))
     torch.testing.assert_close(x.grad, 1-torch.tanh(x.detach()).square())
     assert len(calls) == int(enabled)
+
+
+@replace_all_device_with('cpu', force=True)
+def test_disabled_activation_features_keep_deployed_checkpoint_execution(tmp_path, monkeypatch):
+    import torch.utils.checkpoint as original_checkpoint
+    import nnscaler.runtime.checkpoint as activation_checkpoint
+
+    model = CombinedModel()
+    reference = copy.deepcopy(model)
+    x = torch.randn(4,8,requires_grad=True)
+    parallelize(model, {'x':x.detach().requires_grad_()}, configured_policy,
+                configuration(False,False,False), gen_savedir=tmp_path,
+                instance_name='legacy_checkpoint', load_module=False)
+    cls = _load_parallel_module_class(CombinedModel, gen_savedir=tmp_path,
+                                      instance_name='legacy_checkpoint',rank=0)
+    generated = new_empty(cls,device='cpu',init_params=True)
+    original = original_checkpoint.checkpoint
+    calls = []
+    def observe(*args,**kwargs):
+        calls.append(True)
+        return original(*args,**kwargs)
+    def forbidden(*args,**kwargs):
+        raise AssertionError('Disabled activation features entered the new checkpoint adapter')
+    monkeypatch.setattr(original_checkpoint,'checkpoint',observe)
+    monkeypatch.setattr(activation_checkpoint,'checkpoint',forbidden)
+    compare_gradients(generated,reference,x)
+    assert len(calls)==3

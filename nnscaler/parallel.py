@@ -91,7 +91,7 @@ from nnscaler.utils import (
 logger = logging.getLogger(__name__)
 
 # Metadata emitted by this compiler, independently of a caller's saved config.
-_TRACE_METADATA_VERSION = 5
+_TRACE_METADATA_VERSION = 6
 
 
 _PREDEFINE_SCHEDS: Dict[str, Callable[[IRGraph, int, int], SchedulePlan]] = {}
@@ -552,6 +552,9 @@ def _compile_flags(compute_config: ComputeConfig):
         zero_param_level_sharding=compute_config.zero_param_level_sharding,
         reducer_replicated_params=compute_config.reducer_replicated_params,
         use_fbw=compute_config.use_fbw,
+        checkpoint_input_aliases=(compute_config.cpu_offload is not None
+                                  or compute_config.recompute_merge_adjacent
+                                  or compute_config.recompute_single_ops),
         module_streams=compute_config.module_streams,
         multi_stream_ops=compute_config.multi_stream_ops,
     )

@@ -56,7 +56,7 @@ Adam-state round trip followed by another update; configuration serialization
 preserves every feature switch. CUDA concurrency/resume checks are collected
 but remain gated on overlap chat completion.
 
-The combined compiler uses trace metadata version 5. Packages generated before
+The combined compiler uses trace metadata version 6. Packages generated before
 activation/stream integration are regenerated even when their individual
 feature settings happen to match, preserving the deployed lifetime fixes.
 
@@ -78,3 +78,12 @@ forced-storage-release helper. Private owners now leave scope normally rather
 than resizing aliased storage. dsilu buffer reuse is disabled for retained or
 higher-order graph tasks; 45 real MoE kernel checks passed, including repeated
 backward and borrowed-storage preservation.
+
+## Disabled checkpoint fast path
+
+With CPU offload, adjacent merging and singleton selection all disabled, code
+generation imports the deployed `torch.utils.checkpoint` directly. The saved
+input alias adapter is selected only by those explicit activation features.
+Module-stream-only execution preserves its original checkpoint context path.
+A runtime regression rejects accidental entry into the new adapter when off.
+CPU checks48passed/8CUDA-skipped; isolated CUDA matrix22passed.

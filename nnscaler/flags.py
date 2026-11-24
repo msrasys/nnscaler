@@ -31,6 +31,7 @@ class CompileFlag:
     # ============ code generation ===============
     use_nnfusion = _to_bool('USE_NNFUSION')
     module_streams = ()
+    checkpoint_input_aliases = False
     multi_stream_ops = ()
     use_jit = _to_bool('USE_JIT')
     disable_code_line_info = _to_bool('DISABLE_CODE_LINE_INFO')  # will add original code information in generated code, note that this will make trace slow

@@ -308,7 +308,8 @@ def test_generated_checkpoint_survives_pseudo_free_of_passthrough_output(tmp_pat
                                             init_method=(tmp_path / 'rendezvous').as_uri())
         try:
             compiled = parallelize(copy.deepcopy(model), {'x': value.detach().clone().requires_grad_()},
-                                   policy, ComputeConfig(1, 1, cpu_offload=CPUOffloadConfig() if offload else None),
+                                   policy, ComputeConfig(1, 1, recompute_single_ops=True,
+                                                         cpu_offload=CPUOffloadConfig() if offload else None),
                                    gen_savedir=tmp_path, instance_name='stable_checkpoint', load_module=True)
             source = next(tmp_path.rglob('gencode0.py')).read_text()
             assert 'import nnscaler.runtime.checkpoint as ckpt' in source

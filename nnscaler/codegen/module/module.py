@@ -145,7 +145,9 @@ class ModuleCodeGen(FuncEmission):
             '########## Generated Model Code ###########',
             'from typing import *',
             'from pathlib import Path',
-            'import torch', 'import nnscaler.runtime.checkpoint as ckpt',
+            'import torch',
+            ('import nnscaler.runtime.checkpoint as ckpt' if CompileFlag.checkpoint_input_aliases
+             else 'import torch.utils.checkpoint as ckpt'),
             'import nnscaler', 'import nnscaler.flags',
             'import nnscaler.runtime.function',
             'import nnscaler.runtime.device',
