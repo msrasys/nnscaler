@@ -1943,9 +1943,12 @@ def build_optimizer(
                     seen.add(param)
                     offset += 1
                     yield param
-            if isinstance(m, ParallelModule):
-                # A zero-length location still consumes the module's original parameters
-                # in a merged checkpoint, but consumes no local optimizer slots.
+            # A zero-length location (e.g. on an inactive rank, or for frozen parameters)
+            # still consumes the module's original parameters in a merged checkpoint,
+            # but consumes no local optimizer slots.
+            # A module without original parameters takes no place in a merged checkpoint,
+            # and merging has no state for it when it saves no tensors at all, so it gets no location.
+            if isinstance(m, ParallelModule) and m.origin_module_metadata.origin_param_names:
                 opt_module_locs[name] = ModuleParameterLocation(start, offset - start)
 
         if non_parallel_module_use_zero:

@@ -55,11 +55,24 @@ class FcRelu_4_4(FcRelu):
         return super().forward(x + self.buffer)
 
 
+class Relu2(nn.Module):
+    """A module without parameters or persistent buffers."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return torch.relu(x) * 2
+
+
 def _empty_optimizer_shards_worker(tmp_path):
     init_distributed()
     block = parallelize(FcRelu_4_4, {'x': torch.ones(2, 4)}, 'dp',
                         ComputeConfig(1, 1), gen_savedir=tmp_path)
-    model = nn.Sequential(block(), block(), block())
+    act = parallelize(Relu2, {'x': torch.ones(2, 4)}, 'dp',
+                      ComputeConfig(1, 1), gen_savedir=tmp_path)
+    # The parameterless module saves no tensors, so merging has no state for it.
+    model = nn.Sequential(block(), act(), block(), block())
     model[1:].requires_grad_(False)
     opt = build_optimizer(model, torch.optim.Adam)
     model(torch.ones(2, 4)).sum().backward()
