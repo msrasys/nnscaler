@@ -8,6 +8,7 @@ import types
 from typing import Callable, Any, Dict, Iterable, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
 from pathlib import Path
 import inspect
+import itertools
 import sys
 import importlib
 import multiprocessing
@@ -842,7 +843,15 @@ def _gen_graph(
     IDGenerator().clear()
     disable_global_graph()
 
-    module.cpu()
+    has_meta_tensors = any(t.is_meta for t in itertools.chain(module.parameters(), module.buffers()))
+    if has_meta_tensors:
+        if save_level & (parser.AttrSaveLevel.F | parser.AttrSaveLevel.N):
+            raise ValueError(
+                "Modules with meta-device parameters/buffers require param_init_strategy='shard' "
+                "so concrete attribute contents are not serialized."
+            )
+    else:
+        module.cpu()
     forward_args_default = _get_arg_default_values(module.forward)
     for v in forward_args_default.values():
         if v is not inspect.Parameter.empty and not isinstance(v, (int, str, float, bool, type(None))):

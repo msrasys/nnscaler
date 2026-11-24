@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import itertools
 import time
 from typing import TYPE_CHECKING, Any, Tuple, Dict, Callable, Type
 
@@ -90,19 +91,38 @@ class BaseTraceStrategy:
     def run_output(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         return args[0], args, kwargs
 
+    @staticmethod
+    def _remap_cuda_devices(args: Tuple[Any, ...], kwargs: Dict[str, Any], device: str) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+        if device == 'cuda':
+            return args, kwargs
+        target_dev = torch.device(device)
+        exec_args, exec_kwargs = pytree_utils.tree_map_only(
+            torch.device,
+            lambda d: target_dev if d.type == 'cuda' else d,
+            (args, kwargs),
+        )
+        if isinstance(exec_kwargs.get('device'), str) and exec_kwargs['device'].startswith('cuda'):
+            exec_kwargs = dict(exec_kwargs)
+            exec_kwargs['device'] = target_dev
+        return exec_args, exec_kwargs
+
     def _run_call_function_on(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any], device: str) -> Tuple[Any, Tuple, Dict]:
         if not isinstance(target, Callable):
             raise ValueError(f'the target of "call_function" should be a callable function, but get target {target}')
         args, kwargs = self._place_tensors_to(args, kwargs, device=device)
-        return target(*args, **kwargs), args, kwargs
+        exec_args, exec_kwargs = self._remap_cuda_devices(args, kwargs, device=device)
+        return target(*exec_args, **exec_kwargs), args, kwargs
 
     def _run_call_method_on(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any], device: str) -> Tuple[Any, Tuple, Dict]:
         if not isinstance(target, str):
             raise ValueError(f'the target of "call_method" should be a string, a bound method name of the first argument, but get target {target}')
         args, kwargs = self._place_tensors_to(args, kwargs, device=device)
-        self_obj, *args_tail = args
+        exec_args, exec_kwargs = self._remap_cuda_devices(args, kwargs, device=device)
+        self_obj, *args_tail = exec_args
+        if target == 'cuda' and device != 'cuda':
+            return self_obj.to(device), args, kwargs
         func = getattr(self_obj, target)
-        return func(*args_tail, **kwargs), args, kwargs
+        return func(*args_tail, **exec_kwargs), args, kwargs
 
     def _run_call_module_on(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any], device: str) -> Tuple[Any, Tuple, Dict]:
         if not isinstance(target, str):
@@ -196,9 +216,19 @@ class MetaStrategy(BaseTraceStrategy):
         super().__init__(tracer, 'meta')
 
     def place_model(self, model: torch.nn.Module) -> torch.nn.Module:
+        if any(t.is_meta for t in itertools.chain(model.parameters(), model.buffers())):
+            return model
         # TODO: save the original model paramenters/buffers data to somewhere, the concrate value will lose after place the model to meta
         # return self._place_module_to_meta(model)
         return self._place_module_to(model, device='cpu')
+
+    def run_call_function(self, target: Target, args: Tuple[Any], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
+        with self.tracer.patcher.revert():
+            return super().run_call_function(target, args, kwargs)
+
+    def run_call_method(self, target: Target, args: Tuple[Any], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
+        with self.tracer.patcher.revert():
+            return super().run_call_method(target, args, kwargs)
 
 
 class CudaRunCpuOffloadStrategy(BaseTraceStrategy):

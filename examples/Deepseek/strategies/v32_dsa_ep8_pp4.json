@@ -1,0 +1,79 @@
+{
+  "name": "deepseek_v32_dsa_ep8_pp4",
+  "description": "DeepSeek-V3.2-Exp (671B-A37B + DSA Sparse Attention Indexer, 61L, 256E): 32-GPU PP=4 x MLA-TP=8 & MoE-EP=8",
+  "mesh": {
+    "plan_ngpus": 32,
+    "pipeline_nstages": 4,
+    "pipeline_size": 4,
+    "pipeline_nmicros": 8,
+    "pipeline_scheduler": "1f1b",
+    "zero_stage": 1
+  },
+  "rewrites": {
+    "expand_moe_ops": false,
+    "sum_ce_loss": true,
+    "decouple_row_tp_bias": true
+  },
+  "default_partition": "replicate",
+  "recompute_modules": [
+    "layers\\.\\d+$"
+  ],
+  "stage_splits": [
+    { "layers": "0..15", "stage_id": 0 },
+    { "layers": "16..30", "stage_id": 1 },
+    { "layers": "31..45", "stage_id": 2 },
+    { "layers": "46..60", "stage_id": 3 }
+  ],
+  "rules": [
+    {
+      "name": "lm_head_vocab_tp8",
+      "fqn_regex": "(^|\\.)lm_head$",
+      "op_regex": "linear",
+      "partition": "vocab_parallel"
+    },
+    {
+      "name": "dsa_indexer_mask_rep",
+      "op_regex": "deepseek_v32_dsa_index_mask",
+      "partition": "replicate"
+    },
+    {
+      "name": "mla_qkv_col_tp8",
+      "fqn_regex": "self_attn\\.(q_proj|q_b_proj|kv_b_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "mla_concat_kv_head_tp8",
+      "op_regex": "deepseek_mla_concat_kv",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "mla_sdpa_head_tp8",
+      "op_regex": "scaled_dot_product_attention",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "mla_o_row_tp8",
+      "fqn_regex": "self_attn\\.o_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "dense_and_shared_mlp_col_tp8",
+      "fqn_regex": "mlp\\.(shared_experts\\.)?(gate_proj|up_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "dense_and_shared_mlp_row_tp8",
+      "fqn_regex": "mlp\\.(shared_experts\\.)?down_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "moe_experts_ep8",
+      "op_regex": "deepseek_moe_grouped_gemm",
+      "partition": "expert_parallel"
+    }
+  ]
+}

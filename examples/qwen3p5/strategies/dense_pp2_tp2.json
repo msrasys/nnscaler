@@ -1,0 +1,89 @@
+{
+  "name": "qwen3p5_dense_pp2_tp2",
+  "description": "2-stage Pipeline Parallelism (1F1B) x TP=2 (4 GPUs) with per-decoder-layer activation recomputation.",
+  "mesh": {
+    "plan_ngpus": 4,
+    "runtime_ngpus": 4,
+    "pipeline_nstages": 2,
+    "pipeline_size": 2,
+    "pipeline_nmicros": 4,
+    "pipeline_scheduler": "1f1b",
+    "zero_stage": 1,
+    "zero_ngroups": 1
+  },
+  "rewrites": {
+    "loss_reduction": "sum-count",
+    "wrap_gdn_kernels": true,
+    "head_grouped_gdn_qkv": true,
+    "static_moe_grouped_gemm": true,
+    "expand_moe_ops": false,
+    "wrap_vision_ops": true
+  },
+  "default_partition": "auto",
+  "recompute_modules": [
+    "layers\\.\\d+"
+  ],
+  "stage_splits": [
+    { "layers": "0..11", "stage_id": 0 },
+    { "layers": "12..23", "stage_id": 1 }
+  ],
+  "rules": [
+    {
+      "name": "attn_qkv_col_tp",
+      "fqn_regex": "self_attn\\.(q_proj|k_proj|v_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "attn_o_row_tp",
+      "fqn_regex": "self_attn\\.o_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "gdn_in_proj_col_tp",
+      "fqn_regex": "linear_attn\\.(in_proj_qkv|in_proj_z|in_proj_b|in_proj_a)$",
+      "op_regex": "linear",
+      "partition": "tp_col",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "gdn_conv_and_fla_head_tp",
+      "op_regex": "qwen3_5_(causal_conv1d|chunk_gated_delta_rule)",
+      "partition": "head_parallel",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "gdn_out_proj_row_tp",
+      "fqn_regex": "linear_attn\\.out_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "mlp_gate_up_col_tp",
+      "fqn_regex": "mlp\\.(gate_proj|up_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "mlp_down_row_tp",
+      "fqn_regex": "mlp\\.down_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "token_sharded_lm_head",
+      "fqn_regex": "lm_head$",
+      "op_regex": "linear",
+      "partition": "data_parallel",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "token_sharded_sum_ce",
+      "op_regex": "cross_entropy",
+      "partition": "data_parallel",
+      "on_indivisible": "fallback_replicate"
+    }
+  ]
+}

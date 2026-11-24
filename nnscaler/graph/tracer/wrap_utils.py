@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional, Type, List, Callable, Union, TYPE_CHECKI
 
 import math
 import torch
-from torch.fx.proxy import Scope, ScopeContextManager
+from torch.fx.proxy import Proxy, Scope, ScopeContextManager
 from torch.overrides import is_tensor_method_or_property
 
 import nnscaler.graph.tracer as cct
@@ -622,7 +622,7 @@ def isinstance_wrapper(instance, clz):
                 clz_wrapped.append(orig_type)
         clz = (*clz_wrapped, *(aclz for aclz in clz if aclz not in wrapped_cls_to_orig_cls))
         # use _orig_isinstance(clz, Iterable) will cause an endless recursive loop
-        for cls in (object, cct.ConcreteProxy):
+        for cls in (object, Proxy, cct.ConcreteProxy):
             if cls in clz and orig_func.isinstance(instance, cls):
                 return True
         if orig_func.isinstance(instance, cct.ConcreteProxy):
@@ -630,7 +630,7 @@ def isinstance_wrapper(instance, clz):
         else:
             return orig_func.isinstance(instance, clz)
     else:
-        if clz in (object, cct.ConcreteProxy):
+        if clz in (object, Proxy, cct.ConcreteProxy):
             return orig_func.isinstance(instance, clz)
         if clz in wrapped_cls_to_orig_cls:
             clz = wrapped_cls_to_orig_cls[clz]

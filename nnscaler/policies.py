@@ -1460,6 +1460,11 @@ def fn(
                     op_partitions = []
                     break
                 elif last_partition_dim is not None:
+                    if not isinstance(op_plan.op, IRDimops) or not op_plan.op.algorithm('dim').satisfy(
+                        idx=idx, dim=last_partition_dim, num=tp_size
+                    ):
+                        op_partitions = []
+                        break
                     op_partitions.append(OpPartition(input=idx, dim=last_partition_dim))
 
         # final partition plan for the op

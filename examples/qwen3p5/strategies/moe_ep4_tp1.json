@@ -1,0 +1,89 @@
+{
+  "name": "qwen3p5_moe_ep4_fused",
+  "description": "4-way Expert Parallelism + Hybrid TP=4 for Qwen3.5 MoE (default expand_moe_ops=false fused grouped GEMM).",
+  "mesh": {
+    "plan_ngpus": 4,
+    "runtime_ngpus": 4,
+    "pipeline_nstages": 1,
+    "pipeline_size": 1,
+    "pipeline_nmicros": 1,
+    "pipeline_scheduler": "1f1b",
+    "zero_stage": 1,
+    "zero_ngroups": 1
+  },
+  "rewrites": {
+    "loss_reduction": "sum-count",
+    "wrap_gdn_kernels": true,
+    "head_grouped_gdn_qkv": true,
+    "static_moe_grouped_gemm": true,
+    "expand_moe_ops": false,
+    "wrap_vision_ops": true
+  },
+  "default_partition": "auto",
+  "recompute_modules": [],
+  "stage_splits": [],
+  "rules": [
+    {
+      "name": "moe_routed_experts_ep",
+      "op_regex": "qwen3_5_moe_grouped_gemm",
+      "partition": "expert_parallel"
+    },
+    {
+      "name": "moe_shared_expert_col_tp",
+      "fqn_regex": "shared_expert\\.(gate_proj|up_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "moe_shared_expert_row_tp",
+      "fqn_regex": "shared_expert\\.down_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "attn_qkv_col_tp",
+      "fqn_regex": "self_attn\\.(q_proj|k_proj|v_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "attn_o_row_tp",
+      "fqn_regex": "self_attn\\.o_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "gdn_in_proj_col_tp",
+      "fqn_regex": "linear_attn\\.(in_proj_qkv|in_proj_z|in_proj_b|in_proj_a)$",
+      "op_regex": "linear",
+      "partition": "tp_col",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "gdn_conv_and_fla_head_tp",
+      "op_regex": "qwen3_5_(causal_conv1d|chunk_gated_delta_rule)",
+      "partition": "head_parallel",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "gdn_out_proj_row_tp",
+      "fqn_regex": "linear_attn\\.out_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "token_sharded_lm_head",
+      "fqn_regex": "lm_head$",
+      "op_regex": "linear",
+      "partition": "data_parallel",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "token_sharded_sum_ce",
+      "op_regex": "cross_entropy",
+      "partition": "data_parallel",
+      "on_indivisible": "fallback_replicate"
+    }
+  ]
+}

@@ -433,6 +433,31 @@ def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requi
     )
 
 
+def NewEmpty(input: IRTensor, size, *arg_size, dtype=None, device=None,
+             requires_grad=False, layout=None, pin_memory=False, memory_format=None, signature=None):
+    dtype = dtype if dtype is not None else input.dtype
+    return Empty(size, *arg_size, dtype=dtype, layout=layout, device=device,
+                 requires_grad=requires_grad, pin_memory=pin_memory, memory_format=memory_format)
+
+
+def NewZeros(input: IRTensor, size, *arg_size, dtype=None, device=None,
+             requires_grad=False, layout=None, pin_memory=False, signature=None):
+    dtype = dtype if dtype is not None else input.dtype
+    return Zeros(size, *arg_size, dtype=dtype, layout=layout, device=device, requires_grad=requires_grad)
+
+
+def NewOnes(input: IRTensor, size, *arg_size, dtype=None, device=None,
+            requires_grad=False, layout=None, pin_memory=False, signature=None):
+    dtype = dtype if dtype is not None else input.dtype
+    return Ones(size, *arg_size, dtype=dtype, layout=layout, device=device, requires_grad=requires_grad)
+
+
+def NewFull(input: IRTensor, size, fill_value, *, dtype=None, device=None,
+            requires_grad=False, layout=None, pin_memory=False, signature=None):
+    dtype = dtype if dtype is not None else input.dtype
+    return Full(size, fill_value, dtype=dtype, layout=layout, device=device, requires_grad=requires_grad)
+
+
 def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
           device=None, requires_grad=False, signature=None):
     """
@@ -718,9 +743,25 @@ def Clone(input, *, memory_format=None, signature = None):
     """
     torch.clone(input, *, memory_format=torch.preserve_format)
     """
-    assert memory_format is None, f"Not supported for a specific memory format"
+    assert memory_format in (None, torch.preserve_format, torch.contiguous_format), (
+        f"Not supported for memory_format={memory_format}"
+    )
     annos = ['* -> *']
-    return IRDimops(Clone, 'clone', signature, annos, [input])
+    kw = {'memory_format': memory_format} if memory_format is not None else {}
+    return IRDimops(Clone, 'clone', signature, annos, [input], **kw)
+
+
+def BitwiseAnd(input, other, *, out=None, signature=None):
+    """
+    torch.bitwise_and(input, other, *, out=None) → Tensor
+    """
+    assert out is None
+    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
+        return input & other
+    assert isinstance(input, IRTensor) and isinstance(other, IRTensor)
+    lshape, rshape, oshape = _handle_broadcast(input, other)
+    annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+    return IRDimops(BitwiseAnd, 'bitwise_and', signature, annos, [input, other])
 
 
 def BitwiseOr(input, other, *, out=None, signature=None):
@@ -763,6 +804,10 @@ def IsInf(input, *, signature=None):
 def _unwrap_value(obj: Union[IRObject, Any]):
     if isinstance(obj, IRObject):
         return _unwrap_value(obj.value)
+    elif isinstance(obj, torch.Size):
+        return torch.Size(_unwrap_value(v) for v in obj)
+    elif isinstance(obj, tuple) and hasattr(obj, '_fields'):
+        return type(obj)(*(_unwrap_value(v) for v in obj))
     elif isinstance(obj, (list, tuple)):
         return type(obj)(_unwrap_value(v) for v in obj)
     elif isinstance(obj, dict):
@@ -967,6 +1012,12 @@ def LogSigmoid(input, signature = None):
     return IRDimops(LogSigmoid, 'log_sigmoid', signature, annos, [input])
 
 
+def Softplus(input, beta=1, threshold=20, signature = None):
+    annos = ['* -> *']
+    signature = 'torch.nn.functional.softplus'
+    return IRDimops(Softplus, 'softplus', signature, annos, [input], beta=beta, threshold=threshold)
+
+
 def ReLU(input, inplace=False, signature = None):
     annos = ['* -> *']
     signature = 'torch.nn.functional.relu'
@@ -1130,13 +1181,7 @@ def MaskedFill(input, mask, value, signature = None):
     """
     torch.Tensor.masked_fill_(mask, value)
     """
-    edim_in0 = ShapeAnno.create_shape_str(input.shape)
-    edim_in1 = ShapeAnno.create_shape_str(mask.shape)
-    edim_ou = copy.copy(edim_in0)
-    #TODO: add broadcast rule
-    for idx, (lhs, rhs) in enumerate(zip(input.shape, mask.shape)):
-        if lhs != rhs and rhs == 1:
-            edim_in1[idx] = '1'
+    edim_in0, edim_in1, edim_ou = _handle_broadcast(input, mask)
     anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
     return IRDimops(MaskedFill, 'masked_fill', signature, [anno], [input, mask], value=value)
 
@@ -1390,10 +1435,13 @@ def Contiguous(input, memory_format = None, signature = None):
     """
     torch.Tensor.contiguous(Tensor self) -> Tensor
     """
-    assert memory_format is None
+    assert memory_format in (None, torch.contiguous_format, torch.preserve_format), (
+        f"Not supported for memory_format={memory_format}"
+    )
     anno = ['* -> *']
     signature = 'torch.Tensor.contiguous'
-    return IRDimops(Contiguous, 'contiguous', signature, anno, [input])
+    kw = {'memory_format': memory_format} if memory_format is not None else {}
+    return IRDimops(Contiguous, 'contiguous', signature, anno, [input], **kw)
 
 
 def _reshape_anno(in_shape: List[int], ou_shape: List[int], kwarg_name: str) -> Tuple[str, List[TransformRule]]:
@@ -1931,6 +1979,7 @@ def Chunk(input: IRTensor, chunks, dim=0, signature = None):
     """
     torch.chunk(input, chunks, dim=0)
     """
+    dim = dim + len(input.shape) if dim < 0 else dim
     assert input.shape[dim] % chunks == 0
     iannos = [ShapeAnno.create_shape_str(input.shape)]
     oannos = [copy.copy(iannos[0]) for _ in range(chunks)]
@@ -2862,6 +2911,13 @@ def ScaledDotProductAttention(query, key, value, attn_mask=None, dropout_p=0.0,
     key_anno[-1] = next(gener) + '^'
     query_anno = copy.copy(key_anno)
     query_anno[-2] = next(gener)
+    if kwargs.get('enable_gqa', False) and len(query.shape) >= 3 and query.shape[-3] != key.shape[-3]:
+        if query.shape[-3] % key.shape[-3] != 0 or key.shape[-3] != value.shape[-3]:
+            raise ValueError(
+                f'Invalid GQA head shapes: query={query.shape}, key={key.shape}, value={value.shape}'
+            )
+        gqa_group = query.shape[-3] // key.shape[-3]
+        query_anno[-3] = f'({key_anno[-3]} {gqa_group}^)'
     if is_causal or attn_mask is not None:
         query_anno[-2] += '^'
     out_anno = copy.copy(query_anno)

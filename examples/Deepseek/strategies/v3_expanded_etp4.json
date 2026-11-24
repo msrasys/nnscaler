@@ -1,0 +1,70 @@
+{
+  "name": "deepseek_v3_expanded_etp4",
+  "description": "Opt-in expand_moe_ops=true strategy sharding atomic deepseek_grouped_linear along Expert-TP (Col-ETP gate/up + Row-ETP down)",
+  "mesh": {
+    "plan_ngpus": 4,
+    "pipeline_nstages": 1,
+    "pipeline_size": 1,
+    "pipeline_nmicros": 1,
+    "zero_stage": 1
+  },
+  "rewrites": {
+    "expand_moe_ops": true,
+    "sum_ce_loss": true,
+    "decouple_row_tp_bias": true
+  },
+  "default_partition": "replicate",
+  "rules": [
+    {
+      "name": "lm_head_vocab_tp4",
+      "fqn_regex": "(^|\\.)lm_head$",
+      "op_regex": "linear",
+      "partition": "vocab_parallel"
+    },
+    {
+      "name": "mla_qkv_col_tp4",
+      "fqn_regex": "self_attn\\.(q_proj|q_b_proj|kv_b_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "mla_concat_kv_head_tp4",
+      "op_regex": "deepseek_mla_concat_kv",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "mla_sdpa_head_tp4",
+      "op_regex": "scaled_dot_product_attention",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "mla_o_row_tp4",
+      "fqn_regex": "self_attn\\.o_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "dense_and_shared_mlp_col_tp4",
+      "fqn_regex": "mlp\\.(shared_experts\\.)?(gate_proj|up_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "dense_and_shared_mlp_row_tp4",
+      "fqn_regex": "mlp\\.(shared_experts\\.)?down_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "moe_expanded_down_etp_row",
+      "op_regex": "deepseek_grouped_linear",
+      "param_regex": "down_proj",
+      "partition": "expert_tp_row"
+    },
+    {
+      "name": "moe_expanded_gate_up_etp_col",
+      "op_regex": "deepseek_grouped_linear",
+      "partition": "expert_tp_col"
+    }
+  ]
+}

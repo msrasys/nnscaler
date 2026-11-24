@@ -83,6 +83,8 @@ class SignFx2Op:
         __ttemplate('tril'): function.Tril,
         __ftemplate('relu'): function.ReLU,
         __ftemplate('silu'): function.SiLU,
+        __ftemplate('softplus'): function.Softplus,
+        __fcntemplate('softplus'): function.Softplus,
         __fcntemplate('log_sigmoid'): function.LogSigmoid,
         __fcntemplate('gelu'): function.GeLU,
         __ttemplate('eq') : function.CompareEQ,
@@ -127,6 +129,8 @@ class SignFx2Op:
         __ttemplate('index_select'): function.IndexSelect,
         __ttemplate('finfo'): function.FInfo,
         __ttemplate('inverse'): function.Inverse,
+        __ttemplate('bitwise_and'): function.BitwiseAnd,
+        '_operator.and_': function.BitwiseAnd,
         __ttemplate('bitwise_or'): function.BitwiseOr,
         '_operator.or_': function.BitwiseOr,
         __ttemplate('bitwise_not'): function.BitwiseOr,
@@ -168,6 +172,10 @@ class SignFx2Op:
         __ftemplate('cross_entropy'): function.CrossEntropy,
         #
         # # creators
+        __tttemplate('new_empty'): function.NewEmpty,
+        __tttemplate('new_zeros'): function.NewZeros,
+        __tttemplate('new_ones'): function.NewOnes,
+        __tttemplate('new_full'): function.NewFull,
         __ttemplate('empty'): function.Empty,
         __ttemplate('zeros'): function.Zeros,
         __ttemplate('zeros_like'): function.ZerosLike,
