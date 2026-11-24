@@ -1,0 +1,34 @@
+# Offload, recompute and stream integration
+
+This experimental branch starts from the deployed NNScaler `yileiyang/vl_pp`
+revision and combines independently developed features for integration testing.
+All new feature switches must remain disabled by default.
+
+## Pinned sources
+
+- production: `14c46e62da1c0f0233fab9dcf492197fff5cda0d`
+- offload_original_head: `07479ae3f3068241d5883048806a1e9f3699da37`
+- offload_snapshot: `69e1ade1656a2e0408130d007e0b74131311eab1`
+- offload_merge_base: `f04321bab19a4f5a430cb46108940c375470a98e`
+- overlap: `95ae10df0b09d8600c26eaeaa2115fad6054b82c`
+
+The offload snapshot includes its validated, previously uncommitted recompute
+merge and cleanup. The original source worktree and index are unchanged.
+
+## Acceptance
+
+Compare the deployed two-repository baseline against integration with all
+features disabled, then cover all eight combinations of recompute merging,
+CPU activation offload and module streams. Use isolated Python environments
+and generated-code directories; keep the same stock DeepEP build, inputs,
+initial weights and training settings.
+
+Require first-step gradient-norm difference below 1e-5, multi-step numerical
+checks, checkpoint save/resume checks, and warmed-up performance and F/B-memory
+measurements. Compile/unit tests do not substitute for GPU training validation.
+
+GPU work must wait until the overlap chat completes and the GPUs are released.
+Maintain disk and host-memory limits and remove only this experiment's
+regenerable artifacts after preserving verification evidence.
+
+Status: source snapshots pinned; feature integration and validation pending.
