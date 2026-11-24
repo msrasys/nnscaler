@@ -692,16 +692,24 @@ from nnscaler.policies import fn, get_pas_ops, OpPlan
 def replicate(graph, cfg):
     return (OpPlan(node) for node in get_pas_ops(graph))
 
+def on_first_ranks(graph, cfg, k, plans):
+    # shrink the plan to k ranks, but keep the number of scale units
+    return fn(graph, replace(cfg, plan_ngpus=k, runtime_ngpus=cfg.num_scale_units * k), plans)
+
 def first_rank_only(graph, cfg):
     # place every operator on plan rank 0 only
-    return fn(graph, replace(cfg, plan_ngpus=1), replicate)
+    return on_first_ranks(graph, cfg, 1, replicate)
 
 # plan rank 0 of each scale unit (global ranks 0 and 2) runs the encoder
 encoder = parallelize(Encoder(), dummy_args, first_rank_only, ComputeConfig(2, 4), ...)
 ```
 
+Scale `runtime_ngpus` together with `plan_ngpus` in the reduced config.
+Then it describes the same replicas as the full config,
+so policies and checks that depend on the number of scale units or on ZeRO groups see the right values,
+and the reduced config stays valid when `k` does not divide `runtime_ngpus`.
 The inner policy can also partition operators across the first `k` plan ranks,
-e.g. `fn(graph, replace(cfg, plan_ngpus=2), tp_plans)` in a plan of 3 ranks.
+e.g. `on_first_ranks(graph, cfg, 2, tp_plans)` in a plan of 3 ranks.
 Only the call to `fn` uses the reduced config;
 the `ComputeConfig` passed to `parallelize` must keep the full plan size,
 because replica offsets and communication groups follow it.

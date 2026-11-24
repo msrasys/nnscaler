@@ -58,12 +58,22 @@ def _megatron_tp(graph, cfg):
             yield OpPlan(node)
 
 
+def _plan_on_first_ranks(graph, cfg, nranks, plans):
+    # Shrink the plan but keep the number of scale units,
+    # so the reduced config stays valid and describes the same replicas.
+    return fn(graph, replace(cfg, plan_ngpus=nranks, runtime_ngpus=cfg.num_scale_units * nranks), plans)
+
+
 def _first_rank_only(graph, cfg):
-    return fn(graph, replace(cfg, plan_ngpus=1), _replicate)
+    return _plan_on_first_ranks(graph, cfg, 1, _replicate)
 
 
 def _tp_on_first_two_ranks(graph, cfg):
-    return fn(graph, replace(cfg, plan_ngpus=2), _megatron_tp)
+    return _plan_on_first_ranks(graph, cfg, 2, _megatron_tp)
+
+
+def _first_three_ranks(graph, cfg):
+    return _plan_on_first_ranks(graph, cfg, 3, _replicate)
 
 
 def _gencode(gen_savedir, rank):
@@ -83,6 +93,17 @@ def test_codegen_inactive_plan_ranks(tmp_path):
         assert 'is_inactive_rank' not in code
         assert re.search(rf'allreduce_identity\(\w+, ranks={re.escape(str(tp_ranks))}\)', code)
         assert f'Reducer(ranks={dp_ranks}' in code
+
+
+@replace_all_device_with('cpu')
+def test_codegen_active_ranks_not_dividing_runtime(tmp_path):
+    # 3 active ranks in a plan of 4 with a single scale unit:
+    # a reduced config with runtime_ngpus=4 and plan_ngpus=3 would be invalid.
+    parallelize(Encoder(), {'x': torch.ones(2, 3)}, _first_three_ranks,
+                ComputeConfig(4, 4), gen_savedir=tmp_path, load_module=False)
+    for rank in range(3):
+        assert 'is_inactive_rank' not in _gencode(tmp_path, rank)
+    assert 'is_inactive_rank = True' in _gencode(tmp_path, 3)
 
 
 @replace_all_device_with('cpu')

@@ -85,7 +85,9 @@ def replicate_policy(graph, compute_config):
 
 
 def first_stage_policy(graph, compute_config):
-    return fn(graph, replace(compute_config, plan_ngpus=1), replicate_policy)
+    # Shrink the plan to the first rank but keep the number of scale units.
+    return fn(graph, replace(compute_config, plan_ngpus=1, runtime_ngpus=compute_config.num_scale_units),
+              replicate_policy)
 
 
 def init_scale_unit_groups(trainer: Trainer):
