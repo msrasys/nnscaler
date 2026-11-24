@@ -403,3 +403,27 @@ def test_gencode_narrows_aliased_segment_input(tmp_path):
             rank,
             r'nnscaler\.runtime\.adapter\.(?:all_gather|nn\.split_allgather)',
         )
+
+
+def aliased_combined_memory_pas(graph, cfg):
+    for plan in aliased_segment_input_pas(graph, cfg):
+        plan.recompute_id = plan.stage_id
+        plan.offload_id = plan.stage_id
+        yield plan
+
+
+@replace_all_device_with('cpu')
+def test_combined_memory_preserves_narrowed_aliases(tmp_path):
+    parallelize(
+        AliasedSegmentInputModule(), {'data': torch.randn(64, 64)},
+        pas_policy=aliased_combined_memory_pas,
+        compute_config=ComputeConfig(
+            6, 6, constant_folding=False, use_end2end=True,
+            pas_config={'pp_size': 3, 'pipeline_nmicros': 3, 'pipeline_scheduler': '1f1b'},
+        ), gen_savedir=tmp_path, load_module=False, reuse='override',
+    )
+    for rank in (4, 5):
+        assert _gencode_contains(tmp_path, AliasedSegmentInputModule, rank, r'ckpt\.checkpoint\(')
+        assert _gencode_contains(tmp_path, AliasedSegmentInputModule, rank, r'cpu_offloading_hooks\(')
+        assert not _gencode_contains(tmp_path, AliasedSegmentInputModule, rank,
+                                    r'nnscaler\.runtime\.adapter\.(?:all_gather|nn\.split_allgather)')

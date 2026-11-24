@@ -21,6 +21,7 @@ from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
 from nnscaler.flags import CompileFlag
+from nnscaler.runtime.activation_schedule import ActivationSchedulePlan
 
 
 _logger = logging.getLogger(__name__)
@@ -55,6 +56,8 @@ class ScheduleCodeGen(FuncEmission):
         runtime_ndevs: Optional[int] = None,
         *,
         scale_ndevs: Optional[int] = None,
+        release_pipeline_inputs: bool = False,
+        release_pipeline_outputs: bool = False,
     ):
         """
         Create a schedule code generator
@@ -65,6 +68,8 @@ class ScheduleCodeGen(FuncEmission):
             scale_ndevs (Optional[int]): Deprecated. Use `runtime_ndevs` instead
         """
         self.execplan = execplan
+        self.release_pipeline_inputs = release_pipeline_inputs
+        self.release_pipeline_outputs = release_pipeline_outputs
         self.devices: Tuple[int] = tuple(sorted(execplan.graph.device))
         if self.devices != tuple(range(len(self.devices))):
             raise ValueError(f'device must be consecutive')
@@ -99,6 +104,20 @@ class ScheduleCodeGen(FuncEmission):
         # when we use scheduler (i.e. pipeline parallelism)
         # Otherwise, the caller of `_train_step` will set these flags to support gradient accumulation
         use_scheduler = self.execplan.graph.sched is not None
+        compute_nodes = [n for n in device_nodes if isinstance(
+            n.cell if isinstance(n, ExeReuseCell) else n, IRSegment)]
+        action_positions = {id(node): index for index, node in enumerate(compute_nodes)}
+        activation_entries = ()
+        activation_backward_positions = ()
+        if use_scheduler:
+            actions = []
+            for node in compute_nodes:
+                segment = node.cell if isinstance(node, ExeReuseCell) else node
+                forward = segment if segment.isfw() else segment.mirror
+                actions.append((self._activation_scope_key(node), node.isfw(), self._has_activation_offload(forward)))
+            activation_plan = ActivationSchedulePlan.from_actions(actions)
+            activation_entries = activation_plan.entries()
+            activation_backward_positions = activation_plan.backward_positions
         send_bundle_ranges = self._collect_send_bundle_ranges(device_nodes, device_map) \
             if use_scheduler else {}
 
@@ -113,6 +132,18 @@ class ScheduleCodeGen(FuncEmission):
         sample_reads = self._plan_sample_reads(device_nodes)
         lifetime = LifeCycle(device_nodes, [], self.execplan.outputs(),
                              extra_inputs={node: plan.inputs for node, plan in sample_reads.items()})
+
+        release_inputs = self.release_pipeline_inputs and use_scheduler
+        release_outputs = self.release_pipeline_outputs and use_scheduler
+        if (release_inputs or release_outputs) and CompileFlag.use_fbw:
+            raise ValueError('Pipeline input/output release is not supported with split backward')
+        input_references, output_references = lifetime.pipeline_references_after_data_use(
+            device_nodes, self.execplan.outputs(), release_inputs=release_inputs, release_outputs=release_outputs
+        ) if release_inputs or release_outputs else ({}, {})
+        self._input_release_candidates = {value for values in input_references.values() for value in values}
+        if release_inputs:
+            self._input_release_candidates.update(value for values in output_references.values() for value in values)
+
 
         last_stream = None
         buffered_codes = []
@@ -215,10 +246,30 @@ class ScheduleCodeGen(FuncEmission):
                         produced_tids.add(inp.tid)
 
                 pending_async_recvs = {}
+                # F/B actions count independently of communication/adapters.
+                # Non-pipeline end-to-end graphs retain the local group hint.
+                next_compute = {id(a): b for a, b in zip(compute_nodes, compute_nodes[1:])}
+                backward_positions = {self._activation_scope_key(n): i
+                                      for i, n in enumerate(compute_nodes) if not n.isfw()}
+                self._activation_backward_distances = {
+                    id(n): backward_positions[self._activation_scope_key(n)] - i
+                    for i, n in enumerate(compute_nodes)
+                    if n.isfw() and self._activation_scope_key(n) in backward_positions
+                }
+                self._immediate_backward_forwards = {
+                    id(a) for a, b in zip(compute_nodes, compute_nodes[1:])
+                    if a.isfw() and not b.isfw()
+                    and self._activation_scope_key(a) == self._activation_scope_key(b)
+                }
                 for line, node in enumerate(device_nodes):
                     unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
                     bundle_events = send_bundle_ranges.get(line, ())
                     _append_send_bundle_events(fb, bundle_events, before_node=True)
+                    if activation_entries and id(node) in action_positions:
+                        # Independent saved activations may reload while this
+                        # action waits for its own pipeline receives.
+                        _append_code(fb, f'_activation_schedule.before({action_positions[id(node)]})',
+                                     self._get_node_stream(node))
                     wait_codes = self._emit_async_recv_waits(node, pending_async_recvs, produced_tids)
                     if wait_codes:
                         _append_code(fb, wait_codes, self._get_node_stream(node))
@@ -237,6 +288,12 @@ class ScheduleCodeGen(FuncEmission):
                         )
                     elif use_scheduler and isinstance(unwrap_node, IRWeightReducer):
                         _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_reducer = False')
+                    following = next_compute.get(id(node))
+                    if not use_scheduler and following is not None and not following.isfw():
+                        target = following.cell if isinstance(following, ExeReuseCell) else following
+                        if self._has_activation_offload(target.mirror):
+                            key = self._activation_scope_key(following)
+                            _append_code(fb, f'model.prefetch_activation({key!r})', self._get_node_stream(node))
                     codes = self.emit_node(
                         node,
                         produced_tids=produced_tids,
@@ -244,6 +301,12 @@ class ScheduleCodeGen(FuncEmission):
                     )
                     _append_code(fb, codes, self._get_node_stream(node))
                     self._track_async_recv(node, pending_async_recvs)
+                    for tensor in input_references.get(line, ()):
+                        name = self.tensor_name(tensor)
+                        _append_code(fb, f'{name} = nnscaler.runtime.executor.release_input_tensor({name})')
+                    for tensor in output_references.get(line, ()):
+                        name = self.tensor_name(tensor)
+                        _append_code(fb, f'{name} = nnscaler.runtime.executor.release_output_tensor({name})')
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
@@ -252,6 +315,11 @@ class ScheduleCodeGen(FuncEmission):
                         if isinstance(out, IRObject):
                             produced_tids.add(out.tid)
                     _append_send_bundle_events(fb, bundle_events, before_node=False)
+                    if activation_entries and id(node) in action_positions:
+                        # Retry only after producers completed and schedule
+                        # data references were released; never before save.
+                        _append_code(fb, f'_activation_schedule.after({action_positions[id(node)]})',
+                                     self._get_node_stream(node))
             # return code
             if CompileFlag.async_comm:
                 _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
@@ -260,6 +328,11 @@ class ScheduleCodeGen(FuncEmission):
             _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain()')
             code = f'return {outputs}'
             _append_code(fb, code, force_flush=True)
+            if activation_entries:
+                with Block(f'with model.activation_offload_schedule({activation_entries!r}, '
+                           f'backward_positions={activation_backward_positions!r}) as _activation_schedule:') as scope:
+                    scope.insert_body(fb.code[1:])
+                fb.code[1:] = scope.code
 
         gencode += fb.code
 
@@ -788,6 +861,17 @@ class ScheduleCodeGen(FuncEmission):
         """
         return f'{self.tensor_name(tensor)} = {self.tensor_name(tensor)}.detach()'
 
+    @staticmethod
+    def _has_activation_offload(segment):
+        return any(getattr(n, 'offload', None) is not None for n in segment.nodes())
+
+    def _activation_scope_key(self, node):
+        segment = node.cell if isinstance(node, ExeReuseCell) else node
+        if not segment.isfw():
+            segment = segment.mirror
+        mid = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
+        return self.node_name(segment), mid
+
     def emit_node(self, node: IRCell, force_no_grad: bool = False,
                   produced_tids: set = None, sample_reads: Optional[_SampleReadPlan] = None) -> List[str]:
         """
@@ -832,6 +916,12 @@ class ScheduleCodeGen(FuncEmission):
                     req_grad = req_grad,
                     stream_kwarg = stream_kwarg,
                 )]
+                if not force_no_grad:
+                    call_inputs = [t for t in node_inputs if not isinstance(t, IRObject) or not t.is_attr()]
+                    indices = tuple(i for i, tensor in enumerate(call_inputs)
+                                    if isinstance(tensor, IRSubTensor) and tensor in getattr(self, '_input_release_candidates', set()))
+                    if indices:
+                        codes[-1] = codes[-1][:-1] + f', release_inputs={indices!r})'
                 if post_hook:
                     codes = codes + self._emit_segment_hook_code(
                         post_hook, hook_meta, inputs, is_pre=False,
@@ -912,6 +1002,27 @@ class ScheduleCodeGen(FuncEmission):
                         continue
                     if tensor in plan_outputs:
                         codes.append(self.emit_detach(tensor))
+
+            forward_segment = unwrap_node if node.isfw() else unwrap_node.mirror
+            if self._has_activation_offload(forward_segment) and not force_no_grad:
+                key = self._activation_scope_key(node)
+                if node.isfw():
+                    immediate = id(node) in getattr(self, '_immediate_backward_forwards', set())
+                    distance = getattr(self, '_activation_backward_distances', {}).get(id(node))
+                    if distance is None:
+                        # A forward-only/inference scope has no scheduled
+                        # backward to remove a keyed registration later.
+                        key = None
+                    pipeline = self.execplan.graph.sched is not None
+                    with Block(f'with model.activation_offload_scope({key!r}, immediate_backward={immediate!r}, backward_distance={distance!r}, pipeline={pipeline!r}):') as scope_block:
+                        scope_block.insert_body(codes)
+                    codes = scope_block.code
+                else:
+                    with Block('try:') as backward_block:
+                        backward_block.insert_body(codes)
+                    with Block('finally:') as finish_block:
+                        finish_block.insert_body(f'model.finish_activation_offload({key!r})')
+                    codes = backward_block.code + finish_block.code
 
         elif isinstance(unwrap_node, IRDataOperation):
             already_produced = False

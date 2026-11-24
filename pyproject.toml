@@ -30,7 +30,7 @@ dynamic.dependencies.file = "requirements.txt"
 # the following part only affects wheel, not sdist
 # C++ extensions are now built via setup.py instead of cppimport
 packages.find.include = ["nnscaler*"]
-package-data = { nnscaler = ["resources/**", "autodist/*.h", "autodist/*.cpp"] }
+package-data = { nnscaler = ["resources/**", "autodist/*.h", "autodist/*.cpp", "runtime/csrc/*.cpp", "runtime/csrc/*.cu"] }
 
 [tool.coverage.run]
 omit = [

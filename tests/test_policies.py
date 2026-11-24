@@ -16,7 +16,7 @@ from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import FFN, init_distributed
 from tests.parallel_module.test_gencode import _gencode_contains, print_gencode
 
-from .utils import init_random, replace_all_device_with
+from .utils import init_random, raises_with_cause, replace_all_device_with
 
 MBS = 2
 DIM = 16
@@ -165,9 +165,9 @@ def test_apply_module_recompute_groups_invocations_and_skips_hooks():
 
     result = apply_module_recompute(graph, RecomputeTarget)
 
-    assert [len(group) for group in result.planned_groups] == [2, 2, 2]
-    assert result.planned_group_count == result.applied_group_count == 3
-    assert result.planned_op_count == result.applied_op_count == 6
+    assert [len(group) for group in result.planned_groups] == [2, 2, 2, 1]
+    assert result.planned_group_count == result.applied_group_count == 4
+    assert result.planned_op_count == result.applied_op_count == 7
     assert result.skipped_hook_ops == 1
 
 
@@ -239,6 +239,15 @@ def test_call_name():
     assert get_called_self_module_name('self.up_proj(x).transpose()') == ''
 
 
+def test_op_plan_combines_recompute_with_cpu_offload():
+    from nnscaler.ir.operator import IRFwOperation
+    from nnscaler.policies import OpPlan
+
+    node = IRFwOperation('test', 'test', inputs=[], num_outputs=0)
+    plan = OpPlan(node, recompute_id=0, offload_id=0)
+    assert plan.recompute_id == plan.offload_id == 0
+
+
 class FnPolicyModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -249,6 +258,23 @@ class FnPolicyModule(torch.nn.Module):
         x =  self.ffn(x)
         x = x + 3
         return x
+
+
+def combined_memory_graph_policy(graph, cfg):
+    nodes = get_pas_ops(graph)
+    graph.offload(nodes)
+    graph.recompute(nodes)
+    for node in nodes:
+        graph.assign(node, 0)
+    return graph
+
+
+@replace_all_device_with('cpu')
+def test_graph_policy_combines_recompute_with_cpu_offload(tmp_path):
+    parallelize(FnPolicyModule(), {'x': torch.randn(2, 4)},
+                combined_memory_graph_policy, ComputeConfig(1, 1),
+                gen_savedir=tmp_path, load_module=False)
+    assert _gencode_contains(tmp_path, FnPolicyModule, 0, r'_offload\.checkpoint\(')
 
 
 def megatron_ffn_policy(graph, cfg):
@@ -301,6 +327,143 @@ def megatron_ffn_policy_auto(graph, cfg):
         else:
             # other ops
             yield OpPlan(node, partition='auto')
+
+
+@replace_all_device_with('cpu')
+def test_plan_transform_observes_resolved_layout_before_activation_grouping(tmp_path):
+    from nnscaler.policies import fn, OpPartition
+    observed = []
+    def transform(plans, cfg):
+        assert all(plan.partition != 'auto' for plan in plans)
+        for plan in plans:
+            if plan.op.fn == torch.tanh:
+                assert plan.partition == OpPartition(input=0, dim=1)
+                plan.recompute_id = 0
+                observed.append(plan.op)
+        return plans
+    def policy(graph, cfg):
+        return fn(graph, cfg, megatron_ffn_policy_auto, plan_transform=transform)
+    parallelize(FnPolicyModule(), {'x': torch.randn(2,4)}, policy, ComputeConfig(2,2),
+                gen_savedir=tmp_path, load_module=False)
+    assert observed
+    assert _gencode_contains(tmp_path, FnPolicyModule, 0, r'ckpt\.checkpoint\(')
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('change', ['stage','partition','order','hook'])
+def test_plan_transform_cannot_change_resolved_structure(tmp_path, change):
+    from nnscaler.policies import fn
+    def transform(plans, cfg):
+        if change == 'stage':plans[0].stage_id += 1
+        elif change == 'partition':plans[0].partition = 'auto'
+        elif change == 'hook':plans[0].post_hook = lambda *args: None
+        else:plans.reverse()
+        return plans
+    def policy(graph, cfg):
+        return fn(graph, cfg, megatron_ffn_policy_auto, plan_transform=transform)
+    with raises_with_cause(ValueError, match='activation annotations only'):
+        parallelize(FnPolicyModule(), {'x': torch.randn(2,4)}, policy, ComputeConfig(2,2),
+                    gen_savedir=tmp_path, load_module=False)
+
+
+@replace_all_device_with('cpu')
+def test_plan_transform_does_not_hide_an_invalid_original_plan(tmp_path):
+    from nnscaler.policies import fn, OpPlan
+    called=[]
+    def base(graph,cfg):
+        return [*megatron_ffn_policy_auto(graph,cfg),OpPlan(object(),stage_id=0)]
+    def transform(plans,cfg):
+        called.append(True)
+        return plans
+    def policy(graph,cfg):
+        return fn(graph,cfg,base,plan_transform=transform)
+    with raises_with_cause(ValueError,match='not in the graph'):
+        parallelize(FnPolicyModule(),{'x':torch.randn(2,4)},policy,ComputeConfig(2,2),
+                    gen_savedir=tmp_path,load_module=False)
+    assert not called
+
+
+def cpu_offload_ffn_policy(graph, cfg):
+    for plan in megatron_ffn_policy(graph, cfg):
+        plan.offload_id = 0
+        yield plan
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_cpu_offload(tmp_path):
+    parallelize(
+        FnPolicyModule(),
+        {'x': torch.randn(2, 4)},
+        cpu_offload_ffn_policy,
+        ComputeConfig(2, 2),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+
+    for rank in range(2):
+        assert len(_gencode_contains(
+            tmp_path,
+            FnPolicyModule,
+            rank,
+            r'with self\.cpu_offloading_hooks\((?:tail=True)?\) as _offload:',
+        )) == 1
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_cpu_offload_zero3(tmp_path):
+    parallelize(
+        FnPolicyModule(),
+        {'x': torch.randn(2, 4)},
+        cpu_offload_ffn_policy,
+        ComputeConfig(1, 2, use_zero=3),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+
+    assert _gencode_contains(
+        tmp_path,
+        FnPolicyModule,
+        0,
+        r'with self\.save_params_hooks\(\):',
+    )
+    assert _gencode_contains(
+        tmp_path,
+        FnPolicyModule,
+        0,
+        r'with self\.cpu_offloading_hooks\((?:tail=True)?\) as _offload:',
+    )
+
+
+def _cpu_offload_runtime_worker(tempdir):
+    init_distributed()
+    model = FnPolicyModule()
+    expected_input = torch.randn(2, 4, requires_grad=True)
+    expected_output = model(expected_input)
+    expected_output.sum().backward()
+
+    parallel_model = parallelize(
+        model,
+        {'x': torch.randn(2, 4)},
+        cpu_offload_ffn_policy,
+        ComputeConfig(1, 1, cpu_offload={'min_tensor_bytes': 0}),
+        gen_savedir=tempdir,
+        instance_name='cpu_offload_runtime',
+        load_module=True,
+    )
+    actual_input = expected_input.detach().clone().requires_grad_()
+    actual_output = parallel_model(actual_input)
+    actual_output.sum().backward()
+
+    assert torch.allclose(actual_output, expected_output)
+    assert torch.allclose(actual_input.grad, expected_input.grad)
+    stats = parallel_model.activation_offload_stats()
+    assert stats['d2h_bytes'] > 0
+    assert stats['live_cpu_bytes'] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_codegen_fn_cpu_offload_runtime(tmp_path):
+    launch_torchrun(1, _cpu_offload_runtime_worker, str(tmp_path))
 
 
 @replace_all_device_with('cpu')
@@ -428,6 +591,239 @@ def megatron_ffn_policy_list(graph, cfg):
         else:
             # other ops
             yield OpPlan(node, recompute_id=ffn_idx, stage_id=ffn_idx, partition='auto')
+
+
+def megatron_ffn_offload_policy_list(graph, cfg):
+    for plan in megatron_ffn_policy_list(graph, cfg):
+        plan.offload_id = plan.recompute_id
+        plan.recompute_id = -1
+        yield plan
+
+
+def pipeline_cpu_offload_prefetch_policy(graph, cfg):
+    from nnscaler.policies import OpPlan, get_layer_index
+
+    for node in get_pas_ops(graph):
+        if FFNDropout in node.module_class_chain:
+            ffn_idx = get_layer_index(node.fqn)
+            yield OpPlan(node, offload_id=ffn_idx, stage_id=ffn_idx // 2)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_cpu_offload_multiple_blocks(tmp_path):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        pipeline_cpu_offload_prefetch_policy,
+        ComputeConfig(2, 2),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+
+    for rank in range(2):
+        assert len(_gencode_contains(
+            tmp_path,
+            FnPolicyModuleList,
+            rank,
+            r'with self\.cpu_offloading_hooks\((?:tail=True)?\) as _offload:',
+        )) == 2
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_pipeline_cpu_offload(tmp_path):
+    instance_name = 'cpu_offload_pipeline'
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_offload_policy_list,
+        ComputeConfig(4, 4, use_end2end=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+            }
+        ),
+        gen_savedir=tmp_path,
+        instance_name=instance_name,
+        load_module=False,
+    )
+
+    for rank in range(4):
+        assert len(_gencode_contains(
+            tmp_path,
+            FnPolicyModuleList,
+            rank,
+            r'with self\.cpu_offloading_hooks\((?:tail=True)?\) as _offload:',
+            instance_name=instance_name,
+        )) == 1
+        assert not _gencode_contains(
+            tmp_path,
+            FnPolicyModuleList,
+            rank,
+            r'ckpt\.checkpoint\(',
+            instance_name=instance_name,
+        )
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('release_inputs', [False, True])
+@pytest.mark.parametrize('offload', [False, True])
+@pytest.mark.parametrize('release_outputs', [False, True])
+def test_codegen_fn_pipeline_input_references_are_opt_in(tmp_path, release_inputs, offload, release_outputs):
+    import ast
+    model = FnPolicyModuleList(ffn_layers=4)
+    def policy(graph, cfg):
+        plans = list(pipeline_cpu_offload_prefetch_policy(graph, cfg))
+        if not offload:
+            for plan in plans:
+                plan.offload_id = -1
+        return plans
+    parallelize(
+        model, {'x': torch.randn(4, 4)}, policy,
+        ComputeConfig(2, 2, use_end2end=True,
+            release_pipeline_inputs=release_inputs,
+            release_pipeline_outputs=release_outputs,
+            cpu_offload={'min_tensor_bytes': 0} if offload else None,
+            pas_config={'pipeline_nmicros': 2, 'pipeline_size': 2}),
+        gen_savedir=tmp_path, instance_name='input_references', load_module=False,
+    )
+    sources = [path.read_text() for path in tmp_path.rglob('gencode*.py')]
+    assert sources
+    for source in sources:
+        ast.parse(source)
+    assert any('release_input_tensor(' in source for source in sources) == release_inputs
+    assert any('release_inputs=(' in source for source in sources) == release_inputs
+    assert any('with self.cpu_offloading_hooks(' in source for source in sources) == offload
+    assert any('release_output_tensor(' in source for source in sources) == release_outputs
+    assert any('model.activation_offload_schedule(' in source for source in sources) == offload
+    assert any('activation_offload_scope(' in source for source in sources) == offload
+    if not offload:
+        assert all('prefetch_activation(' not in source and 'finish_activation_offload(' not in source
+                   and '_get_activation_offload_manager(' not in source for source in sources)
+    for source in sources:
+        tree = ast.parse(source)
+        for function in (node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                         and node.name in ('_train_step', '_infer_step')):
+            calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)
+                     and isinstance(node.func, ast.Attribute)]
+            entries = [ast.literal_eval(node.args[0]) for node in calls
+                       if node.func.attr == 'activation_offload_schedule']
+            before = [ast.literal_eval(node.args[0]) for node in calls
+                      if node.func.attr == 'before' and isinstance(node.func.value, ast.Name)
+                      and node.func.value.id == '_activation_schedule']
+            after = [ast.literal_eval(node.args[0]) for node in calls
+                     if node.func.attr == 'after' and isinstance(node.func.value, ast.Name)
+                     and node.func.value.id == '_activation_schedule']
+            if function.name == '_infer_step' or not offload:
+                assert not entries and not before and not after
+            elif entries:
+                assert len(entries) == 1 and all(f < b for _, f, b in entries[0])
+                assert sorted(before) == sorted(after) == list(range(len(before)))
+
+
+@replace_all_device_with('cpu')
+def test_codegen_sparse_offload_preserves_all_backward_windows(tmp_path):
+    import ast
+    from nnscaler.policies import OpPlan, get_layer_index
+    def policy(graph, cfg):
+        for node in get_pas_ops(graph):
+            if FFNDropout in node.module_class_chain:
+                index = get_layer_index(node.fqn)
+                yield OpPlan(node, offload_id=0 if index == 0 else -1, stage_id=index // 2)
+    parallelize(
+        FnPolicyModuleList(ffn_layers=8), {'x': torch.randn(4, 4)}, policy,
+        ComputeConfig(2, 2, use_end2end=True, cpu_offload={'min_tensor_bytes': 0},
+            pas_config={'pipeline_nmicros': 4, 'pp_size': 2,
+                        'pipeline_scheduler': '1f1b_interleaved'}),
+        gen_savedir=tmp_path, instance_name='sparse_backward_windows', load_module=False,
+    )
+    found_sparse = False
+    for path in tmp_path.rglob('gencode*.py'):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == 'activation_offload_schedule'):
+                continue
+            entries = ast.literal_eval(node.args[0])
+            positions = ast.literal_eval(next(k.value for k in node.keywords if k.arg == 'backward_positions'))
+            consumers = {b for _, _, b in entries}
+            assert consumers.issubset(positions)
+            assert not ({f for _, f, _ in entries} & set(positions))
+            found_sparse |= len(positions) > len(consumers)
+    assert found_sparse, 'Unselected local backwards must remain available to hide transfers'
+
+
+def _pipeline_cpu_offload_runtime_worker(tempdir, offload, release_inputs, release_outputs):
+    from tests.launch_torchrun import clone_to_cpu_recursively
+    init_distributed()
+    init_random()
+    model = FnPolicyModuleList(ffn_layers=4)
+    def policy(graph, cfg):
+        plans = list(pipeline_cpu_offload_prefetch_policy(graph, cfg))
+        if not offload:
+            for plan in plans:
+                plan.offload_id = -1
+        return plans
+    parallel_model = parallelize(
+        model,
+        {'x': torch.randn(4, 4)},
+        policy,
+        ComputeConfig(2, 2, use_end2end=True,
+            release_pipeline_inputs=release_inputs,
+            release_pipeline_outputs=release_outputs,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+            }
+        ),
+        gen_savedir=tempdir,
+        instance_name='cpu_offload_pipeline_runtime',
+        load_module=True,
+    )
+
+    rank = torch.distributed.get_rank()
+    assert len(_gencode_contains(
+        tempdir,
+        FnPolicyModuleList,
+        rank,
+        r'with self\.cpu_offloading_hooks\((?:tail=True)?\) as _offload:',
+        instance_name='cpu_offload_pipeline_runtime',
+    )) == (2 if offload else 0)
+
+    from dataclasses import replace
+    parallel_model.compute_config = replace(parallel_model.compute_config,
+        cpu_offload={'min_tensor_bytes': 0, 'max_cpu_bytes': 64 * 1024**2} if offload else None)
+    init_random(42)  # Compilation must not affect samples or dropout randomness.
+    samples = [torch.randn(4, 4) for _ in range(2)]
+    losses = parallel_model.train_step(samples)
+    stats = parallel_model.activation_offload_stats()
+    counts = torch.tensor([stats.get('offloaded_storages', 0), stats.get('prefetch_loads', 0)], device='cuda')
+    torch.distributed.all_reduce(counts)
+    assert bool(counts[0].item()) == offload
+    if offload:
+        # A rank whose whole forward scope is immediately consumed may keep
+        # that scope resident. Other ranks still exercise actual transfers.
+        assert counts[1].item() > 0
+        assert stats['live_cpu_bytes'] == 0
+    assert all(param.grad is not None for param in parallel_model.parameters())
+    assert all(torch.isfinite(param.grad).all() for param in parallel_model.parameters())
+    return clone_to_cpu_recursively({
+        'losses': losses,
+        'gradients': {name: param.grad for name, param in parallel_model.named_parameters()},
+    })
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_pipeline_cpu_offload_runtime(tmp_path):
+    from tests.parallel_module.common import assert_equal
+    reference = None
+    import itertools
+    for offload, release, outputs in itertools.product((False, True), repeat=3):
+        result = launch_torchrun(2, _pipeline_cpu_offload_runtime_worker,
+                                str(tmp_path / f'offload_{offload}_release_{release}_outputs_{outputs}'),
+                                offload, release, outputs)
+        if reference is None:
+            reference = result
+        else:
+            assert_equal(result, reference)
 
 
 @replace_all_device_with('cpu')
@@ -1662,3 +2058,41 @@ def test_codegen_fsdp(tmp_path):
     #     with self.save_params_hooks():
     #         return self.segment105_impl(x_49)
     assert True
+
+
+def partial_combined_memory_graph_policy(graph, cfg):
+    nodes = get_pas_ops(graph)
+    graph.recompute(nodes)
+    selected = [node for node in nodes if node.recompute is not None]
+    assert len(selected) > 1
+    graph.offload(selected[:1])
+    for node in nodes:
+        graph.assign(node, 0)
+    return graph
+
+
+@replace_all_device_with('cpu')
+def test_partial_offload_does_not_silently_split_recompute(tmp_path):
+    with raises_with_cause(ValueError, match='entire recompute region'):
+        parallelize(FnPolicyModule(), {'x': torch.randn(2, 4)},
+                    partial_combined_memory_graph_policy, ComputeConfig(1, 1),
+                    gen_savedir=tmp_path, load_module=False)
+
+
+class SingleOperationCheckpointModule(torch.nn.Module):
+    def forward(self, x):
+        return torch.sin(x * 2).square()
+
+
+def single_operation_checkpoint_policy(graph, cfg):
+    from nnscaler.policies import OpPlan
+    for node in get_pas_ops(graph):
+        yield OpPlan(node, recompute_id=0 if node.fn == torch.sin else -1)
+
+
+@replace_all_device_with('cpu')
+def test_explicit_single_operation_checkpoint_is_emitted(tmp_path):
+    parallelize(SingleOperationCheckpointModule(), {'x': torch.randn(8, 8)},
+                single_operation_checkpoint_policy, ComputeConfig(1, 1),
+                gen_savedir=tmp_path, load_module=False)
+    assert _gencode_contains(tmp_path, SingleOperationCheckpointModule, 0, r'ckpt\.checkpoint\(')

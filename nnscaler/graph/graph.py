@@ -402,6 +402,11 @@ class IRGraph(IRSegment):
         fnodes = algo.instantiate(**config)
         if not fnodes:
             raise ValueError(f"Fail to partition node: {node}. Please check your config: {config}.")
+        if isinstance(node, IRFwOperation):
+            for fnode in fnodes:
+                if isinstance(fnode, IRFwOperation):
+                    fnode.recompute_barriers = tuple(dict.fromkeys(
+                        (*fnode.recompute_barriers, *node.recompute_barriers)))
 
         # insert forward node
         fsegment: IRSegment = self.segment(node)
@@ -1088,6 +1093,11 @@ class IRGraph(IRSegment):
         Recompute a set of nodes. The forward nodes will be assigned with a unique
         recompute group id. A forward not can not be recomputed in different recompute groups.
 
+        Selecting a region asserts that its computation can be replayed under
+        the checkpoint's state handling. Early stopping is an optimization, not
+        a guarantee that a stateful suffix will never execute during replay.
+        Known composition barriers belong in the operation's recompute_barriers.
+
         @param nodes List[IRFwOperation]: nodes for a recompute group
 
         @return success boolean: always success
@@ -1100,36 +1110,41 @@ class IRGraph(IRSegment):
             return self.recompute(nodes.nodes())
 
         else:
+            assert len(nodes) > 0, "Cannot recompute empty list of nodes"
             segments = [self.segment(node) for node in nodes]
             assert all(segment == segments[0] for segment in segments), \
                 "Cross-segment recompute is not allowed yet"
             recompute_group_id: int = IDGenerator().gen_cell_id()
-            start = 0
-            for fnode in nodes:
-                tensors = [t for t in fnode.inputs() if isinstance(t, IRSubTensor) and (not t.is_attr())]
-                if all(t.grad is None for t in tensors):
-                    start += 1
-                    continue
-                break
-            skip = nodes[:start]
-            nodes = nodes[start:]
-            end = len(nodes)
-            for fnode in nodes[::-1]:
-                tensors = [t for t in fnode.inputs() if isinstance(t, IRSubTensor) and (not t.is_attr())]
-                if all(t.grad is None for t in tensors):
-                    end -= 1
-                    continue
-                break
-            skip += nodes[end:]
+            from nnscaler.graph.recompute import get_recompute_span
+            start, end = get_recompute_span(nodes)
+            skip = nodes[:start] + nodes[end:]
             for node in skip:
                 if isinstance(node, IRGraphAnchor): continue
                 _logger.info(
                     f"skip recompute node: {node.name} ({node.cid}) as "
                     f"it doesn't require gradient and appears at head or tail."
                 )
-            nodes = nodes[:end]
+            nodes = nodes[start:end]
             for fnode in nodes:
                 fnode.recompute = recompute_group_id
+        return True
+
+    def offload(self, nodes: Union[IRSegment, List[IRFwOperation]]) -> bool:
+        """Offload tensors saved for backward by a sequence of forward nodes to CPU."""
+        assert all(isinstance(node, IRFwOperation) for node in nodes) or isinstance(nodes, IRSegment), \
+            "Require forward nodes or a single segment"
+
+        if isinstance(nodes, IRSegment):
+            assert nodes.isfw() and (not nodes.isbw()), "Only forward IRSegment can offload"
+            return self.offload(nodes.nodes())
+
+        assert len(nodes) > 0, "Cannot offload empty list of nodes"
+        segments = [self.segment(node) for node in nodes]
+        assert all(segment == segments[0] for segment in segments), \
+            "Cross-segment offload is not allowed"
+        offload_group_id = IDGenerator().gen_cell_id()
+        for fnode in nodes:
+            fnode.offload = offload_group_id
         return True
 
     # =================== Helpers ====================
@@ -1246,11 +1261,14 @@ class IRGraph(IRSegment):
     def copy_node_meta_info(src_node: Union[IRFwOperation, IRDataOperation], dest_node: Union[IRFwOperation, IRDataOperation]):
         """
         Copy meta information from src_node to dest_node.
-        Current copy fields: ['recompute', 'comment', 'op_context', 'module_stack', 'module_call_stack', 'device',
+        Current copy fields: ['recompute', 'recompute_barriers', 'offload', 'comment', 'op_context', 'module_stack', 'module_call_stack', 'device',
         'hook_meta', 'pre_hook', 'post_hook']
         """
         if isinstance(src_node, IRFwOperation):
             dest_node.recompute = src_node.recompute
+            dest_node.recompute_barriers = tuple(dict.fromkeys(
+                (*getattr(dest_node, 'recompute_barriers', ()), *src_node.recompute_barriers)))
+            dest_node.offload = src_node.offload
         if isinstance(src_node.comment, str):
             dest_node.comment = src_node.comment
         if src_node.op_context is not None:

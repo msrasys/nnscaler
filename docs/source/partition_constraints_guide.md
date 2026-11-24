@@ -76,25 +76,61 @@ If you choose to manually partition operators (especially for complex communicat
 The `OpPlan` class defines the strategy for a single operator.
 
 ```python
-class OpPlan:
-    def __init__(self, op, partition='auto', recompute_id=-1, stage_id=-1, ...):
-        ...
+OpPlan(op=node, partition=None, recompute_id=-1, offload_id=-1, stage_id=-1)
 ```
 
 *   **`op`**: The graph node (`IRFwOperation`) this plan applies to.
 *   **`partition`**: define the partitioning strategy.
     *   `OpPartition(input=i, dim=d)`: Partition the operator based on the `d`-th dimension of its `i`-th input tensor.
-    *   `'auto'` (default): Tries to follow the partition of its inputs. If no input is partitioned, it just replicate the operator.
-    *   `None`: Force the operator to be replicated (no partitioning).
+    *   `'auto'`: Tries to follow the partition of its inputs. If no input is partitioned, it just replicate the operator.
+    *   `None` (default): Force the operator to be replicated (no partitioning).
 *   **`recompute_id`** (default: -1):
     *   Used to group operators for Recompute (Gradient Checkpointing).
     *   Operators with the same non-negative `recompute_id` will be grouped into a single recomputation block.
     *   These operators with the same `recompute_id` should be consecutive in the graph.
+*   **`offload_id`** (default: -1):
+    *   Used to group operators whose tensors saved for backward are offloaded to CPU.
+    *   Operators with the same non-negative `offload_id` must be consecutive and belong to the same pipeline stage.
+    *   May be combined with `recompute_id`: checkpoint inputs are offloaded, while intermediates are recomputed on GPU. Select whole recompute regions.
+    *   Saved strided CUDA storages retain their dtype/layout. Parameters, buffers, explicitly resident weights and small tensors are excluded.
+    *   `ComputeConfig.cpu_offload` accepts `CPUOffloadConfig` (or its dictionary form), including a process-shared CPU pool budget and bounded speculative prefetch.
+    *   Generated schedules prefetch the next backward's microbatch/virtual-stage scope during the preceding local F/B action. Group hooks provide lookahead within a scope and support ordinary autograd.
+    *   See [CPU activation offloading](cpu_activation_offload.md) for lifecycle, budgets and limitations.
 *   **`stage_id`** (default: -1):
     *   Used for Pipeline Parallelism assignment.
-    *   These operators with the same `stage_id` should be consecutive in the graph.    
+    *   These operators with the same `stage_id` should be consecutive in the graph.
 *   **`pre_hook` / `post_hook`**:
     *   You can attach custom Python functions to be executed before or after the operator. See source code for signature details.
+
+### Composing adjacent recompute regions
+
+Enable `ComputeConfig(recompute_merge_adjacent=True)` for an `OpPlan` policy:
+
+```python
+from nnscaler import ComputeConfig
+from nnscaler.policies import fn
+
+config = ComputeConfig(6, 6, recompute_merge_adjacent=True)
+
+def policy(graph, config):
+    return fn(graph, config, operator_policy)
+```
+
+`fn` runs the pass after layout resolution and any `plan_transform`, reusing the
+resolved layout summaries. The option participates in generated-code cache
+checks. Policies returning a finished `IRGraph` remain responsible for their own
+transformations. Old trace metadata versions require regeneration.
+
+The pass joins maximal compatible chains of already selected checkpoints. It
+preserves stage, forward slices, gradient reductions, offload selection, known
+effects and hooks. External producers are checked too. Original head/tail
+trimming leaves gaps; unselected operations are never absorbed.
+
+For `h = checkpoint(norm, x); y = checkpoint(attention, h)`, composition emits
+one checkpoint that saves `x` and reconstructs `h`. External consumers still get
+required outputs. Opaque operations retain the caller's checkpoint replay
+contract; absence of known effects is not a purity proof. Larger regions may
+increase the transient backward working set, so check memory on the target model.
 
 ### Example: Custom Partitioning and Recomputation
 

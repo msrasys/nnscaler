@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import warnings
 from collections import OrderedDict, defaultdict
 
 import torch
@@ -51,6 +52,7 @@ from nnscaler.ir.unique import IDGenerator
 
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamZeroConfig
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.cpu_offloading import CPUOffloadConfig
 from nnscaler.runtime.checkpoint_broadcast import broadcast_checkpoint_tensors
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import (
@@ -83,6 +85,9 @@ from nnscaler.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Metadata emitted by this compiler, independently of a caller's saved config.
+_TRACE_METADATA_VERSION = 3
 
 
 _PREDEFINE_SCHEDS: Dict[str, Callable[[IRGraph, int, int], SchedulePlan]] = {}
@@ -217,7 +222,47 @@ class ComputeConfig:
     # ```
     user_config: Dict[str, Any] = field(default_factory=dict)
 
+    # A dict is accepted to support dataclasses.asdict serialization.
+    cpu_offload: Optional[CPUOffloadConfig] = None
+    # Pipeline input lifetime is independent of where saved activations live.
+    # None is an initialization sentinel for the deprecated cpu_offload alias;
+    # __post_init__ resolves it to a bool (False by default).
+    release_pipeline_inputs: Optional[bool] = None
+    # Keep non-scalar pipeline backward roots as gradient edges after their
+    # final data read. Independent of activation offload and input-gradient slots.
+    release_pipeline_outputs: bool = False
+
+    # Version of metadata recorded in the serialized forward trace. Increment
+    # when old graph dumps lack facts needed by current graph transformations.
+    # Append it to preserve existing positional arguments (including Python 3.9).
+    _trace_metadata_version: int = _TRACE_METADATA_VERSION
+
+    # Compose selected checkpoint regions in OpPlan policies after resolution.
+    recompute_merge_adjacent: bool = False
+
     def __post_init__(self):
+        if type(self._trace_metadata_version) is not int or self._trace_metadata_version < 0:
+            raise ValueError('_trace_metadata_version must be a nonnegative integer')
+        if type(self.recompute_merge_adjacent) is not bool:
+            raise ValueError('recompute_merge_adjacent must be a bool')
+        if isinstance(self.cpu_offload, dict):
+            super().__setattr__('cpu_offload', CPUOffloadConfig(**self.cpu_offload))
+        elif self.cpu_offload is not None and not isinstance(self.cpu_offload, CPUOffloadConfig):
+            raise TypeError('cpu_offload must be CPUOffloadConfig or a dictionary')
+        release_inputs = self.release_pipeline_inputs
+        if release_inputs is not None and not isinstance(release_inputs, bool):
+            raise ValueError('release_pipeline_inputs must be a bool')
+        if not isinstance(self.release_pipeline_outputs, bool):
+            raise ValueError('release_pipeline_outputs must be a bool')
+        legacy_release = bool(self.cpu_offload and self.cpu_offload.release_pipeline_inputs)
+        if legacy_release:
+            warnings.warn(
+                'CPUOffloadConfig.release_pipeline_inputs is deprecated; use '
+                'ComputeConfig.release_pipeline_inputs. An explicit top-level value takes precedence.',
+                DeprecationWarning, stacklevel=2,
+            )
+            super().__setattr__('cpu_offload', replace(self.cpu_offload, release_pipeline_inputs=False))
+        super().__setattr__('release_pipeline_inputs', legacy_release if release_inputs is None else release_inputs)
         if self.plan_ngpus <= 0:
             raise ValueError(f"plan_ngpus {self.plan_ngpus} must be > 0")
         if self.runtime_ngpus is None:
@@ -267,6 +312,8 @@ class ComputeConfig:
             raise ValueError("zero_use_reduce_scatter is only supported when zero_ngroups is 1.")
 
         if self.use_fbw:
+            if self.release_pipeline_inputs or self.release_pipeline_outputs:
+                raise ValueError('Pipeline input/output release is not supported with split backward')
             if not self.use_end2end:
                 raise ValueError("use_fbw is only supported in end2end mode.")
             if self.inference_only:
@@ -332,6 +379,7 @@ class ComputeConfig:
             'inference_only': self.inference_only, # there will be no backward nodes in the graph in inference mode
             'end2end_mode': self.use_end2end,  # end2end_mode can affect the graph generation.
             'trace_strategy': self.trace_strategy,  # different strategy might lead to different graph
+            '_trace_metadata_version': vars(self).get('_trace_metadata_version', 0),
         }
 
     @property
@@ -398,7 +446,24 @@ class ComputeConfig:
         if Path(file).exists():
             try:
                 cfg = torch.load(file, weights_only=False)
+                # A legacy object can see the new dataclass default through
+                # attribute lookup/asdict even though it never saved this field.
+                raw_fields = vars(cfg) if isinstance(cfg, cls) else cfg
+                legacy_trace_metadata = (isinstance(raw_fields, dict)
+                                         and '_trace_metadata_version' not in raw_fields)
+                raw_cpu = cfg.cpu_offload if isinstance(cfg, cls) else cfg.get('cpu_offload') if isinstance(cfg, dict) else None
+                legacy_activation_schedule = (raw_cpu is not None and '_schedule_version' not in
+                                              (raw_cpu if isinstance(raw_cpu, dict) else vars(raw_cpu)))
+                if isinstance(cfg, cls):
+                    cfg = asdict(cfg)
                 if isinstance(cfg, dict): # in old version, we save the object directly (not save as dict)
+                    if legacy_trace_metadata:
+                        cfg['_trace_metadata_version'] = 0
+                    if legacy_activation_schedule:
+                        cpu_fields = cfg['cpu_offload']
+                        if not isinstance(cpu_fields, dict):
+                            cpu_fields = asdict(cpu_fields)
+                        cfg['cpu_offload'] = dict(cpu_fields, _schedule_version=0)
                     # this can raise if cfg has extra keys.
                     # which means some fields of ComputeConfig has been removed(we should avoid this).
                     # in this case, we just return None.
@@ -420,8 +485,10 @@ class ComputeConfig:
         """
         try:
             if isinstance(a, cls) and isinstance(b, cls):
-                a = replace(a, user_config=_user_config_for_reuse(a.user_config))
-                b = replace(b, user_config=_user_config_for_reuse(b.user_config))
+                a = replace(a, user_config=_user_config_for_reuse(a.user_config),
+                            _trace_metadata_version=vars(a).get('_trace_metadata_version', 0))
+                b = replace(b, user_config=_user_config_for_reuse(b.user_config),
+                            _trace_metadata_version=vars(b).get('_trace_metadata_version', 0))
             return a == b
         except AttributeError:
             logger.warning("Failed to compare ComputeConfig. They are incompatible.")
@@ -730,8 +797,10 @@ def _prepare_and_check_reusable(
     reusable = False
     config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
     old_config: Optional[ComputeConfig] = ComputeConfig.safe_load_from_file(config_file)
-    is_config_match = ComputeConfig.safe_equals(old_config, compute_config)
-    is_graph_config_match = old_config is not None and old_config.graph_config == compute_config.graph_config
+    current_trace_metadata = (old_config is not None
+                              and old_config._trace_metadata_version == _TRACE_METADATA_VERSION)
+    is_config_match = current_trace_metadata and ComputeConfig.safe_equals(old_config, compute_config)
+    is_graph_config_match = current_trace_metadata and old_config.graph_config == compute_config.graph_config
     trace_meta_files = [
         outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
         outdir / FxModuleParser.ATTR_MAP_FILE,
@@ -1045,7 +1114,11 @@ def _gencode(
     )
     sgener = None
     if compute_config.use_end2end:
-        sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
+        sgener = ScheduleCodeGen(
+            execplan, compute_config.runtime_ngpus,
+            release_pipeline_inputs=compute_config.release_pipeline_inputs,
+            release_pipeline_outputs=compute_config.release_pipeline_outputs,
+        )
 
     actual_codegen_workers = min(codegen_workers, compute_config.runtime_ngpus)
     if actual_codegen_workers > 1:
@@ -1507,6 +1580,11 @@ def parallelize(
         (inspect.isclass(module_or_module_class) and issubclass(module_or_module_class, CubeModule))
     ):
         raise RuntimeError("Old style CubeModule is not supported")
+
+    # This version describes this compiler's output, not a user setting. A
+    # loaded legacy config must retrace once, then save a reusable current graph.
+    if vars(compute_config).get('_trace_metadata_version', 0) != _TRACE_METADATA_VERSION:
+        compute_config = replace(compute_config, _trace_metadata_version=_TRACE_METADATA_VERSION)
 
     if isinstance(pas_policy, str):
         if not pas_policy in _PREDEFINED_POLICIES:

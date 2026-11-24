@@ -40,6 +40,7 @@ from nnscaler.utils import accum_mode, classproperty, unchecked_fields
 
 if TYPE_CHECKING:
     from nnscaler.parallel import ComputeConfig
+    from nnscaler.runtime.cpu_offloading import CPUOffloadContext
 
 
 _logger = logging.getLogger(__name__)
@@ -1400,6 +1401,46 @@ class ExtraState(ZeroMetadata, OriginModuleMetadata, ParallelModuleConfig):
     pass
 
 
+class _ModuleTensorRegistry:
+    def __init__(self, module: torch.nn.Module) -> None:
+        self.module_parameters = tuple(module.parameters())
+        self.module_tensors = self.module_parameters + tuple(module.buffers())
+        self.parameters_by_id = {id(parameter): parameter for parameter in self.module_parameters}
+        self.tensors_by_storage = {
+            self._storage_key(tensor): tensor
+            for tensor in self.module_tensors
+            # Only consider tensors with strided layout for storage key mapping.
+            # other layouts (e.g., sparse, mkldnn) are not supported for CPU offloading and remain on their original device.
+            if tensor.layout == torch.strided
+        }
+
+    @staticmethod
+    def _storage_key(tensor: torch.Tensor) -> Tuple[torch.device, torch.UntypedStorage]:
+        return tensor.device, tensor.untyped_storage()
+
+    def find(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
+        """Find the module parameter or buffer that owns ``tensor``'s data.
+
+        Args:
+            tensor: A strided tensor passed to a saved-tensor pack hook.
+
+        Returns:
+            Its owning module parameter or buffer, or ``None``.
+        """
+        key = self._storage_key(tensor)
+        owner = self.tensors_by_storage.get(key)
+
+        if owner is not None:
+            return owner
+
+        # A gathered ZeRO-3 parameter is absent from the storage snapshot.
+        base = tensor
+        while base is not None and (owner := self.parameters_by_id.get(id(base))) is None:
+            base = base._base
+
+        return owner
+
+
 class ParallelModule(CubeModule):
     COMPUTE_CONFIG_FILE = 'compute_config.pt'
     ORIGIN_MODULE_METADATA_FILE = 'origin_module_metadata.pt'
@@ -1647,6 +1688,24 @@ class ParallelModule(CubeModule):
                 ) if zero3_info is not None else None
 
         self._zero_metadata = self._get_zero_metadata()
+        # all parameters and buffers are ready now
+        # we can build the module tensor registry to help find the owner of a tensor
+        self._module_tensor_registry = _ModuleTensorRegistry(self)
+
+    def find_buffer_or_param_owner(self, tensor: torch.Tensor):
+        """
+        Check if the given tensor is a derived buffer or parameter.
+
+        Args:
+            tensor (torch.Tensor): the tensor to check
+
+        Returns:
+            Optional[torch.Tensor]: the owner tensor if the given tensor is a derived buffer or parameter, None  otherwise
+        """
+        assert self._module_tensor_registry is not None, \
+            "Module tensor registry is not initialized. Please call build_buckets() first." \
+            "And you should not call this method when module is in sleep state."
+        return self._module_tensor_registry.find(tensor)
 
     def get_zero3_attr_meta(self, attr_name: str) -> Optional[Zero3AttrMeta]:
         """
@@ -1722,8 +1781,23 @@ class ParallelModule(CubeModule):
 
     def save_params_hooks(self) -> saved_tensors_hooks:
         """
-        A hook to save tensors during forward pass.
-        This is used to avoid parameters being saved for activation checkpointing.
+        Avoid retaining ZeRO-3 gathered parameter storage in autograd.
+
+        ZeRO-3 temporarily replaces a parameter's local shard with an
+        all-gathered full tensor. Autograd, including activation checkpointing,
+        may save a view of that tensor, such as a transposed linear weight.
+        Rebinding ``param.data`` to the local shard after forward does not free
+        the gathered storage while such a saved view still references it.
+
+        The pack hook replaces tensors sharing storage with a currently
+        prefetched parameter by the parameter object and the view's shape,
+        stride, and storage offset. The gathered storage can then be released
+        when the parameter is evicted. Before the corresponding backward,
+        generated hooks gather the parameter again, and the unpack hook
+        reconstructs the original view with ``torch.as_strided``.
+
+        Only parameters in ``_forward_prefetched_params`` are matched, so the
+        recorded view metadata always describes the currently gathered storage.
 
         Returns:
             saved_tensors_hooks: the saved tensors hooks
@@ -1740,6 +1814,56 @@ class ParallelModule(CubeModule):
             return x
 
         return saved_tensors_hooks(pack, unpack)
+
+    def cpu_offloading_hooks(self, *, tail=False) -> 'CPUOffloadContext':
+        """
+        Offload activations while preserving ``save_params_hooks`` semantics.
+        """
+        from nnscaler.runtime.cpu_offloading import CPUOffloadContext
+        return CPUOffloadContext(self, tail=tail)
+
+    def _get_activation_offload_manager(self):
+        from nnscaler.runtime.cpu_offloading import ActivationOffloadManager, CPUOffloadConfig
+        manager = getattr(self, '_activation_offload_manager', None)
+        if manager is None:
+            config = getattr(getattr(self, 'compute_config', None), 'cpu_offload', None)
+            if config is not None and config._schedule_version != CPUOffloadConfig._schedule_version:
+                raise RuntimeError('Activation scheduling requires regenerated code; recompile with a current CPUOffloadConfig')
+            manager = ActivationOffloadManager(self, config or CPUOffloadConfig())
+            self._activation_offload_manager = manager
+        return manager
+
+    def activation_offload_scope(self, key=None, *, immediate_backward=False, backward_distance=None, pipeline=False):
+        return self._get_activation_offload_manager().scope(key, immediate_backward, backward_distance, pipeline)
+
+    def activation_offload_schedule(self, entries, *, backward_positions=None):
+        """Use actual local F/B positions, with runtime-configurable lookahead."""
+        return self._get_activation_offload_manager().schedule(entries, backward_positions=backward_positions)
+
+    def prefetch_activation(self, key):
+        self._get_activation_offload_manager().prefetch(key)
+
+    def finish_activation_offload(self, key):
+        self._get_activation_offload_manager().finish(key)
+
+    def activation_offload_stats(self):
+        manager = getattr(self, '_activation_offload_manager', None)
+        return {} if manager is None else manager.pool.snapshot()
+
+    def _apply(self, fn, recurse=True):
+        # Device/dtype conversion invalidates the storage identity registry.
+        self._reset_activation_offload_manager()
+        self._module_tensor_registry = None
+        result = super()._apply(fn, recurse=recurse)
+        self._module_tensor_registry = _ModuleTensorRegistry(self)
+        return result
+
+    def _reset_activation_offload_manager(self):
+        manager = getattr(self, '_activation_offload_manager', None)
+        if manager is not None:
+            if manager.records or manager.scopes:
+                raise RuntimeError('Cannot move or sleep a module with live offloaded activations')
+            self._activation_offload_manager = None
 
     @classmethod
     def get_attr_meta_map(cls, rank=None):
@@ -1866,6 +1990,12 @@ class ParallelModule(CubeModule):
                     break
             return ins, outs, grads
 
+        # Loss scaling only transforms output roots/gradients; it never reads
+        # segment input data and can accept input gradient slots.
+        cube_scale._nnscaler_supports_input_grad_slots = True
+        # Released non-scalar roots have explicit incoming gradients. This hook
+        # only reads scalar loss roots, which are never converted to references.
+        cube_scale._nnscaler_supports_output_references = True
         Executor.register_backward_pre_hook(cube_scale)
 
     def train_step(self,
@@ -2310,6 +2440,16 @@ class ParallelModule(CubeModule):
         _logger.info(f'Rank {self.rank}: Finished gathering model state dict')
         torch.cuda.synchronize()
         return merged_state_dict
+
+    def sleep(self):
+        self._reset_activation_offload_manager()
+        self._module_tensor_registry = None
+        return super().sleep()
+
+    def wake_up(self, device: Optional[Union[int, device]] = None):
+        super().wake_up(device=device)
+        self._module_tensor_registry = _ModuleTensorRegistry(self)
+        return self
 
     def _pack(
         self,

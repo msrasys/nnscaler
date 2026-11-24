@@ -20,6 +20,7 @@ IRDataOperation is recommended to be replicated to all devices.
 
 import ast
 from dataclasses import dataclass, field
+import json
 import logging
 from typing import Any, List, Literal, Optional, Sequence, TYPE_CHECKING, Callable, Iterable, Union
 import random
@@ -33,6 +34,7 @@ from nnscaler.graph import IRGraph
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.graph.function.pyfunc import IRPyFunc
+from nnscaler.graph.recompute import _collect_plan_layouts, merge_recompute_regions
 from nnscaler.graph.segment import IRSegment
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir import IRCell, IRSubTensor, IRFullTensor
@@ -389,7 +391,7 @@ class OpPlan:
     OpPlan represents the distributed plan for an operator.
     """
     op: IRFwOperation
-    recompute_id: int = -1  # -1 means no recompute
+    recompute_id: int = -1   # -1 means no recompute
     stage_id: int = -1       # pipeline stage id, -1 means following the previous op's stage
 
     # user defined meta data for hooks
@@ -429,8 +431,17 @@ class OpPlan:
     # for future extension
     # don't use it now.
     partitions: List[OpPartition | None] = field(default_factory=list)  # multiple partition plans
+    # Appended to preserve the positional constructor used by existing policies.
+    offload_id: int = -1     # -1 means no saved-tensor CPU offload
 
     def __post_init__(self):
+        if self.recompute_id < -1:
+            raise ValueError("recompute_id must be -1 or non-negative")
+        if self.offload_id < -1:
+            raise ValueError("offload_id must be -1 or non-negative")
+        if self.stage_id < -1:
+            raise ValueError("stage_id must be -1 or non-negative")
+
         if self.partition is not None and len(self.partitions) > 0:
             raise ValueError("Only one of partition and partitions can be set")
 
@@ -535,9 +546,7 @@ def apply_module_recompute(
             current_key = key
         groups[-1].append(node)
 
-    planned_groups = tuple(
-        tuple(group) for group in groups if len(group) > 1
-    )
+    planned_groups = tuple(tuple(group) for group in groups)
     for group in planned_groups:
         graph.recompute(list(group))
 
@@ -554,6 +563,34 @@ def apply_module_recompute(
         applied_nodes=applied_nodes,
         skipped_hook_ops=skipped_hook_ops,
     )
+
+
+def apply_module_offload(graph: IRGraph, module_types) -> int:
+    """Select consecutive traced module invocations before partitioning.
+
+    The same nodes may also be recomputed. Whole recompute regions must be
+    selected so code generation can offload their saved checkpoint inputs.
+    """
+    if isinstance(module_types, type):
+        module_types = (module_types,)
+    module_types = tuple(module_types)
+    if not all(isinstance(m, type) and issubclass(m, torch.nn.Module) for m in module_types):
+        raise TypeError('module_types must contain torch.nn.Module classes')
+    groups = []
+    current = None
+    for node in graph.select(ntype=IRFwOperation):
+        match = next((m for m in module_types if m in node.module_class_chain), None)
+        if match is None:
+            current = None
+            continue
+        key = (match, node.get_module_fqn(match))
+        if key != current:
+            groups.append([])
+            current = key
+        groups[-1].append(node)
+    for group in groups:
+        graph.offload(group)
+    return len(groups)
 
 
 def get_layer_index(fqn: str) -> int:
@@ -924,6 +961,7 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
         copy_node._device = ()
         copy_node._mirror = None
         copy_node.recompute = None
+        copy_node.offload = None
         copy_node.comment = 'fn: clone dataloader index op in consumer stage'
 
         # rewire inputs: recurse into sinkable inputs, keep dataloader/constant inputs
@@ -990,12 +1028,18 @@ def fn(
         policy: Union[
             Callable[[IRGraph, 'ComputeConfig'], IRGraph],
             Callable[[IRGraph, 'ComputeConfig'], Iterable[OpPlan]],
-        ]
+        ],
+        *,
+        plan_transform: Optional[Callable[[list[OpPlan], 'ComputeConfig'], Iterable[OpPlan]]] = None,
+        hooks_allow_recompute: Optional[Callable[[Optional[Callable], Optional[Callable]], bool]] = None,
 ) -> IRGraph:
     """
     General policy function based on user-defined policy.
     The user-defined policy can either return the final IRGraph, or
     return a list of OpPlan to describe the distributed plan for each operator.
+    ``cfg.recompute_merge_adjacent`` composes existing checkpoints only on the
+    OpPlan path, after layout resolution and plan_transform. Graph-returning
+    policies retain ownership of their graph transformations.
 
     To write a new-style policy, the most important part is to locate the operator node in the graph.
     Here are some tips:
@@ -1025,12 +1069,20 @@ def fn(
         cfg: the compute config
         policy: the user-defined policy function. It can either return the final IRGraph,
                 or return an iterable of OpPlan for each operator.
+        plan_transform: optional activation-annotation pass after automatic
+                partition plans have been resolved, before graph staging and
+                partitioning. It must preserve operators, order, placement and
+                hooks; only recompute_id/offload_id may change.
+        hooks_allow_recompute: optional application contract for hooks in
+                composed checkpoints. By default, hooked regions are not merged.
 
     Returns:
         the distributed IRGraph
     """
     result = policy(graph, cfg)
     if isinstance(result, IRGraph):  # traditional policy
+        if plan_transform is not None:
+            raise ValueError('plan_transform requires an OpPlan policy')
         return result
 
     op_plans = {r.op: r for r in result}
@@ -1071,6 +1123,9 @@ def fn(
     recompute_groups: dict[int, list[IRFwOperation]] = {}
     recompute_last_id: int = -1
     recompute_group_stages: dict[int, int] = {}
+    offload_groups: dict[int, list[IRFwOperation]] = {}
+    offload_last_id: int = -1
+    offload_group_stages: dict[int, int] = {}
 
     pp_stages: list[list[IRFwOperation]] = [[]]
     pp_cur_stage_id = 0
@@ -1108,6 +1163,7 @@ def fn(
         _duplicate_dataloader_index_ops_per_stage(graph, op_plans)
 
     fw_nodes = dict.fromkeys(graph.select(ntype=IRFwOperation))
+    resolved_layouts = {} if cfg.recompute_merge_adjacent else None
 
     for node in fw_nodes:
         if (
@@ -1154,6 +1210,7 @@ def fn(
         # final partition plan for the op
         # key: input idx, value: partitioned dim
         op_partition_map: dict[int, int | Literal['rn', 'rr']] = {}
+        partitioned_nodes = None
         if op_partitions:
             # we partition the op based on the first partition plan
             # and then check the rest partitions are satisfied or not
@@ -1227,6 +1284,12 @@ def fn(
                     dim=op_partition_map[first_input_idx]
                 )
 
+        if resolved_layouts is not None:
+            # An auto candidate can have been rejected above. Snapshot only the
+            # final layout, including unselected ops needed as side producers.
+            rank_nodes = partitioned_nodes if op_plan.partition is not None else [node] * op_partition_ngpus
+            resolved_layouts[node] = _collect_plan_layouts(op_plan, rank_nodes, op_partition_ngpus)
+
         op_partition_maps[op_plan.op] = op_partition_map
         # update tensor_splits for input tensors
         for idx, input in enumerate(op_plan.op.inputs()):
@@ -1243,6 +1306,44 @@ def fn(
             else:
                 tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add(op_partition_map[idx])
 
+    if len(op_plans) != len(fw_nodes):
+        assert len(op_plans) > len(fw_nodes)
+        for op_plan in op_plans.values():
+            if op_plan.op not in fw_nodes:
+                raise ValueError(f"OpPlan contains operator {op_plan.op} not in the graph or not a forward operator")
+
+    if plan_transform is not None:
+        ordered = [op_plans[node] for node in fw_nodes]
+        def structure(plan):
+            return (id(plan.op), plan.stage_id, repr(plan.partition), repr(plan.partitions),
+                    plan.pre_hook, plan.post_hook, repr(plan.hook_meta),
+                    plan.op.recompute_barriers)
+        before = [structure(plan) for plan in ordered]
+        transformed = list(plan_transform(ordered, cfg))
+        if not all(isinstance(plan, OpPlan) for plan in transformed):
+            raise TypeError('plan_transform must return OpPlans')
+        if [structure(plan) for plan in transformed] != before:
+            raise ValueError('plan_transform may change activation annotations only; '
+                             'operator order, placement and hooks must be preserved')
+        for plan in transformed:
+            if plan.recompute_id < -1 or plan.offload_id < -1:
+                raise ValueError('Invalid activation annotation after plan_transform')
+        op_plans = {plan.op: plan for plan in transformed}
+
+    if cfg.recompute_merge_adjacent:
+        merged, report = merge_recompute_regions(
+            [op_plans[node] for node in fw_nodes],
+            partition_degree=op_partition_ngpus,
+            hooks_allow_recompute=hooks_allow_recompute,
+            _resolved_layouts=resolved_layouts,
+        )
+        op_plans = {plan.op: plan for plan in merged}
+        _logger.info('Adjacent recompute merge: %s', json.dumps(report))
+
+    # Activation groups are formed only after automatic layouts are resolved
+    # and the optional annotation transform has inspected those real layouts.
+    for node in fw_nodes:
+        op_plan = op_plans[node]
         if op_plan.recompute_id != -1:
             if op_plan.recompute_id in recompute_group_stages:
                 if recompute_group_stages[op_plan.recompute_id] != op_plan.stage_id:
@@ -1257,6 +1358,20 @@ def fn(
 
         recompute_last_id = op_plan.recompute_id
 
+        if op_plan.offload_id != -1:
+            if op_plan.offload_id in offload_group_stages:
+                if offload_group_stages[op_plan.offload_id] != op_plan.stage_id:
+                    raise ValueError("All ops in an offload group must be in the same stage")
+            else:
+                offload_group_stages[op_plan.offload_id] = op_plan.stage_id
+
+            if op_plan.offload_id != offload_last_id and op_plan.offload_id in offload_groups:
+                raise ValueError("Nodes in an offload group must be continuous.")
+
+            offload_groups.setdefault(op_plan.offload_id, []).append(op_plan.op)
+
+        offload_last_id = op_plan.offload_id
+
         # update pipeline stages
         if op_plan.stage_id == pp_cur_stage_id:
             pp_stages[pp_cur_stage_id].append(op_plan.op)
@@ -1265,12 +1380,6 @@ def fn(
             pp_stages.append([op_plan.op])
         else:
             raise ValueError("Pipeline stage ids must be continuous integers starting from 0")
-
-    if len(op_plans) != len(fw_nodes):
-        assert len(op_plans) > len(fw_nodes)
-        for op_plan in op_plans.values():
-            if op_plan.op not in fw_nodes:
-                raise ValueError(f"OpPlan contains operator {op_plan.op} not in the graph or not a forward operator")
 
     pp_segs = [graph]
     assert nstages == len(pp_stages), "Internal Error: nstages should be equal to the number of pipeline stages"
@@ -1318,9 +1427,10 @@ def fn(
 
     # set recompute groups
     for group in recompute_groups.values():
-        if len(group) <= 1:
-            continue
         graph.recompute(group)
+
+    for group in offload_groups.values():
+        graph.offload(group)
 
     # add multiref for shared parameters across stages
     # note that we have constrained that shared parameters cannot be partitioned in SPMDSolver, other input tensors
@@ -1498,7 +1608,7 @@ def pas_fsdp(graph, cfg: 'ComputeConfig'):
     1. all operators are replicated
     2. user specified modules with `cfg.pas_config.recompute_modules` are recomputed
     3. shard policy is configured in cfg.use_zero and cfg.zero_ngroups
-    4. CPU offload is not supported
+    4. CPU offload may be selected with apply_module_offload before this policy
     """
     if cfg.plan_ngpus != 1:
         raise ValueError("FSDP policy only supports 1 plan GPU")

@@ -5,6 +5,8 @@ r"""
 Executor for runtime
 """
 import atexit
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 
 from dataclasses import dataclass
 from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional, Union, Iterator
@@ -14,11 +16,40 @@ from torch.distributed import Work
 
 from ._patch_torch import stage_backward_input, stage_backward_weight
 from .stream import input_stream_lifetime, drain_stream_holds
+from .pipeline_input import (
+    InputReference, OutputReference, InputGradSlot, make_releasable_input,
+    release_input_tensor as _make_input_reference,
+    input_id, saved_input_id, is_grad_target, supports_input_slots, supports_output_references,
+)
 
 
 _logger = logging.getLogger(__name__)
 
 _ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16)
+_forward_output_observers = ContextVar('nnscaler_forward_output_observers', default=())
+
+
+@contextmanager
+def observe_forward_outputs(callback):
+    """Observe segment boundaries without changing their outputs or schedule.
+
+    ``callback(name, outputs)`` must treat outputs as read-only. Keep metadata or
+    weak references when measuring lifetime. Registration is context-local;
+    nested observers compose and are removed on exit, including exceptions.
+    Callback failures propagate to the caller.
+    """
+    if not callable(callback):
+        raise TypeError('A forward output observer must be callable')
+    token = _forward_output_observers.set((*_forward_output_observers.get(), callback))
+    try:
+        yield
+    finally:
+        _forward_output_observers.reset(token)
+
+
+def _observe_forward_outputs(name, outputs):
+    for callback in _forward_output_observers.get():
+        callback(name, outputs)
 
 try:
     from torch.autograd.graph import get_gradient_edge
@@ -175,7 +206,7 @@ class AsyncCommHandler:
         )
 
 
-TensorPairs = List[Tuple[int, Optional[torch.Tensor]]]
+TensorPairs = List[Tuple[Any, Any]]
 
 
 @dataclass
@@ -206,34 +237,144 @@ class Executor:
     _input_grad_callbacks: Dict[
         int, Tuple[torch.Tensor, Callable[[torch.Tensor], None]]
     ] = dict()
+    # Weak callback registrations are keyed by an identity object, not an
+    # integer tensor id that may be reused after forward data is released.
+    _released_input_grad_callbacks: Dict[InputReference, Tuple[Callable, Optional[Callable]]] = dict()
 
     @staticmethod
     def register_input_grad_callback(
         tensor: torch.Tensor,
         callback: Callable[[torch.Tensor], None],
+        *,
+        release_input: bool = False,
+        on_data_release: Optional[Callable[[], None]] = None,
     ) -> None:
-        """Run ``callback`` once a detached segment produces ``tensor``'s grad."""
+        """Run ``callback`` once a detached segment produces ``tensor``'s grad.
+
+        Weak registrations must precede forward. Their callback must retain
+        any required outer autograd edge independently of the input tensor.
+        ``on_data_release`` runs only at the schedule's final data-read marker.
+        """
         if not torch.is_tensor(tensor) or not tensor.requires_grad:
             raise ValueError('input gradient callbacks require a grad-requiring tensor')
         tensor_id = id(tensor)
-        if tensor_id in Executor._input_grad_callbacks:
+        if (tensor_id in Executor._input_grad_callbacks
+                or any(key.original() is tensor for key in Executor._released_input_grad_callbacks)):
             raise RuntimeError('an input gradient callback is already registered')
+        if not isinstance(release_input, bool) or (on_data_release is not None and not release_input):
+            raise ValueError('on_data_release requires a weak release_input callback')
+        if release_input:
+            for pending in Executor._detach.values():
+                for pairs in pending:
+                    if any((key.original() is tensor if isinstance(key, InputReference)
+                            else key == tensor_id) for key, _ in pairs):
+                        raise RuntimeError('A weak input gradient callback must be registered before forward')
+            Executor._released_input_grad_callbacks[InputReference(tensor)] = (callback, on_data_release)
+            return
         # Keep the tensor alive so its id cannot be reused before the callback.
         Executor._input_grad_callbacks[tensor_id] = (tensor, callback)
+
+    @staticmethod
+    def release_input_tensor(tensor):
+        reference = _make_input_reference(tensor)
+        if reference is tensor:
+            return reference
+        for key in tuple(Executor._released_input_grad_callbacks):
+            if key.original() is tensor:
+                callback, release = Executor._released_input_grad_callbacks[key]
+                if release is not None:
+                    Executor._released_input_grad_callbacks[key] = (callback, None)
+                    release()
+        return reference
+
+    @staticmethod
+    def release_output_tensor(tensor):
+        """Keep an immutable pipeline output's backward edge after its last read.
+
+        Leaves, scalar losses, unsupported layouts/APIs and unknown backward
+        hooks retain the tensor. No data pointer, shape or storage is modified.
+        Existing owners and autograd saves can still keep its storage alive.
+        """
+        if isinstance(tensor, OutputReference):
+            return tensor
+        if (get_gradient_edge is None or not supports_output_references(Executor._backward_pre_hook)
+                or not torch.is_tensor(tensor) or tensor.is_leaf or not tensor.requires_grad
+                or tensor.layout != torch.strided or tensor.numel() <= 1):
+            return tensor
+        # Transfer ownership from the legacy P2P placeholder mechanism. Pending
+        # sends retain their own tensor until completion, so the new reference
+        # needs neither a second edge registry entry nor a later data mutation.
+        edge = Executor._pseudo_free_grad_edges.pop(id(tensor), None)
+        Executor._pseudo_free_pending_sends.pop(id(tensor), None)
+        if edge is None:
+            edge = get_gradient_edge(tensor)
+        if tensor.device.type == 'cuda':
+            tensor.record_stream(torch.cuda.current_stream(tensor.device))
+        # A tensor may also have an external producer with a final-read callback.
+        Executor.release_input_tensor(tensor)
+        return OutputReference(tensor, edge)
+
+    @staticmethod
+    def register_input_backward(
+        tensor: torch.Tensor,
+        *,
+        context_factory: Optional[Callable] = None,
+        on_complete: Optional[Callable[[], None]] = None,
+        on_data_release: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Connect an isolated segment's input gradient to an outer eager graph.
+
+        A non-leaf can retain its autograd edge without owning the output data.
+        When early data release is requested, the caller only supplies cleanup
+        of its external references. Leaves (and older PyTorch without gradient
+        edges) keep the tensor alive. Saved values required by autograd always
+        remain owned by that graph. Register before forward for early release.
+
+        ``context_factory`` is entered only while running the outer backward,
+        for example to apply the caller's gradient synchronization policy.
+        """
+        if not torch.is_tensor(tensor) or not tensor.requires_grad:
+            raise ValueError('input backward connections require a grad-requiring tensor')
+        release_input = on_data_release is not None and not tensor.is_leaf and get_gradient_edge is not None
+        root = get_gradient_edge(tensor) if release_input else tensor
+
+        def resume_backward(grad):
+            nonlocal root
+            with (context_factory() if context_factory is not None else nullcontext()):
+                torch.autograd.backward(root, grad)
+            root = None
+            if on_complete is not None:
+                on_complete()
+
+        Executor.register_input_grad_callback(
+            tensor, resume_backward, release_input=release_input,
+            on_data_release=on_data_release if release_input else None,
+        )
 
     @staticmethod
     def _run_input_grad_callbacks(
         saved_pairs: TensorPairs,
         grad_by_dtensor_id: Dict[int, Optional[torch.Tensor]],
     ) -> None:
-        for tensor_id, dtensor in saved_pairs:
+        for key, dtensor in saved_pairs:
             if dtensor is None:
-                # Forward-only inputs can already be gone, and Python may
-                # have reused their object ids for a later callback boundary.
                 continue
-            entry = Executor._input_grad_callbacks.pop(tensor_id, None)
+            if isinstance(key, InputReference) and key in Executor._released_input_grad_callbacks:
+                callback, _ = Executor._released_input_grad_callbacks.pop(key)
+                grad = grad_by_dtensor_id.get(id(dtensor))
+                if grad is None:
+                    raise RuntimeError('segment did not produce a registered input gradient')
+                callback(grad.detach())
+                continue
+            tensor_id = saved_input_id(key)
+            entry = Executor._input_grad_callbacks.get(tensor_id)
             if entry is None:
                 continue
+            if isinstance(key, InputReference) and key.original() is not entry[0]:
+                # The original input can now die before backward. Never run
+                # a callback registered on a later tensor that reused its id.
+                continue
+            Executor._input_grad_callbacks.pop(tensor_id)
             grad = grad_by_dtensor_id.get(id(dtensor))
             if grad is None:
                 raise RuntimeError('segment did not produce a registered input gradient')
@@ -244,7 +385,7 @@ class Executor:
     def _pop_forward_inputs(name, requested):
         saved_pairs = Executor._detach[name].pop(0)
         opaque_inputs = Executor._backward_owners[name].pop(0)
-        pruned_ids = {tid for tid, tensor in saved_pairs if tensor is None}
+        pruned_ids = {saved_input_id(tid) for tid, tensor in saved_pairs if tensor is None}
         for tensor in requested:
             if torch.is_tensor(tensor) and tensor.requires_grad and id(tensor) in pruned_ids:
                 raise RuntimeError('Segment input requires_grad was enabled after forward')
@@ -261,7 +402,7 @@ class Executor:
 
     @staticmethod
     def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any],
-                 requires_grad=True, track_stream=True):
+                 requires_grad=True, track_stream=True, release_inputs: Tuple[int, ...] = ()):
         """
         Forward the sub-graph. Tracking defaults on for direct callers;
         generated single-stream plans explicitly pass ``track_stream=False``.
@@ -269,40 +410,69 @@ class Executor:
         original_inputs = input_tensors
         input_tensors = Executor.sync_tensors(input_tensors)
 
+        if any(isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < len(input_tensors)
+               for i in release_inputs):
+            raise ValueError('release_inputs must contain valid input argument indices')
         if not requires_grad:
             with torch.no_grad(), input_stream_lifetime(input_tensors, track_stream):
                 outputs = subgraph(*input_tensors)
+                _observe_forward_outputs(name, outputs)
             return outputs
 
         # everytime forward a segment, detach the tensor from previous graph
         mapping: Dict[int, torch.Tensor] = dict()
+        selected_ids = {id(original_inputs[i]) for i in release_inputs}
+        slots, keys = {}, {}
+        owner = getattr(subgraph, '__self__', None)
+        find_owner = getattr(owner, 'find_buffer_or_param_owner', None)
         for original, itensor in zip(original_inputs, input_tensors):
-            # A communication callback may materialize a new tensor without an
-            # autograd edge. The original boundary still needs its gradient.
-            if torch.is_tensor(itensor) and (itensor.requires_grad or original.requires_grad) \
-                    and id(itensor) not in mapping:
-                mapping[id(itensor)] = itensor.detach().requires_grad_()
+            if not torch.is_tensor(itensor) or not (itensor.requires_grad or original.requires_grad):
+                continue
+            tid = id(original)
+            if id(itensor) in mapping:
+                continue
+            for key in Executor._released_input_grad_callbacks:
+                if key.tensor_id == tid and key.original() is original:
+                    keys[tid] = key
+                    break
+            if tid in selected_ids:
+                keys.setdefault(tid, InputReference(original))
+                if (supports_input_slots(Executor._backward_pre_hook)
+                        and itensor.layout == torch.strided
+                        and itensor.dtype in _ALLOW_GRAD_DTYPES
+                        and not isinstance(itensor, torch.nn.Parameter)
+                        and not (find_owner and find_owner(itensor) is not None)
+                        and not getattr(itensor.untyped_storage(), '_nnscaler_activation_resident', False)):
+                    mapping[id(itensor)], slots[tid] = make_releasable_input(itensor)
+                    continue
+            mapping[id(itensor)] = itensor.detach().requires_grad_()
         input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in input_tensors)
-
-        saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(original_inputs, input_dtensors)]
+        saved_pairs = [(keys.get(id(original), id(original)), slots.get(id(original), dtensor))
+                       for original, dtensor in zip(original_inputs, input_dtensors)]
         Executor._detach.setdefault(name, []).append(saved_pairs)
 
-        with input_stream_lifetime(input_dtensors, track_stream) as opaque:
-            Executor._backward_owners.setdefault(name, []).append(tuple(opaque))
-            outputs = subgraph(*input_dtensors)
-        # Autograd/checkpointing own any constants needed by backward. The
-        # executor keeps input-gradient/callback boundaries here. Opaque owners
-        # are held separately until backward GPU completion, since autograd's
-        # Python references alone do not protect cross-stream storage reuse.
-        # Keeping every input here pins frozen reference hidden/KV tensors
-        # (and entire metadata dictionaries) until this segment's backward.
-        # Prune after the call so an input enabled for grad inside it is kept;
-        # retain ids for the existing boundary-order checks.
+        from nnscaler.runtime.cpu_offloading import mark_retained_scope_tensors
+        mark_retained_scope_tensors(tuple(dtensor for original, dtensor in zip(original_inputs, input_dtensors)
+                                         if id(original) not in slots))
+        owners = ()
+        try:
+            with input_stream_lifetime(input_dtensors, track_stream) as opaque:
+                owners = tuple(opaque)
+                Executor._backward_owners.setdefault(name, []).append(owners)
+                outputs = subgraph(*input_dtensors)
+                _observe_forward_outputs(name, outputs)
+        except BaseException:
+            pending = Executor._detach[name]
+            pending[:] = [pairs for pairs in pending if pairs is not saved_pairs]
+            owner_queue = Executor._backward_owners.get(name, [])
+            if owner_queue and owner_queue[-1] is owners:
+                owner_queue.pop()
+            raise
         saved_pairs[:] = [
-            (tensor_id, tensor if torch.is_tensor(tensor) and (
-                tensor.requires_grad or tensor_id in Executor._input_grad_callbacks
+            (key, tensor if is_grad_target(tensor) or (
+                torch.is_tensor(tensor) and saved_input_id(key) in Executor._input_grad_callbacks
             ) else None)
-            for tensor_id, tensor in saved_pairs
+            for key, tensor in saved_pairs
         ]
         return outputs
 
@@ -350,19 +520,20 @@ class Executor:
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
 
         saved_pairs, opaque_inputs = Executor._pop_forward_inputs(name, input_tensors)
-        tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
+        tensor_ids: List[int] = [saved_input_id(pair[0]) for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
         requested_input_tensors = input_tensors
         requested_tensor_ids = [
-            id(t) for t in requested_input_tensors if torch.is_tensor(t)
+            input_id(t) for t in requested_input_tensors if isinstance(t, (torch.Tensor, InputReference))
         ]
         dtensor_by_input_id = {
-            tid: dtensor
+            saved_input_id(tid): dtensor
             for tid, dtensor in saved_pairs
-            if torch.is_tensor(dtensor)
+            if isinstance(dtensor, (torch.Tensor, InputGradSlot))
         }
+
         for t in requested_input_tensors:
-            if torch.is_tensor(t) and id(t) not in tensor_ids:
+            if isinstance(t, (torch.Tensor, InputReference)) and input_id(t) not in tensor_ids:
                 import traceback
                 _logger.warning(
                     f"rank {torch.distributed.get_rank()}: input {name} doesn't match. "
@@ -376,7 +547,7 @@ class Executor:
         input_tensors = []
         for tid in requested_tensor_ids:
             t = dtensor_by_input_id.get(tid)
-            if torch.is_tensor(t) and t.requires_grad:
+            if is_grad_target(t):
                 t.retain_grad()
                 input_tensors.append(t)
 
@@ -385,22 +556,33 @@ class Executor:
         dedup_output_tensor_grads = []
         for t, g in zip(output_tensors, output_tensor_grads):
             # filter out duplicated output tensor and its grad.
-            pair = (id(t), id(g))
+            pair = (t.backward_identity if isinstance(t, OutputReference) else id(t), id(g))
             if pair not in visited:
                 visited.add(pair)
                 dedup_output_tensors.append(t)
                 dedup_output_tensor_grads.append(g)
 
         # apply hook before backward
-        input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
-            Executor._apply_backward_pre_hook(
-                input_tensors, dedup_output_tensors, dedup_output_tensor_grads,
-                track_stream or bool(opaque_inputs),
-            )
+        if Executor._backward_pre_hook is not None:
+            if any(isinstance(t, InputGradSlot) for t in input_tensors) and not supports_input_slots(Executor._backward_pre_hook):
+                raise RuntimeError('The backward hook changed after pipeline inputs were released; it must support input gradient slots')
+            if (any(isinstance(t, OutputReference) for t in dedup_output_tensors)
+                    and not supports_output_references(Executor._backward_pre_hook)):
+                raise RuntimeError('The backward hook changed after pipeline outputs were released; it must support output references')
+            input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
+                Executor._apply_backward_pre_hook(
+                    input_tensors, dedup_output_tensors, dedup_output_tensor_grads,
+                    track_stream or bool(opaque_inputs),
+                )
 
         pseudo_free_output_ids = []
         backward_roots = []
         for tensor in dedup_output_tensors:
+            if isinstance(tensor, OutputReference):
+                if tensor.edge is None:
+                    raise RuntimeError('A released pipeline output was already consumed by backward')
+                backward_roots.append(tensor.edge)
+                continue
             edge = Executor._pseudo_free_grad_edges.get(id(tensor))
             if edge is None:
                 backward_roots.append(tensor)
@@ -418,29 +600,43 @@ class Executor:
                     grad_tensors=dedup_output_tensor_grads,
                 )
             finally:
+                for tensor in (*output_tensors, *dedup_output_tensors):
+                    if isinstance(tensor, OutputReference):
+                        tensor.edge = None
                 for tensor_id in pseudo_free_output_ids:
                     Executor._pseudo_free_grad_edges.pop(tensor_id, None)
                     Executor._pseudo_free_pending_sends.pop(tensor_id, None)
             grads = tuple(t.grad for t in input_tensors)
             assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
 
-            # ``fexecute`` deliberately detaches segment inputs. Preserve the
-            # retain_grad contract, and include callbacks in the protected scope.
+            # ``fexecute`` deliberately detaches segment inputs.  Preserve the
+            # normal PyTorch ``retain_grad`` contract for callers that need a
+            # gradient to cross from an end-to-end generated subgraph back into an
+            # outer eager graph.
             grad_by_input_id = {
-                tid: dtensor.grad
+                saved_input_id(tid): dtensor.grad
                 for tid, dtensor in saved_pairs
-                if torch.is_tensor(dtensor) and dtensor.requires_grad
+                if is_grad_target(dtensor)
             }
-            Executor._accumulate_retained_input_grads(requested_input_tensors, grad_by_input_id)
+            Executor._accumulate_retained_input_grads(
+                [tensor.original() if isinstance(tensor, InputReference) else tensor
+                 for tensor in requested_input_tensors],
+                grad_by_input_id,
+            )
 
             Executor._run_input_grad_callbacks(
                 saved_pairs,
                 {
                     id(dtensor): dtensor.grad
                     for dtensor in dtensors
-                    if torch.is_tensor(dtensor)
+                    if isinstance(dtensor, (torch.Tensor, InputGradSlot))
                 },
             )
+            for target in dtensors:
+                if isinstance(target, InputGradSlot):
+                    # The returned gradients/callbacks own any still-needed data.
+                    # An output retained by a caller must not keep dInput alive.
+                    target.grad = None
 
             if    len(grads) == 0: return None
             elif  len(grads) == 1: return grads[0]
@@ -460,6 +656,10 @@ class Executor:
         ``backward_weight`` must later be called for the same segment name and
         in the same order as ``backward_input``.
         """
+        if any(isinstance(t, OutputReference) for t in output_tensors):
+            raise RuntimeError('Released pipeline outputs do not support split backward')
+        if any(isinstance(key, InputReference) for key, _ in Executor._detach[name][0]):
+            raise RuntimeError('Released pipeline inputs do not support split backward')
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
         weights = tuple(weights)
         requested_input_tensors = input_tensors
@@ -706,7 +906,7 @@ class Executor:
             return tensor
         tensor.data = torch.empty((1,), dtype=tensor.dtype, device=tensor.device)
         return tensor
-    
+
     @staticmethod
     def clear():
         try:
@@ -719,6 +919,7 @@ class Executor:
             Executor._weight_backward_states = dict()
             Executor._backward_pre_hook = None
             Executor._input_grad_callbacks = dict()
+            Executor._released_input_grad_callbacks = dict()
 
     @staticmethod
     def check_clear():
@@ -740,6 +941,8 @@ class Executor:
                 f"Fine remaining segment needs weight backward: {name}, remaining times: {len(states)}"
         assert len(Executor._input_grad_callbacks) == 0, \
             f"Input gradient callbacks remain: {len(Executor._input_grad_callbacks)}"
+        assert not Executor._released_input_grad_callbacks, \
+            f"Released input gradient callbacks remain: {len(Executor._released_input_grad_callbacks)}"
 
 
 fexecute = Executor.fexecute
@@ -751,6 +954,9 @@ complete_deferred_pseudo_free_tensor = Executor.complete_deferred_pseudo_free_te
 backward_input = Executor.backward_input
 backward_weight = Executor.backward_weight
 register_input_grad_callback = Executor.register_input_grad_callback
+register_input_backward = Executor.register_input_backward
+release_input_tensor = Executor.release_input_tensor
+release_output_tensor = Executor.release_output_tensor
 sync_tensors = Executor.sync_tensors
 
 
