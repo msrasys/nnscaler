@@ -1066,7 +1066,7 @@ class ModuleCodeGen(FuncEmission):
         return self._emit_segment_nodes(segment, list(segment.nodes()), runtime_devid)
 
     def _emit_segment_nodes(self, segment, nodes, runtime_devid, lifetime=None, *, release_unused=True,
-                            checkpoint_readiness=None):
+                            checkpoint_readiness=None, weight_regions=None):
         """Emit ordinary nodes/checkpoints with a caller-provided lifetime plan."""
         lifetime = lifetime or LifeCycle(nodes, segment.inputs(), segment.outputs())
         rc_groups: List[List[IRCell]] = list(
@@ -1081,13 +1081,13 @@ class ModuleCodeGen(FuncEmission):
             assert len(rc_group) > 0
             gid: Optional[int] = rc_group[0].recompute
             if gid is None:
-                codes += self._emit_nodes(rc_group, lifetime, runtime_devid)
+                codes += self._emit_nodes(rc_group, lifetime, runtime_devid, weight_regions=weight_regions)
             else:
                 # get recompute excution code
                 rc_segment = segment.create_segment(rc_group)
                 rc_codes = self._emit_recompute(rc_group,
                     rc_segment.inputs(), rc_segment.outputs(), lifetime, runtime_devid,
-                    backward_ready=(checkpoint_readiness or {}).get(gid))
+                    backward_ready=(checkpoint_readiness or {}).get(gid), weight_regions=weight_regions)
                 codes += rc_codes
                 # release input tensors after exiting a RC group:
                 last_node = rc_group[-1]
@@ -1102,7 +1102,7 @@ class ModuleCodeGen(FuncEmission):
 
         return codes
 
-    def _emit_nodes(self, nodes: List[IRCell], lifecycle: LifeCycle, runtime_devid: int) -> List[str]:
+    def _emit_nodes(self, nodes: List[IRCell], lifecycle: LifeCycle, runtime_devid: int, *, weight_regions=None) -> List[str]:
         """
         Emit code to invoke operations and adapter,
         e.g. (the lines are split into `List[str]`)
@@ -1175,10 +1175,10 @@ class ModuleCodeGen(FuncEmission):
                     ))
                     if parameters:
                         self.execplan.mark_module_streams()
-                        with Block(
-                            f'with nnscaler.WeightGradientAccumulator({weight_stream!r}, '
-                            f'({", ".join(parameters)}, )):'
-                        ) as block:
+                        region = (weight_regions or {}).get(node)
+                        scope = (f'{region}.operator()' if region else
+                                 f'nnscaler.WeightGradientAccumulator({weight_stream!r}, ({", ".join(parameters)}, ))')
+                        with Block(f'with {scope}:') as block:
                             block.insert_body(code)
                         code = block.code
                 if not param_inputs or CompileFlag.use_zero <= 1:
@@ -1316,7 +1316,7 @@ class ModuleCodeGen(FuncEmission):
         return node_codes
 
     def _emit_recompute(self, nodes: Tuple[IRCell], inputs: List[IRSubTensor], outputs: List[IRSubTensor],
-                        lifecycle: LifeCycle, runtime_devid: int, *, backward_ready=None) -> List[str]:
+                        lifecycle: LifeCycle, runtime_devid: int, *, backward_ready=None, weight_regions=None) -> List[str]:
         """
         Emit code to define a Python function for Recomputing and invoke it
         e.g. (the lines are split into `List[str]`)
@@ -1347,7 +1347,6 @@ class ModuleCodeGen(FuncEmission):
 
         inputs = [t for t in inputs if not t.is_attr()]
         input_names = [self.tensor_name(t) for t in inputs]
-        input_names_tuple = ', '.join(input_names)
         output_names = [self.tensor_name(t) for t in outputs]
         output_names_tuple = ', '.join(output_names)
 
@@ -1356,7 +1355,9 @@ class ModuleCodeGen(FuncEmission):
         # And we will not generate 'return' statement for it, since it will cause the error
         # that the variable is not defined (because it has been 'del'-ed).
 
-        with FunctionBlock('recompute', input_names, False) as fb:
+        captures = list(dict.fromkeys(weight_regions[node] for node in nodes if node in (weight_regions or {})))
+        # Explicit arguments keep each invocation's region alive through replay.
+        with FunctionBlock('recompute', input_names + captures, False) as fb:
             # The nodes to recompute share the same space of line_ids (or "node ids") with non-recomputable nodes.
             # e.g. those ids in subgraphs are not 0-based, and incremented after the preceding non-rc nodes and so on.
             #
@@ -1367,7 +1368,7 @@ class ModuleCodeGen(FuncEmission):
 
             # for ncode in ModuleCodeGen._emit_nodes(nodes, lifecycle):
             #     fb.insert_body(ncode)
-            fb.insert_body(self._emit_nodes(nodes, lifecycle, runtime_devid))
+            fb.insert_body(self._emit_nodes(nodes, lifecycle, runtime_devid, weight_regions=weight_regions))
             fb.insert_body(f'return {output_names_tuple}')
         codes = [''] + fb.code + ['']
         stream = checkpoint_stream(nodes, CompileFlag.module_streams)
@@ -1379,7 +1380,8 @@ class ModuleCodeGen(FuncEmission):
             context = (f', context_fn=lambda: nnscaler.runtime.checkpoint_stream.contexts('
                        f'{stream!r}, {dependencies}'
                        f'{", backward_ready=" + backward_ready if backward_ready else ""})')
-        codes.append(f'{output_names_tuple} = ckpt.checkpoint(recompute, {input_names_tuple}, '
+        checkpoint_inputs = ', '.join(input_names + captures)
+        codes.append(f'{output_names_tuple} = ckpt.checkpoint(recompute, {checkpoint_inputs}, '
                      f'use_reentrant=False{context})')
         return codes
 

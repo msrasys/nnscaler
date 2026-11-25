@@ -12,6 +12,7 @@ from nnscaler.codegen.syntax.blocks import Block
 from nnscaler.flags import CompileFlag
 from nnscaler.graph.schedule.checkpoint_readiness import plan_checkpoint_readiness
 from nnscaler.graph.schedule.module_streams import plan_module_streams, weight_gradient_stream
+from nnscaler.graph.schedule.weight_backward import plan_weight_backward
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.ir.cten import IRTensor
 
@@ -55,6 +56,15 @@ def _record_parameter_streams(codegen, nodes, regions):
 
 def emit_module_streams(codegen, segment, runtime_devid):
     nodes, regions, joins = plan_module_streams(segment.nodes(), segment.oobjs(), CompileFlag.module_streams)
+    weight_plans = plan_weight_backward(nodes, CompileFlag.module_streams)
+    weight_names = {node: f'_weight_region_{i}' for i, node in enumerate(weight_plans)}
+    weight_anchors = defaultdict(list)
+    for node, (anchor, stream) in weight_plans.items():
+        if anchor.signature not in codegen.async_op_signatures:
+            raise ValueError('Weight backward anchors require a registered async operator')
+        if any(node in region.nodes or anchor in region.nodes for region in regions.values()):
+            raise ValueError('Weight backward anchors and cooperative operators cannot also move forward streams')
+        weight_anchors[anchor].append(node)
     anchors = plan_checkpoint_readiness(nodes, segment.oobjs(), CompileFlag.module_streams)
     readiness = {gid: f'_checkpoint_ready_{i}' for i, gid in enumerate(anchors)}
     ready_at = defaultdict(list)
@@ -66,7 +76,7 @@ def emit_module_streams(codegen, segment, runtime_devid):
             raise ValueError('Recompute readiness cannot also move its checkpoint or backend forward')
         ready_at[anchor].append(readiness[gid])
     _record_parameter_streams(codegen, nodes, regions)
-    if not regions and not anchors:
+    if not regions and not anchors and not weight_plans:
         return codegen._emit_segment_nodes(segment, nodes, runtime_devid)
 
     codegen.execplan.mark_module_streams()
@@ -123,6 +133,7 @@ def emit_module_streams(codegen, segment, runtime_devid):
             lifetime,
             release_unused=False,
             checkpoint_readiness=readiness,
+            weight_regions=weight_names,
         )
 
     body = [f'{name} = nnscaler.runtime.backward.BackwardLaunchPoint(())' for name in readiness.values()]
@@ -179,6 +190,19 @@ def emit_module_streams(codegen, segment, runtime_devid):
         dependencies = [obj for region in anchored for obj in region.outputs if obj.requires_grad]
         retained = []
         contexts = list(ready_at.get(node, ()))
+        for weight_node in weight_anchors.get(node, ()):
+            name = weight_names[weight_node]
+            _, stream = weight_plans[weight_node]
+            parameters = tuple(dict.fromkeys(v for v in weight_node.iobjs()
+                               if isinstance(v, IRTensor) and v.is_param() and v.requires_grad))
+            body.append(f'{name} = nnscaler.WeightGradientAccumulator({stream!r}, '
+                        f'{names(parameters)}, defer_until_backward=True)')
+            body.append(f'_weight_regions.append({name})')
+            value = next(v for v in node.iobjs()
+                         if isinstance(v, IRTensor) and v.requires_grad and not v.is_attr())
+            value = codegen.tensor_name(value)
+            body.append(f'{value} = {name}.after_backward({value})')
+            contexts.append(f'{name}.backward_point()')
         if dependencies:
             value = next((obj for obj in node.iobjs()
                           if isinstance(obj, IRTensor) and obj.requires_grad and not obj.is_attr()), None)
@@ -226,7 +250,7 @@ def emit_module_streams(codegen, segment, runtime_devid):
             flush()
             body.extend(async_code(node, submit=True))
             continue
-        if node in backwards:
+        if node in backwards or node in weight_anchors:
             flush()
             emit_anchor(node)
             continue
@@ -267,6 +291,12 @@ def emit_module_streams(codegen, segment, runtime_devid):
         elif node not in owners:
             pending.append(node)
     flush()
-    with Block('with nnscaler.runtime.stream.ModuleStreams() as _module_streams:') as block:
-        block.insert_body(body)
-    return block.code
+    if regions:
+        with Block('with nnscaler.runtime.stream.ModuleStreams() as _module_streams:') as block:
+            block.insert_body(body)
+        body = block.code
+    if weight_plans:
+        with Block('with nnscaler.runtime.weight_accumulator.weight_backward_scopes() as _weight_regions:') as block:
+            block.insert_body(body)
+        body = block.code
+    return body

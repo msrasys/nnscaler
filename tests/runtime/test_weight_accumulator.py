@@ -10,6 +10,96 @@ from torch.utils.checkpoint import checkpoint
 from nnscaler import WeightGradientAccumulator, prepare_weight_backward
 
 
+class CommunicationAnchor(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, order):
+        from nnscaler.runtime.backward import capture_async_backward
+        ctx.point = capture_async_backward()
+        ctx.order = order
+        return x * 2
+
+    @staticmethod
+    def backward(ctx, dy):
+        if ctx.point is not None:
+            ctx.point.record_ready()
+        ctx.order.append('communication')
+        return dy * 2, None
+
+
+@pytest.mark.parametrize('recompute', [False, True])
+@pytest.mark.parametrize('only_weight', [False, True])
+def test_deferred_weights_follow_communication_without_changing_gradients(recompute, only_weight):
+    torch.manual_seed(173)
+    w = torch.nn.Parameter(torch.randn(4, 6))
+    ref_w = w.detach().clone().requires_grad_()
+    x = torch.randn(5, 4, requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_()
+    order = []
+    region = WeightGradientAccumulator('deferred', (w,), defer_until_backward=True)
+    controlled = region.after_backward(x)
+    with region.backward_point():
+        h = CommunicationAnchor.apply(controlled, order)
+
+    def compute(h):
+        with region.compute():
+            return fragment(h, w, order)
+
+    y = checkpoint(compute, h, use_reentrant=False) if recompute else compute(h)
+    region.close_forward()
+    expected = (ref_x * 2) @ ref_w
+    if only_weight:
+        actual_grads = torch.autograd.grad(y.square().sum(), (w,))
+        expected_grads = torch.autograd.grad(expected.square().sum(), (ref_w,))
+        torch.testing.assert_close(actual_grads, expected_grads)
+        assert x.grad is w.grad is None
+    else:
+        y.square().sum().backward()
+        expected.square().sum().backward()
+        torch.testing.assert_close(x.grad, ref_x.grad)
+        torch.testing.assert_close(w.grad, ref_w.grad)
+    assert len(order) == 2 and order[0] == 'communication' and isinstance(order[1], int)
+    assert not region.tasks
+
+
+def test_deferred_pruned_weights_release_inputs_without_running_callbacks():
+    x = torch.randn(5, 4, requires_grad=True)
+    w = torch.nn.Parameter(torch.randn(4, 6))
+    order = []
+    region = WeightGradientAccumulator('pruned_deferred', (w,), defer_until_backward=True)
+    h = CommunicationAnchor.apply(region.after_backward(x), order)
+    with region.operator():
+        y = fragment(h, w, order)
+    dx, = torch.autograd.grad(y.sum(), (x,))
+    torch.testing.assert_close(dx, torch.ones_like(y) @ w.t() * 2)
+    assert order == ['communication'] and w.grad is None and not region.tasks
+
+
+def test_early_anchor_failure_releases_deferred_aliases_with_gc_disabled():
+    import gc
+    from nnscaler.runtime.weight_accumulator import weight_backward_scopes
+    references = []
+    enabled = gc.isenabled()
+
+    def fail():
+        with weight_backward_scopes() as regions:
+            w = torch.nn.Parameter(torch.randn(4, 6))
+            region = WeightGradientAccumulator('failed_deferred', (w,), defer_until_backward=True)
+            regions.append(region)
+            references.append(weakref.ref(region))
+            region.after_backward(torch.randn(5, 4, requires_grad=True))
+            raise ValueError('anchor failed before compute')
+
+    try:
+        gc.disable()
+        try:
+            fail()
+        except ValueError:
+            pass
+        assert references[0]() is None
+    finally:
+        if enabled:gc.enable()
+
+
 class FragmentLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, binding, records, kind, delay):

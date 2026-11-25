@@ -43,7 +43,7 @@ class ModuleStreamRule:
     backward_on: str | None = None
     operators: str | tuple[str, ...] | None = None
     weight_backward_only: bool = False
-    _codegen_version: int = field(default_factory=lambda: 25, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 26, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):
@@ -86,7 +86,7 @@ class ModuleStreamRule:
         if self.weight_backward_only and (
             not self.operators or self.recompute_only or self.overlap_backward
             or self.launch_before or self.launch_after or self.split_before
-            or self.resume_before or self.resume_after or self.backward_on
+            or self.resume_before or self.resume_after
         ):
             raise ValueError('Weight-backward rules require cooperative operators without forward placement')
         if self.recompute_only and (
@@ -101,8 +101,8 @@ class ModuleStreamRule:
             raise ValueError('Recompute-only rules cannot also move forward computation')
         if self.overlap_backward and not (self.launch_before or self.launch_after):
             raise ValueError('Backward overlap requires a launch anchor')
-        if self.backward_on is not None and not self.overlap_backward:
-            raise ValueError('backward_on requires overlap_backward')
+        if self.backward_on is not None and not (self.overlap_backward or self.weight_backward_only):
+            raise ValueError('backward_on requires backward overlap or weight-backward scheduling')
 
 
 def module_stream_rules_from_env():

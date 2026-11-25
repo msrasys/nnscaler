@@ -21,6 +21,17 @@ from .utils import get_grad_dtype
 _active = local()
 
 
+@contextmanager
+def weight_backward_scopes():
+    """Close aliases even if an earlier anchor fails before its compute call."""
+    regions = []
+    try:
+        yield regions
+    finally:
+        for region in regions:
+            region.close_forward(failed=True)
+
+
 class _ParameterGrads(torch.autograd.Function):
     @staticmethod
     def forward(ctx, region, *parameters):
@@ -52,6 +63,7 @@ class WeightBackwardBinding:
 @dataclass
 class _AccumulationTask:
     buffers: dict = field(default_factory=dict)
+    pending: list = field(default_factory=list)
     done: object = None
 
 
@@ -71,7 +83,9 @@ class WeightGradientAccumulator:
     ``None`` for an unbound/frozen parameter; its corresponding return is ignored.
     """
 
-    def __init__(self, stream, parameters):
+    def __init__(self, stream, parameters, *, defer_until_backward=False):
+        if type(defer_until_backward) is not bool:
+            raise TypeError('defer_until_backward must be a boolean')
         if not isinstance(stream, str) or not stream or stream == 'default':
             raise ValueError('Weight accumulation requires a distinct named stream')
         parameters = tuple(parameters)
@@ -90,6 +104,9 @@ class WeightGradientAccumulator:
         if self.device.type not in ('cpu', 'cuda'):
             raise ValueError('Weight backward supports CPU validation and CUDA execution')
         self.enabled = torch.is_grad_enabled()
+        self.deferred = defer_until_backward
+        self.backward_ready = None
+        self.anchored = False
         if self.enabled and self.device.type == 'cuda' and torch.cuda.is_current_stream_capturing():
             raise RuntimeError('Weight backward regions require eager execution')
         self.stream = _get_module_stream(self.device, stream) if self.enabled and self.device.type == 'cuda' else None
@@ -119,6 +136,34 @@ class WeightGradientAccumulator:
         self.forward_closed = False
         self._scope = None
 
+    def after_backward(self, value):
+        """Delay dW publication until an earlier async operator's backward.
+
+        Call before that operator's forward, then enter ``backward_point()``
+        around it. The operator must use the async-backward readiness protocol.
+        Parameter aliases carry only control edges; no communication-result
+        wait is imported onto the dW stream.
+        """
+        from .backward import (
+            BackwardLaunchPoint, after_backward, backward_boundaries, prioritize_backward,
+        )
+
+        if not self.deferred or self.anchored or self.forward_closed:
+            raise RuntimeError('A deferred weight region requires exactly one earlier backward anchor')
+        self.anchored = True
+        if not self.enabled:
+            return value
+        if self.stream is not None:
+            self.backward_ready = BackwardLaunchPoint((self.stream,))
+        boundaries = backward_boundaries((value, self.aliases))
+        controlled = after_backward(value, self.aliases, self.backward_ready)
+        prioritize_backward((controlled,), boundaries)
+        prioritize_backward(self.aliases, backward_boundaries(self.originals))
+        return controlled
+
+    def backward_point(self):
+        return self.backward_ready or nullcontext()
+
     @contextmanager
     def compute(self):
         previous = getattr(_active, 'compute', None)
@@ -127,6 +172,18 @@ class WeightGradientAccumulator:
             yield
         finally:
             _active.compute = previous
+
+    @contextmanager
+    def operator(self):
+        """One cooperative forward call, reused by non-reentrant replay."""
+        if not self.forward_closed:
+            with self:
+                yield
+        else:
+            if torch._C._current_graph_task_id() < 0:
+                raise RuntimeError('A weight accumulator owns one forward invocation')
+            with self.compute():
+                yield
 
     def bind(self, parameters):
         if self.forward_closed and torch._C._current_graph_task_id() < 0:
@@ -152,6 +209,8 @@ class WeightGradientAccumulator:
     def close_forward(self, failed=False):
         self.aliases = ()  # Break the autograd cycle when automatic GC is disabled.
         self.forward_closed = True
+        if self.enabled and not failed and self.deferred and not self.anchored:
+            raise RuntimeError('Deferred weight accumulation requires an earlier backward anchor')
         if self.enabled and not failed and len(self.bound_indices) != len(self.originals):
             raise RuntimeError('Every accumulator parameter must be bound by a cooperative backend')
 
@@ -194,6 +253,12 @@ class WeightGradientAccumulator:
         if self.stream is not None:
             ready = torch.cuda.Event()
             ready.record(torch.cuda.current_stream(self.device))
+        if self.deferred:
+            task.pending.append((indices, callback, inputs, ready))
+        else:
+            self._accumulate(gid, task, indices, callback, inputs, ready)
+
+    def _accumulate(self, gid, task, indices, callback, inputs, ready):
         try:
             with (
                 torch.cuda.stream(self.stream) if self.stream is not None else nullcontext(),
@@ -264,9 +329,16 @@ class WeightGradientAccumulator:
 
     def gradients(self, incoming):
         gid = torch._C._current_graph_task_id()
-        task = self.tasks.pop(gid, None)
+        task = self.tasks.get(gid)
         if task is None:
             return incoming  # E.g. an empty backend retaining ordinary zero grads.
+        if task.pending:
+            if self.backward_ready is not None and not self.backward_ready.captured:
+                raise RuntimeError('The weight backward anchor did not capture async input readiness')
+            pending, task.pending = task.pending, []
+            for indices, callback, inputs, ready in pending:
+                self._accumulate(gid, task, indices, callback, inputs, ready)
+        self.tasks.pop(gid, None)
         self._join_accumulation(task)
         result = list(incoming)
         for index, value in task.buffers.items():

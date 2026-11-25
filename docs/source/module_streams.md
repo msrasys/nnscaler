@@ -144,6 +144,15 @@ parameter through `prepare_weight_backward`; unsupported operators fail explicit
 Recomputed calls use the original parameter values and do not publish gradients
 from the discarded replay graph. Weight-only rules cannot also move forward work.
 
+Add `backward_on='*.dispatch'` to delay dW submission until an earlier async
+operator's backward has submitted communication. The compiler requires that
+anchor to be an upstream dependency outside the selected checkpoint. Parameter
+aliases carry autograd control edges; the backend's input-readiness event gates
+the dW stream without waiting for communication results. Deferred callbacks and
+their inputs belong to one backward task. This also preserves partial-gradient
+requests and the original checkpoint boundary. The anchor must be a registered
+async operator using `capture_async_backward()` and `record_ready()`.
+
 `WeightGradientAccumulator(stream, parameters)` is a context manager scoped to
 one forward invocation. A cooperative backend binds parameters using
 `prepare_weight_backward(parameters)` before its autograd `Function.apply` and
