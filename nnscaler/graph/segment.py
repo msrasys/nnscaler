@@ -289,7 +289,10 @@ class IRSegment(IRCell):
         @return index int: the index
         """
         assert isinstance(node, IRCell)
-        if node in self._nodes:
+        # Cells compare by identity, so the lookup answers membership without
+        # a second linear scan of the node list.
+        self._ensure_node_lookup()
+        if node in self._node_lookup.counts:
             return CellPosition((self._nodes.index(node),))
         for idx, segment in enumerate(self._nodes):
             if isinstance(segment, IRSegment):
