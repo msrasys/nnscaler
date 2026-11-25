@@ -5,11 +5,13 @@ r"""
 Executor for runtime
 """
 import atexit
+import weakref
 from copy import copy
 import sys
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional, Union, Generator, Set, TypedDict
 import torch
 import logging
@@ -179,6 +181,16 @@ class _WeightBackwardState:
     output_tensor_grads: Optional[Tuple[Optional[torch.Tensor], ...]] = None
 
 
+@dataclass
+class _InputGradCallback:
+    # Holding the tensor keeps its id from being reused before the callback runs.
+    tensor: torch.Tensor
+    callback: Callable[[Optional[torch.Tensor]], None]
+    # Sum of the gradients from consumer segments that already ran backward;
+    # stays None while no consumer has contributed a gradient.
+    grad: Optional[torch.Tensor] = None
+
+
 class Executor:
 
     # We consider each segment as an isolated graph. By
@@ -190,6 +202,207 @@ class Executor:
     # Weight-backward states follow the same per-segment FIFO order as `_detach`.
     _weight_backward_states: Dict[str, List[_WeightBackwardState]] = dict()
     _backward_pre_hook: Optional[Callable] = None
+
+    _input_grad_callbacks: Dict[int, _InputGradCallback] = dict()
+    # Tensors whose callback already fired, so that a later consumer cannot
+    # silently lose its gradient. Weak references neither keep the outer graph
+    # alive nor match a new tensor that reuses the id of a released one.
+    # A mark lives as long as its tensor, independent of train_step:
+    # it is dropped when the tensor is released, when the tensor is registered
+    # again for a new round, or by clear().
+    _delivered_input_grads: Dict[int, weakref.ref] = dict()
+    # ids of the saved pairs of every segment whose boundary grads Executor
+    # handled (retained grads written back, callbacks dispatched) while a
+    # custom_fbw replacement runs, so the wrapper can tell whether the
+    # replacement already went through Executor for its own segment.
+    # A set, scoped to one replacement call, stays correct when the replacement
+    # or a callback runs further segments; it is None outside such a call.
+    # ids avoid keeping the detached inputs alive.
+    _handled_pairs_ids: Optional[Set[int]] = None
+
+    @staticmethod
+    def register_input_grad_callback(
+        tensor: torch.Tensor,
+        callback: Callable[[Optional[torch.Tensor]], None],
+    ) -> None:
+        """Call ``callback`` once with the gradient of ``tensor`` from the segments it feeds.
+
+        ``fexecute`` detaches segment inputs, so autograd never reaches ``tensor``.
+        The callback lets an outer eager module resume its own backward as soon as the gradient is ready,
+        for example once per micro-batch inside a pipeline ``train_step``.
+
+        The gradients of all consumer segments are summed.
+        The callback runs right after the backward (or ``backward_input``) of the last consumer
+        whose forward has already run.
+        So every consumer must run its forward before the first of them runs backward.
+        A segment that consumes ``tensor`` after the callback fired raises,
+        e.g. when one tensor object is fed to several micro-batches;
+        You should pass each micro-batch its own tensor, or register again to start a new round.
+
+        Unlike an ordinary hook, a registration is one-shot:
+
+        - It fires at most once, in whichever backward completes its last consumer,
+          including a backward that another callback runs through ``Executor``;
+          any later backward skips it.
+        - A pending registration cannot be replaced: registering ``tensor`` again raises.
+          Registering it again after the callback fired starts a new round,
+          which collects only the consumers whose forward runs afterwards.
+
+        Register the callback before the ``train_step`` of the module that consumes ``tensor``,
+        with no other end-to-end module's ``train_step`` in between, or while that ``train_step`` runs.
+        ``ParallelModule.train_step`` raises if any callback is still pending when it returns,
+        since it cannot tell which module a callback was meant for.
+
+        A consumer without gradient roots (its backward gets no output tensors) contributes no gradient.
+        If no consumer contributes, the callback receives ``None``, PyTorch's convention for "no gradient".
+        A zero tensor would not be equivalent:
+        optimizers such as Adam still update parameters with a zero gradient through momentum and weight decay,
+        while they skip parameters whose ``grad`` is ``None``.
+        Whether a segment has gradient roots is fixed in the generated schedule,
+        so the callback receives ``None`` for every micro-batch of the step or for none of them.
+
+        On ``None`` the caller should skip the outer backward.
+        The reducers of the outer module then see no gradient in this step:
+
+        - sync reducer: the parameters get zero gradients;
+        - async reducer: ``sync_grads`` raises because the reduction was never triggered;
+        - either reducer with ``ComputeConfig.reducer_none_grad=True``:
+          the parameters keep ``grad=None`` and the optimizer skips them.
+
+        The callback owns the outer propagation, including retained grads:
+        ``Executor`` does not also write the retained grad of ``tensor``.
+        ``tensor.grad`` after its consumers ran backward:
+
+        =================  ===========  ==============================================================
+        ``retain_grad()``  callback     ``tensor.grad``
+        =================  ===========  ==============================================================
+        no                 no           ``None``: segments detach their inputs.
+        no                 registered   Passed to the callback, which decides.
+                                        ``torch.autograd.backward(tensor, grad)`` in the callback
+                                        sets it only if ``tensor`` is a leaf.
+        yes                no           Written by ``Executor``, summed over consumer segments.
+        yes                registered   Passed to the callback, which decides.
+                                        ``torch.autograd.backward(tensor, grad)`` in the callback
+                                        sets it (to the sum over consumer segments).
+        =================  ===========  ==============================================================
+
+        The callback runs synchronously inside the generated schedule,
+        on the current stream and under the runtime flags the schedule has set
+        (e.g. ``RuntimeFlag.skip_reducer``).
+        Only the ranks of the pipeline stage that consumes ``tensor`` reach this point together,
+        so collectives in the callback must stay within that stage.
+        A blocking collective that also needs ranks of other stages waits for ranks
+        that are busy with their own part of the schedule, and can deadlock.
+        """
+        if not torch.is_tensor(tensor) or not tensor.requires_grad:
+            raise ValueError('input gradient callbacks require a grad-requiring tensor')
+        tensor_id = id(tensor)
+        if tensor_id in Executor._input_grad_callbacks:
+            raise RuntimeError('an input gradient callback is already registered')
+        Executor._delivered_input_grads.pop(tensor_id, None)
+        Executor._input_grad_callbacks[tensor_id] = _InputGradCallback(tensor, callback)
+
+    @staticmethod
+    def _mark_input_grad_delivered(tensor: torch.Tensor) -> None:
+        tensor_id = id(tensor)
+        # Bind the dict marked now: forget may run after clear() replaced it,
+        # or at interpreter shutdown when module globals are already torn down.
+        delivered = Executor._delivered_input_grads
+
+        def forget(ref):
+            # Defensive: only drop the entry this reference still owns.
+            if delivered.get(tensor_id) is ref:
+                del delivered[tensor_id]
+
+        delivered[tensor_id] = weakref.ref(tensor, forget)
+
+    @staticmethod
+    def _check_input_grad_not_delivered(name: str, tensor: torch.Tensor) -> None:
+        ref = Executor._delivered_input_grads.get(id(tensor))
+        if ref is not None and ref() is tensor:
+            raise RuntimeError(
+                f'segment {name} consumes a tensor whose input gradient callback already fired; '
+                f'its gradient would be lost. Every consumer must run forward before the first '
+                f'consumer runs backward: pass each micro-batch its own tensor, '
+                f'or register the callback again.'
+            )
+
+    @staticmethod
+    def check_input_grad_callbacks_fired() -> None:
+        """Raise if a registered input gradient callback has not fired.
+
+        A pending callback never fires once its consumers have run,
+        and would keep its tensor and the outer autograd graph alive across steps.
+        The callbacks are dropped before raising so that the graph is released.
+        """
+        pending = len(Executor._input_grad_callbacks)
+        if pending:
+            Executor._input_grad_callbacks = dict()
+            raise RuntimeError(
+                f'{pending} input gradient callback(s) did not fire: '
+                f'their tensors were not consumed by a segment requiring gradients. '
+                f'Register a callback only on the ranks whose pipeline stage consumes the tensor, '
+                f'and pass the tensor itself (not inside a container) as a module input.'
+            )
+
+    @staticmethod
+    def _run_input_grad_callbacks(
+        saved_pairs: TensorPairs,
+        grad_by_dtensor_id: Optional[Dict[int, torch.Tensor]],
+    ) -> None:
+        """Accumulate registered input grads of one segment and fire completed callbacks.
+
+        ``grad_by_dtensor_id`` is None when the segment has no gradient roots,
+        so it contributes no gradient.
+        """
+        # Executor writes retained grads right before dispatching callbacks,
+        # so this marks the boundary grads of the segment as handled.
+        if Executor._handled_pairs_ids is not None:
+            Executor._handled_pairs_ids.add(id(saved_pairs))
+        # Accumulate every registered input of the segment before firing any
+        # callback: a callback that runs another segment's backward through
+        # Executor may otherwise fire a callback this segment still owes a share to.
+        # A repeated input shares one detached tensor whose grad already sums
+        # all its uses; dict() collapses the repeats so it is counted once.
+        entries = []
+        try:
+            for tensor_id, dtensor in dict(saved_pairs).items():
+                entry = Executor._input_grad_callbacks.get(tensor_id)
+                if entry is None:
+                    continue
+                entries.append((tensor_id, entry))
+                if grad_by_dtensor_id is not None:
+                    grad = grad_by_dtensor_id.get(id(dtensor))
+                    if grad is None:
+                        raise RuntimeError('segment did not produce a registered input gradient')
+                    grad = grad.detach()
+                    entry.grad = grad if entry.grad is None else entry.grad + grad
+            for tensor_id, entry in entries:
+                # A registration fires at most once: an earlier callback may have run
+                # another segment's backward that already fired it, after which the
+                # tensor may even be registered again for a new round.
+                if Executor._input_grad_callbacks.get(tensor_id) is not entry:
+                    continue
+                # Another segment that consumed the tensor still owes its share.
+                if any(
+                    tid == tensor_id
+                    for queue in Executor._detach.values()
+                    for pairs in queue
+                    for tid, _ in pairs
+                ):
+                    continue
+                del Executor._input_grad_callbacks[tensor_id]
+                Executor._mark_input_grad_delivered(entry.tensor)
+                entry.callback(entry.grad)
+        except BaseException:
+            # The segment has left _detach, so its remaining registrations would
+            # never fire, yet keep their tensors and outer graphs alive if the
+            # caller recovers. Drop only those this call collected and that are
+            # still current; a callback may have registered a new round meanwhile.
+            for tensor_id, entry in entries:
+                if Executor._input_grad_callbacks.get(tensor_id) is entry:
+                    del Executor._input_grad_callbacks[tensor_id]
+            raise
 
     @staticmethod
     def _retained_inputs(input_tensors: Iterable[Any]) -> Dict[int, torch.Tensor]:
@@ -213,13 +426,11 @@ class Executor:
         # An input passed several times maps to one detached tensor whose grad
         # is already the sum over all uses; dict() collapses the repeats so the
         # gradient is copied once.  Accumulate across segments like retain_grad.
-        # TODO: Preserve the caller-to-resolved input mapping when an async
-        # communication callback returns a different Tensor. This write-back
-        # currently requires matching Tensor identities across forward/backward;
-        # shape-changing callbacks also need an explicit gradient layout mapping.
+        # A registered input-gradient callback owns the outer propagation,
+        # including retained grads, so writing them here would count twice.
         for tid, dtensor in dict(saved_pairs).items():
             tensor = retained_inputs.get(tid)
-            if tensor is not None:
+            if tensor is not None and tid not in Executor._input_grad_callbacks:
                 grad = grad_by_dtensor[id(dtensor)]
                 tensor.grad = grad if tensor.grad is None else tensor.grad + grad
 
@@ -239,6 +450,10 @@ class Executor:
         mapping: Dict[int, torch.Tensor] = dict()
         for itensor in input_tensors:
             if torch.is_tensor(itensor) and itensor.requires_grad:
+                # Sharing a tensor across segments is fine while their forwards all run
+                # before its callback fires. A segment consuming it afterwards, e.g. the same
+                # tensor fed to a later micro-batch, would silently lose its gradient.
+                Executor._check_input_grad_not_delivered(name, itensor)
                 mapping[id(itensor)] = itensor.detach().requires_grad_()
         input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in input_tensors)
 
@@ -302,7 +517,9 @@ class Executor:
                     f"{''.join(traceback.format_stack())}"
                 )
 
-        if len(output_tensors) == 0: return None
+        if len(output_tensors) == 0:
+            Executor._run_input_grad_callbacks(saved_pairs, None)
+            return None
 
         retained_inputs = Executor._retained_inputs(input_tensors)
         input_tensors = []
@@ -333,9 +550,9 @@ class Executor:
         grads = tuple(t.grad for t in input_tensors)
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
 
-        Executor._restore_retained_grads(
-            retained_inputs, saved_pairs, {id(t): t.grad for t in input_tensors},
-        )
+        grad_by_dtensor = {id(t): t.grad for t in input_tensors}
+        Executor._restore_retained_grads(retained_inputs, saved_pairs, grad_by_dtensor)
+        Executor._run_input_grad_callbacks(saved_pairs, grad_by_dtensor)
 
         if    len(grads) == 0: return None
         elif  len(grads) == 1: return grads[0]
@@ -376,6 +593,7 @@ class Executor:
             Executor._weight_backward_states.setdefault(name, []).append(
                 _WeightBackwardState(param_groups=[])
             )
+            Executor._run_input_grad_callbacks(saved_pairs, None)
             return None
 
         retained_inputs = Executor._retained_inputs(input_tensors)
@@ -423,6 +641,7 @@ class Executor:
         grad_by_dtensor = dict(zip(map(id, unique_inputs), unique_grads))
         grads = tuple(grad_by_dtensor[id(tensor)] for tensor in input_tensors)
         Executor._restore_retained_grads(retained_inputs, saved_pairs, grad_by_dtensor)
+        Executor._run_input_grad_callbacks(saved_pairs, grad_by_dtensor)
         if len(grads) == 0: return None
         elif len(grads) == 1: return grads[0]
         else: return grads
@@ -616,6 +835,9 @@ class Executor:
         Executor._detach = dict()
         Executor._weight_backward_states = dict()
         Executor._backward_pre_hook = None
+        Executor._input_grad_callbacks = dict()
+        Executor._delivered_input_grads = dict()
+        Executor._handled_pairs_ids = None
 
     @staticmethod
     def check_clear():
@@ -625,11 +847,14 @@ class Executor:
         for name, states in Executor._weight_backward_states.items():
             assert len(states) == 0, \
                 f"Fine remaining segment needs weight backward: {name}, remaining times: {len(states)}"
+        assert len(Executor._input_grad_callbacks) == 0, \
+            f"Input gradient callbacks remain: {len(Executor._input_grad_callbacks)}"
 
 
 fexecute = Executor.fexecute
 aexecute = Executor.aexecute
 backward = Executor.backward
+register_input_grad_callback = Executor.register_input_grad_callback
 backward_input = Executor.backward_input
 backward_weight = Executor.backward_weight
 sync_tensors = Executor.sync_tensors
@@ -758,6 +983,61 @@ def _checked_fbw(input_fn, weight_fn):
     return checked_input, checked_weight, pending
 
 
+def _with_boundary_grads(input_fn):
+    """Write retained grads and dispatch callbacks for a custom ``backward_input``.
+
+    ``Executor.backward_input`` does both for the segment inputs;
+    a replacement that bypasses it would otherwise silently drop them.
+    """
+    @wraps(input_fn)
+    def backward_input_with_boundary_grads(name, input_tensors, output_tensors, output_tensor_grads, weights):
+        # Custom implementations can consume _detach without calling Executor.
+        # Save the boundary association before they pop the FIFO entry.
+        queue = Executor._detach.get(name, ())
+        saved_pairs = queue[0] if queue else ()
+        retained_inputs = Executor._retained_inputs(input_tensors)
+        outer_handled = Executor._handled_pairs_ids
+        Executor._handled_pairs_ids = handled = set()
+        try:
+            result = input_fn(name, input_tensors, output_tensors, output_tensor_grads, weights)
+        finally:
+            Executor._handled_pairs_ids = outer_handled
+            if outer_handled is not None:
+                outer_handled |= handled
+        # A custom backward_input that called Executor.backward or
+        # Executor.backward_input for this segment has already handled it,
+        # even if it ran further segments afterwards; doing it again would count twice.
+        # ``saved_pairs`` stays alive here, so no other object can reuse its id.
+        if id(saved_pairs) in handled:
+            return result
+        boundary_ids = {
+            tid for tid, _ in saved_pairs
+            if tid in retained_inputs or tid in Executor._input_grad_callbacks
+        }
+        if not boundary_ids:
+            return result
+        # Like Executor.backward_input, a segment without output tensors has no
+        # gradient roots: retained grads stay as they are, and callbacks get no contribution.
+        if len(output_tensors) == 0:
+            Executor._run_input_grad_callbacks(saved_pairs, None)
+            return result
+        if result is None:
+            raise RuntimeError('custom backward_input returned no gradient for a retained or callback input')
+        inputs = [t for _, t in saved_pairs if torch.is_tensor(t) and t.requires_grad]
+        grads = (result,) if torch.is_tensor(result) else result
+        if len(inputs) != len(grads):
+            raise RuntimeError('custom backward_input returned an unexpected number of input gradients')
+        grad_by_dtensor_id = {id(t): grad for t, grad in zip(inputs, grads) if grad is not None}
+        if any(id(dtensor) not in grad_by_dtensor_id for tid, dtensor in saved_pairs if tid in boundary_ids):
+            raise RuntimeError('custom backward_input returned no gradient for a retained or callback input')
+        # Same order as Executor.backward_input.
+        Executor._restore_retained_grads(retained_inputs, saved_pairs, grad_by_dtensor_id)
+        Executor._run_input_grad_callbacks(saved_pairs, grad_by_dtensor_id)
+        return result
+
+    return backward_input_with_boundary_grads
+
+
 @contextmanager
 def custom_fbw(
     backward_input_fn: Callable,
@@ -770,6 +1050,12 @@ def custom_fbw(
     Schedule code resolves the module-level ``backward_input`` and
     ``backward_weight`` attributes at runtime. Replacements must keep the same
     call signatures as the corresponding :class:`Executor` methods.
+    When the replacement calls neither :meth:`Executor.backward_input` nor :meth:`Executor.backward` for the segment,
+    the input gradients it returns are written to retained grads
+    and passed to input-gradient callbacks (see :meth:`Executor.register_input_grad_callback`),
+    as the default implementation does.
+    A replacement must therefore return the input gradients of a segment with output tensors;
+    returning None for an input that retains its grad or has a callback raises.
 
     ``check_grad_coverage`` enables strict diagnostics for graph-reachable
     parameters receiving no gradient across a paired B/W call. Intentional
@@ -801,7 +1087,7 @@ def custom_fbw(
     global backward_input, backward_weight
     previous_backward_input = backward_input
     previous_backward_weight = backward_weight
-    backward_input = backward_input_fn
+    backward_input = _with_boundary_grads(backward_input_fn)
     backward_weight = backward_weight_fn
     try:
         yield

@@ -1862,7 +1862,7 @@ class ParallelModule(CubeModule):
                 raise ValueError(f"Expected one of {valid_nmicros} samples, but got {sample_count}")
             # only one step, so begin/end are both True
             with self._cuda_sync_fence(), accum_mode(begin=True, end=True):
-                return self._train_step(dataloader)
+                outputs = self._train_step(dataloader)
         else:
             outputs = []
             with self._cuda_sync_fence():
@@ -1870,7 +1870,8 @@ class ParallelModule(CubeModule):
                     with accum_mode(begin=(idx==0), end=(idx==sample_count-1)):
                         output = self._train_step(dataloader)
                     outputs.append(output)
-            return outputs
+        Executor.check_input_grad_callbacks_fired()
+        return outputs
 
     def infer_step(self, samples: List[Any]) -> List[Any]:
         """
