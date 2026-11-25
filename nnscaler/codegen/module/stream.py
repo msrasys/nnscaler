@@ -11,7 +11,9 @@ from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import Block
 from nnscaler.flags import CompileFlag
 from nnscaler.graph.schedule.checkpoint_readiness import plan_checkpoint_readiness
-from nnscaler.graph.schedule.module_streams import plan_module_streams, weight_gradient_stream, direct_weight_gradients
+from nnscaler.graph.schedule.module_streams import (
+    plan_module_streams, plan_module_graph_preparation, weight_gradient_stream, direct_weight_gradients,
+)
 from nnscaler.graph.schedule.weight_backward import plan_weight_backward
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.ir.cten import IRTensor
@@ -108,14 +110,13 @@ def emit_module_streams(codegen, segment, runtime_devid):
     starts = {region.nodes[0]: region for region in regions.values()}
     owners = {node: region for region in regions.values() for node in region.nodes}
     captures, backwards = defaultdict(list), defaultdict(list)
+    preparation_points = plan_module_graph_preparation(nodes, regions)
     preparations = {}
     for region in regions.values():
         if region.ready_before is not None:
-            captures[region.ready_before].append(region.key)
-            # A later region may consume an earlier region on the same stream.
-            # Only stage inputs that already exist before this anchor.
-            later_outputs = {v for n in nodes[nodes.index(region.ready_before):] for v in n.oobjs()}
-            if region.cuda_graph == 'forward' and not later_outputs.intersection(region.inputs):
+            point = preparation_points.get(region.key, region.ready_before)
+            captures[point].append(region.key)
+            if region.key in preparation_points:
                 preparations[region.key] = f'_{region.key}_prepared_graph'
         if region.overlap_backward:
             backwards[region.backward_anchor].append(region)

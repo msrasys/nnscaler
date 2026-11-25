@@ -11,6 +11,7 @@ import nnscaler
 from nnscaler import ComputeConfig, ModuleStreamRule, parallelize
 from nnscaler.policies import pas_dp
 from .test_weight_backward_streams import ready_anchor, ReadyAnchor, submit_ready_anchor, complete_ready_anchor
+from ..utils import replace_all_device_with
 
 
 @nnscaler.register_op('n h -> n h')
@@ -42,6 +43,48 @@ class Model(torch.nn.Module):
         main = ready_anchor(x)
         main = combine_anchor(main.cos())
         return main + self.branch(x) + self.gate(x)
+
+
+class EarlyPreparationModel(Model):
+    def forward(self, x):
+        value = x.relu()
+        main = ready_anchor(value.tanh())
+        return main + self.branch(value)
+
+
+@replace_all_device_with('cpu', force=True)
+def test_graph_preparation_moves_before_independent_main_work(tmp_path):
+    rule = ModuleStreamRule('branch', stream='shared', launch_after='*.ready_anchor',
+                            overlap_backward=True, cuda_graph='forward')
+    parallelize(EarlyPreparationModel(), {'x': torch.randn(4, 8, requires_grad=True)}, pas_dp,
+                ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path, load_module=False)
+    source = next(tmp_path.rglob('gencode0.py')).read_text()
+    assert source.index('.prepare(') < source.index('torch.tanh(') < source.index('.submit(')
+    assert source.index('.submit(') < source.index('.fork(') < source.index('run_module_graph(')
+
+
+@pytest.mark.parametrize('boundary', ['ordinary', 'mutation', 'checkpoint'])
+def test_graph_preparation_preserves_mutation_and_checkpoint_boundaries(boundary):
+    from nnscaler.ir.operator import IRFwOperation
+    from nnscaler.ir.tensor import IRFullTensor
+    from nnscaler.graph.schedule.module_streams import ModuleStreamRegion, plan_module_graph_preparation
+
+    def node(signature, inputs):
+        operation = IRFwOperation(signature.rsplit('.', 1)[-1], signature, inputs, 1)
+        operation.set_output(0, IRFullTensor((4, 8), requires_grad=True))
+        return operation
+
+    producer = node('torch.relu', [IRFullTensor((4, 8), requires_grad=True)])
+    value = producer.output(0)
+    work = node('torch.add_' if boundary == 'mutation' else 'torch.sin', [value])
+    if boundary == 'checkpoint':
+        producer.recompute = work.recompute = 7
+    anchor = node('test.async', [work.output(0)])
+    branch = node('torch.cos', [value])
+    region = ModuleStreamRegion('side', 'shared', [branch], (value,), (branch.output(0),),
+                                ready_before=anchor, cuda_graph='forward')
+    points = plan_module_graph_preparation([producer, work, anchor, branch], {'side': region})
+    assert points['side'] is (work if boundary == 'ordinary' else anchor)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')

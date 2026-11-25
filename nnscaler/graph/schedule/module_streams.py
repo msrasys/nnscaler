@@ -493,6 +493,38 @@ def plan_module_streams(nodes, outputs, rules):
     return ordered, regions, dict(joins)
 
 
+def plan_module_graph_preparation(nodes, regions):
+    """Stage graph inputs once ready, without crossing mutations or scopes."""
+    positions = {node: i for i, node in enumerate(nodes)}
+    producers = {value: i for i, node in enumerate(nodes) for value in node.oobjs()}
+    owners = {node: region for region in regions.values() for node in region.nodes}
+    result = {}
+    for region in regions.values():
+        if region.cuda_graph != 'forward' or region.ready_before is None:
+            continue
+        anchor = positions[region.ready_before]
+        begin = max((producers.get(value, -1) + 1 for value in region.inputs), default=0)
+        if begin > anchor:
+            continue
+        for i in range(begin, anchor):
+            node = nodes[i]
+            if ((_unsafe(node) and not _local_adapter(node))
+                    or node.pre_hook is not None or node.post_hook is not None):
+                begin = i + 1
+        # A tensor can become visible only after its whole checkpoint or
+        # generated stream scope returns, even if its producer is earlier.
+        while begin < anchor:
+            node = nodes[begin]
+            in_checkpoint = (begin and node.recompute is not None
+                             and node.recompute == nodes[begin - 1].recompute)
+            in_stream = node in owners and node is not owners[node].nodes[0]
+            if not in_checkpoint and not in_stream:
+                break
+            begin += 1
+        result[region.key] = nodes[begin]
+    return result
+
+
 def _weight_rules(node, rules):
     return tuple(rule for rule in rules
         if rule.weight_backward_only
