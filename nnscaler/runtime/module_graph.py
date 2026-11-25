@@ -5,7 +5,7 @@
 
 Calibration observes the first optimizer step. Capture runs only at a subsequent
 gradient reset, after those backwards finish. Forward state belongs to a slot;
-backward workspaces and published buffers are shared on the region's stream.
+native forward/backward graphs keep each slot's captured storage alive.
 """
 
 from collections import deque
@@ -104,49 +104,32 @@ class _Calibrate(torch.autograd.Function):
         return (None, *grads)
 
 
+def _clone_gradients(gradients, _outputs):
+    # Native graphed callables return their static gradient buffers. Clone before
+    # the outer engine hands them to consumers or another forward reuses a slot.
+    return tuple(None if value is None else value.clone() for value in gradients)
+
+
 class _Replay(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, ticket, *inputs):
-        pool = ticket.owner
+    def forward(ctx, ticket, *outputs):
         ctx.ticket = ticket
-        # Activations are copied into slot-owned buffers. Parameters share the
-        # model's storage and must not change before their backward finishes.
-        ctx.save_for_backward(*(inputs[i] for i in sorted(pool.parameters)))
+        ctx.save_for_backward(*ticket.parameters)
         ctx.set_materialize_grads(False)
-        with pool.lock:
-            slot = pool.slots[ticket.slot]
-            copied = set()
-            for i, (target, value) in enumerate(zip(slot['inputs'], inputs)):
-                if i not in pool.parameters and target.data_ptr() not in copied:
-                    target.copy_(value)
-                    copied.add(target.data_ptr())
-            slot['forward'].replay()
-            outputs = tuple(v.clone() for v in pool.outputs)
-        ctx.mark_non_differentiable(*(v for v, grad in zip(outputs, pool.output_grads) if grad is None))
-        return outputs
+        values = tuple(value.clone() for value in outputs)
+        ctx.mark_non_differentiable(*(v for v, grad in zip(values, ticket.owner.output_requires_grad) if not grad))
+        return values
 
     @staticmethod
-    @_capture_guard
     def backward(ctx, *gradients):
-        ticket, pool = ctx.ticket, ctx.ticket.owner
-        if ticket.used or torch.is_grad_enabled():
+        if ctx.ticket.used or torch.is_grad_enabled():
             raise RuntimeError('Module graphs require one first-order backward per forward')
-        ticket.used = True
+        ctx.ticket.used = True
         try:
-            # Preserve version checks for the shared parameter storage.
-            ctx.saved_tensors
-            with pool.lock:
-                for target, grad in zip(pool.output_grads, gradients):
-                    if target is not None:
-                        target.zero_() if grad is None else target.copy_(grad)
-                pool.slots[ticket.slot]['backward'].replay()
-                result = tuple(None if v is None else v.clone() for v in pool.input_grads)
-            return (None, *result)
-        except BaseException:
-            pool.failed = True
-            raise
+            ctx.saved_tensors  # Check the model's parameter versions.
+            return (None, *gradients)
         finally:
-            torch.autograd.Variable._execution_engine.queue_callback(ticket.release)
+            torch.autograd.Variable._execution_engine.queue_callback(ctx.ticket.release)
 
 
 class ModuleGraph:
@@ -162,7 +145,6 @@ class ModuleGraph:
         self.stream = stream or torch.cuda.current_stream(sample_inputs[0].device)
         self.lock = RLock()
         self.free = deque(range(capacity))
-        self.failed = False
         self.slots = []
         capture_stream = (torch.cuda.Stream(device=sample_inputs[0].device)
                           if self.stream == torch.cuda.default_stream(sample_inputs[0].device) else self.stream)
@@ -179,65 +161,18 @@ class ModuleGraph:
                         set_grad_dtype(value, get_grad_dtype(original))
                     else:
                         key = self.signature[i][4]
-                        base = buffers.setdefault(key, None)
-                        if base is None:
-                            base = buffers[key] = torch.zeros_like(original)
-                        value = base.detach().requires_grad_(original.requires_grad)
+                        if key not in buffers:
+                            buffers[key] = torch.zeros_like(original)
+                        value = buffers[key].detach().requires_grad_(original.requires_grad)
                     inputs.append(value)
-                self.slots.append(dict(inputs=tuple(inputs), saved=[], forward=torch.cuda.CUDAGraph(), backward=torch.cuda.CUDAGraph()))
-
-            sample = self.slots[0]['inputs']
-            needed = tuple(v for v in sample if v.requires_grad)
-            if not needed:
-                raise ValueError('Use eager execution for module regions without gradients')
-            for _ in range(3):
-                outputs, self.single = _tuple(function(*sample))
-                if not any(v.requires_grad for v in outputs):
+                inputs = tuple(inputs)
+                outputs, self.single = _tuple(function(*inputs))
+                self.output_requires_grad = tuple(v.requires_grad for v in outputs)
+                if not any(self.output_requires_grad):
                     raise ValueError('Module graphs require a differentiable output')
-                grad_outputs = tuple(torch.zeros_like(v) if v.requires_grad else None for v in outputs)
-                grads = torch.autograd.grad(tuple(v for v in outputs if v.requires_grad), needed,
-                    tuple(v for v in grad_outputs if v is not None), allow_unused=True)
-            self.outputs = tuple(torch.empty_like(v) for v in outputs)
-            self.output_grads = tuple(None if v is None else torch.zeros_like(v) for v in grad_outputs)
-            gradients, input_grads = iter(grads), []
-            for value in sample:
-                grad = next(gradients) if value.requires_grad else None
-                input_grads.append(None if grad is None else torch.empty_like(grad))
-            self.input_grads = tuple(input_grads)
-            del outputs, grad_outputs, grads, gradients
-            torch.cuda.synchronize(sample_inputs[0].device)
-
-            forward_pool, backward_pool = torch.cuda.graph_pool_handle(), torch.cuda.graph_pool_handle()
-            tapes = []
-            # Keep all forward tapes live while capturing every slot. No forward
-            # pool allocations happen after this phase, so its saved state cannot
-            # alias another slot, even for custom Function tensor attributes.
-            for slot in self.slots:
-                def pack(value, saved=slot['saved']):
-                    value = value.detach()
-                    saved.append(value)
-                    return value
-                with (torch.autograd.graph.saved_tensors_hooks(pack, lambda value: value),
-                      torch.cuda.graph(slot['forward'], pool=forward_pool, stream=capture_stream)):
-                    outputs, single = _tuple(function(*slot['inputs']))
-                    with torch.no_grad():
-                        for target, value in zip(self.outputs, outputs):target.copy_(value)
-                if single != self.single or len(outputs) != len(self.outputs):
-                    raise ValueError('Module graph outputs changed during capture')
-                tapes.append(outputs)
-            for slot, outputs in zip(self.slots, tapes):
-                with torch.cuda.graph(slot['backward'], pool=backward_pool, stream=capture_stream):
-                    gradients = torch.autograd.grad(tuple(v for v in outputs if v.requires_grad),
-                        tuple(v for v in slot['inputs'] if v.requires_grad),
-                        tuple(v for v in self.output_grads if v is not None), allow_unused=True)
-                    for target, value in zip((v for v, x in zip(self.input_grads, sample) if x.requires_grad), gradients):
-                        if (target is None) != (value is None):
-                            raise ValueError('Module graph gradient participation changed')
-                        if target is not None:target.copy_(value)
-                # Only common published buffers persist. Backward temporaries
-                # may share addresses because replays and copies are serialized.
-                del gradients
-            del tapes, outputs
+                del outputs
+                native = torch.cuda.make_graphed_callables(function, inputs, allow_unused_input=True)
+                self.slots.append(dict(inputs=inputs, native=native))
             torch.cuda.synchronize(sample_inputs[0].device)
 
     @_capture_guard
@@ -249,8 +184,8 @@ class ModuleGraph:
 
     @_capture_guard
     def __call__(self, *inputs):
-        if self.failed or torch.cuda.current_stream(inputs[0].device) != self.stream:
-            raise RuntimeError('Module graph execution requires its original stream and a healthy pool')
+        if torch.cuda.current_stream(inputs[0].device) != self.stream:
+            raise RuntimeError('Module graph execution requires its original stream')
         if _signature(inputs, self.parameters) != self.signature:
             raise ValueError('Module graph input shapes, aliases, gradient flags or parameter storage changed')
         if not torch.is_grad_enabled():
@@ -260,7 +195,13 @@ class ModuleGraph:
                 raise RuntimeError('Module graph live forwards exceeded the calibrated capacity')
             ticket = _Ticket(self, self.free.popleft())
         try:
-            outputs = _Replay.apply(ticket, *inputs)
+            with self.lock:
+                outputs, _ = _tuple(self.slots[ticket.slot]['native'](*inputs))
+                nodes = {value.grad_fn for value in outputs if value.grad_fn is not None}
+                for node in nodes:
+                    node.register_hook(_clone_gradients)
+                ticket.parameters = tuple(inputs[i] for i in sorted(self.parameters))
+                outputs = _Replay.apply(ticket, *outputs)
         except BaseException:
             ticket.release()
             raise

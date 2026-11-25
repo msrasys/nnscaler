@@ -135,10 +135,9 @@ after previous backwards finish, and synchronizes pipeline ranks before replay.
 For a custom optimizer loop, call
 `nnscaler.runtime.module_graph.prepare_module_graphs(model)` at that boundary.
 
-Each live forward owns its input/saved state. Forward and backward workspaces
-use separate pools; backward temporary buffers are shared, so FIFO and other
-backward orders do not overwrite another forward's activations. Returned outputs
-and gradients have independent storage. `module_graph_stats(model)` reports
+Each live forward owns a native PyTorch graph pair and its captured state, so
+FIFO and other backward orders do not overwrite another forward's activations.
+Returned outputs and gradients have independent storage. `module_graph_stats(model)` reports
 calibration capacity and actual replay counts without GPU synchronization.
 
 Regions must have fixed, contiguous CUDA tensor boundaries and stable parameter
