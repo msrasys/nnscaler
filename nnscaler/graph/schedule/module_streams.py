@@ -45,7 +45,7 @@ class ModuleStreamRule:
     weight_backward_only: bool = False
     accumulate_weight_grads: bool = False
     cuda_graph: bool | str = False
-    _codegen_version: int = field(default_factory=lambda: 30, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 31, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):
@@ -430,22 +430,21 @@ def plan_module_streams(nodes, outputs, rules):
                     f'Module stream launch violates dependency {producer.signature} -> {node.signature}: {producer}'
                 )
 
-    # Adjacent graphs with identical ordering need only one fork and replay.
-    # Rebuild their boundaries so internal edges do not become graph inputs.
+    # Independent adjacent graphs with identical ordering need one replay.
     previous = None
     ordering = ('stream', 'ready_before', 'overlap_backward', 'backward_anchor',
                 'retain_backward_outputs', 'prioritize_backward', 'cuda_graph')
     for region in sorted(regions.values(), key=lambda r: new_positions[r.nodes[0]]):
         if (previous is not None and region.cuda_graph
                 and new_positions[previous.nodes[-1]] + 1 == new_positions[region.nodes[0]]
+                and not set(previous.inputs).intersection(region.inputs)
+                and not set(previous.outputs).intersection(region.inputs)
                 and all(getattr(previous, key) == getattr(region, key) for key in ordering)):
             previous.nodes.extend(region.nodes)
-            members = set(previous.nodes)
-            previous.inputs = tuple(dict.fromkeys(
-                obj for n in previous.nodes for obj in n.iobjs() if producers.get(obj) not in members))
-            previous.outputs = tuple(dict.fromkeys(
-                obj for n in previous.nodes for obj in n.oobjs()
-                if obj in graph_outputs or any(c not in members for c in consumers[obj])))
+            # Autograd runs later sibling nodes first. Publish their input
+            # gradients first too, preserving BF16 accumulation at shared edges.
+            previous.inputs = (*region.inputs, *previous.inputs)
+            previous.outputs = (*previous.outputs, *region.outputs)
             del regions[region.key]
         else:
             previous = region

@@ -44,6 +44,38 @@ class Model(torch.nn.Module):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_coalesced_replay_preserves_bf16_input_gradient_accumulation(tmp_path):
+    from nnscaler.runtime.module_graph import prepare_module_graphs
+    dist.init_process_group('nccl', init_method=f'file://{tmp_path}/pg', rank=0, world_size=1)
+    try:
+        nnscaler.init()
+        torch.manual_seed(512)
+        model = Model().cuda().bfloat16()
+        shared = dict(stream='shared', launch_after='*.ready_anchor', overlap_backward=True,
+                      backward_on='*.combine_anchor', cuda_graph='forward')
+        rules = (ModuleStreamRule('gate', **shared),
+                 ModuleStreamRule('branch', split_before='down', resume_after='*.combine_anchor', **shared))
+        x = torch.randn(4, 8, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+        generated = parallelize(model, {'x': x}, pas_dp, ComputeConfig(1, 1, module_streams=rules),
+                                gen_savedir=tmp_path, instance_name='bf16_coalesced_order')
+        expected = generated(x)
+        expected.float().square().sum().backward()
+        reference = [p.grad.clone() for p in (x, *generated.parameters())]
+        prepare_module_graphs(generated)
+        for p in (x, *generated.parameters()):
+            p.grad = None
+        actual = generated(x)
+        actual.float().square().sum().backward()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close([p.grad for p in (x, *generated.parameters())], reference, rtol=0, atol=0)
+    finally:
+        torch.cuda.synchronize()
+        nnscaler.uninit()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 @pytest.mark.parametrize('capture_mode', [True, 'forward'])
 @pytest.mark.parametrize('workers', [1, 2])
 @pytest.mark.parametrize('split', [False, True])
