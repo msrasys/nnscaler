@@ -148,8 +148,8 @@ def fragment(x, weight, records, kind='direct', delay=0):
     )
 
 
-def run(xs, weight, records, *, recompute=False, kind='direct', delay=0):
-    region = WeightGradientAccumulator('accumulator_test', (weight,))
+def run(xs, weight, records, *, recompute=False, kind='direct', delay=0, direct=False):
+    region = WeightGradientAccumulator('accumulator_test', (weight,), direct_parameter_grads=direct)
 
     def compute(x):
         with region.compute():
@@ -158,6 +158,51 @@ def run(xs, weight, records, *, recompute=False, kind='direct', delay=0):
     with region:
         outputs = [checkpoint(compute, x, use_reentrant=False) if recompute else compute(x) for x in xs]
     return outputs, region
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+@pytest.mark.parametrize('recompute', [False, True])
+def test_direct_leaf_grads_accumulate_across_microbatches_and_reset(device, recompute):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('requires CUDA')
+    from nnscaler.runtime.stream import register_parameter_stream
+    w = torch.nn.Parameter(torch.randn(4, 6, device=device))
+    register_parameter_stream(w, 'accumulator_test')
+    ref = w.detach().clone().requires_grad_()
+    for step in range(3):
+        w.grad = ref.grad = None
+        for micro in range(3):
+            x = torch.randn(5, 4, device=device, requires_grad=True)
+            rx = x.detach().clone().requires_grad_()
+            records = []
+            ys, region = run([x[:2], x[2:]], w, records, recompute=recompute, direct=True)
+            (sum(y.square().sum() for y in ys) + .3 * w.square().sum()).backward()
+            ((rx @ ref).square().sum() + .3 * ref.square().sum()).backward()
+            torch.testing.assert_close(w.grad, ref.grad)
+            torch.testing.assert_close(x.grad, rx.grad)
+            assert records == [w.grad.data_ptr()] * 2
+            assert not region.tasks
+
+
+@pytest.mark.parametrize('hooked', [False, True])
+def test_direct_leaf_grads_preserve_partial_backward_and_tensor_hooks(hooked):
+    w = torch.nn.Parameter(torch.randn(4, 6))
+    x = torch.randn(5, 4, requires_grad=True)
+    seen = []
+    if hooked:
+        w.register_hook(lambda grad: seen.append(grad.clone()))
+    ys, region = run([x], w, [], direct=True)
+    expected = x.detach().t() @ torch.ones_like(ys[0])
+    dw, = torch.autograd.grad(ys[0].sum(), (w,), retain_graph=True)
+    torch.testing.assert_close(dw, expected)
+    assert w.grad is None
+    dx, = torch.autograd.grad(ys[0].sum(), (x,), retain_graph=True)
+    torch.testing.assert_close(dx, torch.ones_like(ys[0]) @ w.detach().t())
+    assert w.grad is None
+    ys[0].sum().backward()
+    torch.testing.assert_close(w.grad, expected)
+    assert len(seen) == (2 if hooked else 0)
+    assert not region.tasks
 
 
 @pytest.mark.parametrize('kind', ['direct', 'legacy'])

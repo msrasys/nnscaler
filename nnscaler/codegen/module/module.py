@@ -33,7 +33,7 @@ from nnscaler.codegen.syntax.blocks import ClassBlock, ForBlock, FunctionBlock, 
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
 from nnscaler.codegen.lifecycle import LifeCycle
-from nnscaler.graph.schedule.module_streams import checkpoint_stream, weight_gradient_stream
+from nnscaler.graph.schedule.module_streams import checkpoint_stream, weight_gradient_stream, direct_weight_gradients
 from nnscaler.codegen.module.stream import emit_module_streams
 from nnscaler.runtime.async_op import registered_async_ops
 
@@ -1177,8 +1177,10 @@ class ModuleCodeGen(FuncEmission):
                     if parameters:
                         self.execplan.mark_module_streams()
                         region = (weight_regions or {}).get(node)
+                        direct = direct_weight_gradients(node, CompileFlag.module_streams)
                         scope = (f'{region}.operator()' if region else
-                                 f'nnscaler.WeightGradientAccumulator({weight_stream!r}, ({", ".join(parameters)}, ))')
+                                 f'nnscaler.WeightGradientAccumulator({weight_stream!r}, ({", ".join(parameters)}, ), '
+                                 f'direct_parameter_grads={direct!r})')
                         with Block(f'with {scope}:') as block:
                             block.insert_body(code)
                         code = block.code

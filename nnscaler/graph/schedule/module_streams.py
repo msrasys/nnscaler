@@ -43,8 +43,9 @@ class ModuleStreamRule:
     backward_on: str | None = None
     operators: str | tuple[str, ...] | None = None
     weight_backward_only: bool = False
+    accumulate_weight_grads: bool = False
     cuda_graph: bool | str = False
-    _codegen_version: int = field(default_factory=lambda: 28, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 29, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):
@@ -64,7 +65,7 @@ class ModuleStreamRule:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f'{name} must be a nonempty string or None')
-        for name in ('recompute_only', 'overlap_backward', 'weight_backward_only'):
+        for name in ('recompute_only', 'overlap_backward', 'weight_backward_only', 'accumulate_weight_grads'):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f'{name} must be a boolean')
         if not (type(self.cuda_graph) is bool or self.cuda_graph == 'forward'):
@@ -86,6 +87,8 @@ class ModuleStreamRule:
                 raise ValueError('Operator selection cannot split modules or select recompute regions')
         if self.recompute_ready_on is not None and not self.recompute_only:
             raise ValueError('recompute_ready_on requires a recompute_only rule')
+        if self.accumulate_weight_grads and not self.weight_backward_only:
+            raise ValueError('accumulate_weight_grads requires weight_backward_only')
         if self.cuda_graph and (self.recompute_only or self.weight_backward_only):
             raise ValueError('CUDA graph regions cannot also select recomputation or cooperative dW')
         if self.weight_backward_only and (
@@ -471,17 +474,27 @@ def plan_module_streams(nodes, outputs, rules):
     return ordered, regions, dict(joins)
 
 
-def weight_gradient_stream(node, rules):
-    """Select a cooperative operator's dW stream without moving forward work."""
-    streams = {
-        rule.stream for rule in rules
+def _weight_rules(node, rules):
+    return tuple(rule for rule in rules
         if rule.weight_backward_only
         and any(fnmatchcase(path, rule.module) for path in (node.module_stack or {}))
         and any(fnmatchcase(node.signature, pattern) for pattern in rule.operators)
-    }
+    )
+
+
+def weight_gradient_stream(node, rules):
+    """Select a cooperative operator's dW stream without moving forward work."""
+    streams = {rule.stream for rule in _weight_rules(node, rules)}
     if len(streams) > 1:
         raise ValueError('Conflicting weight-gradient streams for an operator')
     return next(iter(streams), None)
+
+
+def direct_weight_gradients(node, rules):
+    modes = {rule.accumulate_weight_grads for rule in _weight_rules(node, rules)}
+    if len(modes) > 1:
+        raise ValueError('Conflicting weight-gradient accumulation rules')
+    return next(iter(modes), False)
 
 
 def checkpoint_stream(nodes, rules):

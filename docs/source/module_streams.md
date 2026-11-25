@@ -181,6 +181,14 @@ their inputs belong to one backward task. This also preserves partial-gradient
 requests and the original checkpoint boundary. The anchor must be a registered
 async operator using `capture_async_backward()` and `record_ready()`.
 
+`accumulate_weight_grads=True` allows a cooperative backend to add directly to
+native parameter gradients, avoiding a temporary dW buffer and its final add.
+CUDA parameters must have exclusive compiler-proven affinity to the dW stream.
+Tensor hooks, reducer-owned parameters and partial `autograd.grad` requests
+retain ordinary gradient publication. This option requires serialized backward
+tasks and does not support custom AccumulateGrad node hooks. Callbacks always
+add to the supplied buffer, which may contain earlier microbatch contributions.
+
 `WeightGradientAccumulator(stream, parameters)` is a context manager scoped to
 one forward invocation. A cooperative backend binds parameters using
 `prepare_weight_backward(parameters)` before its autograd `Function.apply` and

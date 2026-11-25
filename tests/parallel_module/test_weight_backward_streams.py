@@ -119,7 +119,8 @@ def test_weight_anchor_rejects_late_or_independent_operations(tmp_path, late, ma
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('checkpointed', [False, True])
 @pytest.mark.parametrize('workers', [1, 2])
-def test_generated_deferred_weights_preserve_replay_and_live_forwards(tmp_path, checkpointed, workers):
+@pytest.mark.parametrize('direct', [False, True])
+def test_generated_deferred_weights_preserve_replay_and_live_forwards(tmp_path, checkpointed, workers, direct):
     def policy(graph, config):
         if checkpointed:
             graph.recompute([node for node in graph.select(ntype=IRFwOperation)
@@ -128,13 +129,14 @@ def test_generated_deferred_weights_preserve_replay_and_live_forwards(tmp_path, 
 
     model = AnchoredModel()
     reference = copy.deepcopy(model)
-    rule = replace(RULE, backward_on='*.ready_anchor')
-    instance = f'deferred_weight_{checkpointed}_{workers}'
+    rule = replace(RULE, backward_on='*.ready_anchor', accumulate_weight_grads=direct)
+    instance = f'deferred_weight_{checkpointed}_{workers}_{direct}'
     parallelize(model, {'x': torch.randn(4,8,requires_grad=True)}, policy,
                 ComputeConfig(1,1,module_streams=(rule,)),gen_savedir=tmp_path,
                 instance_name=instance, codegen_workers=workers, load_module=False)
     code = next(tmp_path.rglob('gencode0.py')).read_text()
     assert 'defer_until_backward=True' in code and '.after_backward(' in code
+    assert f'direct_parameter_grads={direct!r}' in code
     assert ('ckpt.checkpoint(' in code) == checkpointed
     cls = _load_parallel_module_class(AnchoredModel, gen_savedir=tmp_path, rank=0, instance_name=instance)
     generated = new_empty(cls, device='cpu', init_params=True)
@@ -170,7 +172,7 @@ def test_generated_deferred_cuda_launches_communication_before_weights(tmp_path,
         nnscaler.init()
         model = AnchoredModel().cuda()
         reference = copy.deepcopy(model)
-        rules = (replace(RULE, backward_on='*.ready_anchor'),)
+        rules = (replace(RULE, backward_on='*.ready_anchor', accumulate_weight_grads=True),)
         if checkpointed:
             rules += (ModuleStreamRule('expert', stream='expert_recompute', recompute_only=True),)
         generated = parallelize(model, {'x': torch.randn(4,8,device='cuda',requires_grad=True)}, policy,

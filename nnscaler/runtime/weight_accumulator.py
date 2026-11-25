@@ -14,6 +14,7 @@ from .stream import (
     _get_module_stream,
     input_stream_lifetime,
     parameter_gradient_stream,
+    parameter_gradient_stream_name,
     parameter_uses_module_stream,
 )
 from .utils import get_grad_dtype
@@ -65,6 +66,8 @@ class _AccumulationTask:
     buffers: dict = field(default_factory=dict)
     pending: list = field(default_factory=list)
     done: object = None
+    direct: set = field(default_factory=set)
+    hooks: list = field(default_factory=list)
 
 
 class WeightGradientAccumulator:
@@ -73,7 +76,7 @@ class WeightGradientAccumulator:
     Use as a context manager around cooperative backend calls. The backend
     binds parameters with ``prepare_weight_backward`` and calls
     ``binding.accumulate(callback, inputs)`` from its first-order backward.
-    The callback receives zero-initialized gradient buffers on first use and
+    The callback receives zero-initialized private gradient buffers on first use and
     must ADD each contribution, returning those same buffers. Buffer dtypes
     follow each parameter's ``grad_dtype`` (or its dtype when unspecified).
 
@@ -81,11 +84,19 @@ class WeightGradientAccumulator:
     the accumulation buffers. Frozen parameters may be passed to the backend,
     but only trainable parameters belong in this region. A callback can receive
     ``None`` for an unbound/frozen parameter; its corresponding return is ignored.
+
+    ``direct_parameter_grads`` permits adding to an existing native leaf grad
+    during a full backward. CUDA parameters require compiler-proven exclusive
+    stream affinity. Hooks, reducer parameters and autograd.grad use private
+    buffers. Backward tasks must be serialized; custom AccumulateGrad node hooks
+    are not supported in this opt-in mode.
     """
 
-    def __init__(self, stream, parameters, *, defer_until_backward=False):
+    def __init__(self, stream, parameters, *, defer_until_backward=False, direct_parameter_grads=False):
         if type(defer_until_backward) is not bool:
             raise TypeError('defer_until_backward must be a boolean')
+        if type(direct_parameter_grads) is not bool:
+            raise TypeError('direct_parameter_grads must be a boolean')
         if not isinstance(stream, str) or not stream or stream == 'default':
             raise ValueError('Weight accumulation requires a distinct named stream')
         parameters = tuple(parameters)
@@ -105,6 +116,8 @@ class WeightGradientAccumulator:
             raise ValueError('Weight backward supports CPU validation and CUDA execution')
         self.enabled = torch.is_grad_enabled()
         self.deferred = defer_until_backward
+        self.direct_parameter_grads = direct_parameter_grads
+        self.stream_name = stream
         self.backward_ready = None
         self.anchored = False
         if self.enabled and self.device.type == 'cuda' and torch.cuda.is_current_stream_capturing():
@@ -237,15 +250,62 @@ class WeightGradientAccumulator:
         if gid not in self.tasks:
             if self.tasks:
                 raise RuntimeError('Concurrent backwards of one accumulator are unsupported')
-            self.tasks[gid] = _AccumulationTask()
+            task = self.tasks[gid] = _AccumulationTask()
 
-            def cleanup(region=self):
-                task = region.tasks.pop(gid, None)
-                if task is not None:
+            def cleanup(region=self, task=task):
+                pending = region.tasks.pop(gid, None)
+                if pending is not None:
                     region._join_accumulation(task)
+                for hook in task.hooks:
+                    hook.remove()
+                task.hooks.clear()
 
             torch.autograd.Variable._execution_engine.queue_callback(cleanup)
         return gid, self.tasks[gid]
+
+    def _parameter_buffer(self, index, task):
+        """Use a native leaf's accumulation buffer only for a full backward.
+
+        Tensor hooks and reducer-owned parameters keep ordinary publication.
+        The opt-in mode requires serial backward tasks and no custom node hooks.
+        """
+        from .adapter.reducer import has_reducer_grad_accumulator
+
+        parameter = self.originals[index]
+        if (not self.direct_parameter_grads or not isinstance(parameter, torch.nn.Parameter)
+                or not parameter.is_leaf or has_reducer_grad_accumulator(parameter)
+                or (self.stream is not None and parameter_gradient_stream_name(parameter) != self.stream_name)
+                or getattr(parameter, '_backward_hooks', None)
+                or getattr(parameter, '_post_accumulate_grad_hooks', None)):
+            return None
+        node = torch.autograd.graph.get_gradient_edge(parameter).node
+        try:
+            if not torch._C._will_engine_execute_node(node):
+                return None
+        except RuntimeError:
+            # autograd.grad captures leaf gradients without executing their
+            # AccumulateGrad nodes. Preserve its returned-gradient semantics.
+            return None
+        value = parameter.grad
+        if value is not None and (not value.is_contiguous() or value.requires_grad
+                or value.dtype != get_grad_dtype(parameter) or value.shape != parameter.shape):
+            return None
+        if value is None:
+            value = torch.zeros_like(parameter, dtype=get_grad_dtype(parameter))
+            parameter.grad = value
+        task.direct.add(index)
+        producer = self.stream
+
+        def wait_for_writes(gradients, task=task, producer=producer):
+            if task.done is not None:
+                caller = torch.cuda.current_stream(value.device)
+                if caller != producer:
+                    caller.wait_event(task.done)
+                    value.record_stream(caller)
+            return gradients
+
+        task.hooks.append(node.register_prehook(wait_for_writes))
+        return value
 
     def accumulate(self, indices, callback, inputs):
         gid, task = self._task()
@@ -267,7 +327,9 @@ class WeightGradientAccumulator:
                 for index in indices:
                     if index is not None and index not in task.buffers:
                         parameter = self.originals[index]
-                        task.buffers[index] = torch.zeros_like(parameter, dtype=get_grad_dtype(parameter))
+                        buffer = self._parameter_buffer(index, task)
+                        task.buffers[index] = (buffer if buffer is not None else
+                                               torch.zeros_like(parameter, dtype=get_grad_dtype(parameter)))
                 # Zeroing private outputs depends only on parameter metadata.
                 # It can precede the producer event; callback reads cannot.
                 if ready is not None:
@@ -295,6 +357,11 @@ class WeightGradientAccumulator:
                         raise RuntimeError('Accumulation callback must preserve its supplied gradient buffers')
         except BaseException:
             self.failed = True
+            for index in task.direct:
+                self.originals[index].grad = None
+            for hook in task.hooks:
+                hook.remove()
+            task.hooks.clear()
             raise
         finally:
             if self.stream is not None:
@@ -342,7 +409,8 @@ class WeightGradientAccumulator:
         self._join_accumulation(task)
         result = list(incoming)
         for index, value in task.buffers.items():
-            result[index] = value if result[index] is None else result[index] + value
+            if index not in task.direct:
+                result[index] = value if result[index] is None else result[index] + value
         return tuple(result)
 
 

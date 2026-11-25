@@ -59,6 +59,12 @@ def parameter_uses_module_stream(param):
     return entry is not None and entry[0]() is param
 
 
+def parameter_gradient_stream_name(param):
+    """Return the exclusive gradient stream proven by the compiler, if any."""
+    entry = _parameter_stream_names.get(id(param))
+    return entry[1] if entry is not None and entry[0]() is param else None
+
+
 def hold_owners_through_backward(owners, streams):
     """Keep opaque storage through the graph task and its queued CUDA work."""
     owners, streams = tuple(owners), tuple(streams)

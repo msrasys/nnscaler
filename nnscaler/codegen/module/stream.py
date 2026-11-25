@@ -11,7 +11,7 @@ from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import Block
 from nnscaler.flags import CompileFlag
 from nnscaler.graph.schedule.checkpoint_readiness import plan_checkpoint_readiness
-from nnscaler.graph.schedule.module_streams import plan_module_streams, weight_gradient_stream
+from nnscaler.graph.schedule.module_streams import plan_module_streams, weight_gradient_stream, direct_weight_gradients
 from nnscaler.graph.schedule.weight_backward import plan_weight_backward
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.ir.cten import IRTensor
@@ -197,7 +197,8 @@ def emit_module_streams(codegen, segment, runtime_devid):
             parameters = tuple(dict.fromkeys(v for v in weight_node.iobjs()
                                if isinstance(v, IRTensor) and v.is_param() and v.requires_grad))
             body.append(f'{name} = nnscaler.WeightGradientAccumulator({stream!r}, '
-                        f'{names(parameters)}, defer_until_backward=True)')
+                        f'{names(parameters)}, defer_until_backward=True, '
+                        f'direct_parameter_grads={direct_weight_gradients(weight_node, CompileFlag.module_streams)!r})')
             body.append(f'_weight_regions.append({name})')
             value = next(v for v in node.iobjs()
                          if isinstance(v, IRTensor) and v.requires_grad and not v.is_attr())
