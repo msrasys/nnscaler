@@ -184,7 +184,7 @@ class ModuleGraph:
                             base = buffers[key] = torch.zeros_like(original)
                         value = base.detach().requires_grad_(original.requires_grad)
                     inputs.append(value)
-                self.slots.append(dict(inputs=tuple(inputs), forward=torch.cuda.CUDAGraph(), backward=torch.cuda.CUDAGraph()))
+                self.slots.append(dict(inputs=tuple(inputs), saved=[], forward=torch.cuda.CUDAGraph(), backward=torch.cuda.CUDAGraph()))
 
             sample = self.slots[0]['inputs']
             needed = tuple(v for v in sample if v.requires_grad)
@@ -213,7 +213,12 @@ class ModuleGraph:
             # pool allocations happen after this phase, so its saved state cannot
             # alias another slot, even for custom Function tensor attributes.
             for slot in self.slots:
-                with torch.cuda.graph(slot['forward'], pool=forward_pool, stream=capture_stream):
+                def pack(value, saved=slot['saved']):
+                    value = value.detach()
+                    saved.append(value)
+                    return value
+                with (torch.autograd.graph.saved_tensors_hooks(pack, lambda value: value),
+                      torch.cuda.graph(slot['forward'], pool=forward_pool, stream=capture_stream)):
                     outputs, single = _tuple(function(*slot['inputs']))
                     with torch.no_grad():
                         for target, value in zip(self.outputs, outputs):target.copy_(value)
