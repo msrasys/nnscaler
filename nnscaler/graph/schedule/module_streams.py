@@ -42,7 +42,7 @@ class ModuleStreamRule:
     recompute_ready_on: str | None = None
     backward_on: str | None = None
     operators: str | tuple[str, ...] | None = None
-    _codegen_version: int = field(default_factory=lambda: 23, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 24, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):
@@ -92,8 +92,8 @@ class ModuleStreamRule:
             or self.backward_on
         ):
             raise ValueError('Recompute-only rules cannot also move forward computation')
-        if self.overlap_backward and (not self.launch_before or (self.split_before and not self.resume_before)):
-            raise ValueError('Backward overlap requires submission before each anchor')
+        if self.overlap_backward and not (self.launch_before or self.launch_after):
+            raise ValueError('Backward overlap requires a launch anchor')
         if self.backward_on is not None and not self.overlap_backward:
             raise ValueError('backward_on requires overlap_backward')
 

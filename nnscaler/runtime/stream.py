@@ -101,8 +101,16 @@ class ModuleStreams:
         self.events, self.ready = {}, {}
         self.joined, self.streams = set(), {self.caller}
         self.owners = []
+        self.pending_ops = []
         self.region_streams, self.backward_points = {}, {}
         return self
+
+    def submit(self, operator, *args, **kwargs):
+        from .async_op import PendingOp
+
+        pending = PendingOp(operator, args, kwargs)
+        self.pending_ops.append(pending)
+        return pending
 
     def stream(self, name):
         """Return a shared named stream on this region's device."""
@@ -212,6 +220,9 @@ class ModuleStreams:
             self.joined.add(key)
 
     def __exit__(self, exc_type, exc_value, traceback):
+        for pending in self.pending_ops:
+            pending.close()
+        self.pending_ops.clear()
         for key in self.events:
             self.join(key)
         if exc_type is not None:

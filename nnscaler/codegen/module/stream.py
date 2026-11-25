@@ -3,6 +3,8 @@
 
 """Emit dependency-checked module branches and their CUDA stream boundaries."""
 
+import ast
+import copy
 from collections import defaultdict
 
 from nnscaler.codegen.lifecycle import LifeCycle
@@ -66,8 +68,26 @@ def emit_module_streams(codegen, segment, runtime_devid):
     if not regions and not anchors:
         return codegen._emit_segment_nodes(segment, nodes, runtime_devid)
 
-    codegen.execplan.use_multi_streams = True
-    lifetime = LifeCycle(nodes, segment.inputs(), segment.outputs())
+    codegen.execplan.mark_module_streams()
+    deferred = defaultdict(list)
+    for region in regions.values():
+        anchor = region.ready_before
+        if anchor is not None and anchor.signature in codegen.async_op_signatures:
+            deferred[anchor].append(region)
+        elif anchor is not None and region.overlap_backward and region.backward_anchor is anchor:
+            raise ValueError('Backward overlap after launch requires a registered async operator')
+    finish_after, pending_names = {}, {}
+    lifetime_nodes = list(nodes)
+    for index, (anchor, after_regions) in enumerate(deferred.items()):
+        after_nodes = [node for region in after_regions for node in region.nodes]
+        position = nodes.index(anchor)
+        if nodes[position + 1:position + 1 + len(after_nodes)] != after_nodes:
+            raise ValueError('Async after-launch regions must immediately follow their anchor')
+        lifetime_nodes.remove(anchor)
+        lifetime_nodes.insert(lifetime_nodes.index(after_nodes[-1]) + 1, anchor)
+        finish_after[after_regions[-1].key] = anchor
+        pending_names[anchor] = f'_async_operator_{index}'
+    lifetime = LifeCycle(lifetime_nodes, segment.inputs(), segment.outputs())
     starts = {region.nodes[0]: region for region in regions.values()}
     owners = {node: region for region in regions.values() for node in region.nodes}
     captures, backwards = defaultdict(list), defaultdict(list)
@@ -105,6 +125,85 @@ def emit_module_streams(codegen, segment, runtime_devid):
         body.append(codegen.emit_release(unused))
     pending = []
 
+    async_codes = {}
+
+    def async_code(node, *, submit):
+        if node not in async_codes:
+            # Preserve ordinary argument emission, pre/post hooks, grad/autocast
+            # contexts, metadata unpacking and lifetime releases exactly once.
+            tree = ast.parse('\n'.join(emit([node])))
+            calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                     and ast.unparse(n.func) == node.signature]
+            if len(calls) != 1:
+                raise ValueError('Async operators require one direct emitted operator call')
+            call = calls[0]
+            if any(isinstance(n, ast.Call) for arg in [*call.args, *[k.value for k in call.keywords]]
+                   for n in ast.walk(arg)):
+                raise ValueError('Async operator arguments must be values, not nested function calls')
+            name = pending_names[node]
+            start = copy.deepcopy(call)
+            start.args.insert(0, start.func)
+            start.func = ast.parse('_module_streams.submit', mode='eval').body
+            statement = ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=start)
+            call.func = ast.Attribute(value=ast.Name(id=name, ctx=ast.Load()), attr='complete', ctx=ast.Load())
+
+            def split(statements):
+                for i, current in enumerate(statements):
+                    if call in ast.walk(current):
+                        if isinstance(current, ast.With):
+                            before, after = split(current.body)
+                            return (
+                                statements[:i] + [ast.With(items=copy.deepcopy(current.items), body=before)],
+                                [ast.With(items=copy.deepcopy(current.items), body=after)] + statements[i + 1:],
+                            )
+                        if isinstance(current, (ast.Assign, ast.Expr)):
+                            return statements[:i] + [statement], statements[i:]
+                        raise ValueError('Async operator emission must be an assignment in ordinary contexts')
+                raise ValueError('Async operator call was not found')
+
+            before, after = split(tree.body)
+            async_codes[node] = tuple(
+                ast.unparse(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))).splitlines()
+                for body in (before, after)
+            )
+        return async_codes[node][0 if submit else 1]
+
+    def emit_anchor(node, *, prepared=False):
+        anchored = backwards.get(node, ())
+        dependencies = [obj for region in anchored for obj in region.outputs if obj.requires_grad]
+        retained = []
+        contexts = list(ready_at.get(node, ()))
+        if dependencies:
+            value = next((obj for obj in node.iobjs()
+                          if isinstance(obj, IRTensor) and obj.requires_grad and not obj.is_attr()), None)
+            if value is None:
+                raise ValueError(f'Backward overlap anchor {node.signature} has no differentiable input')
+            keys = tuple(region.key for region in anchored)
+            parts = []
+            for region in anchored:
+                if region.retain_backward_outputs:
+                    name = f'_{region.key}_backward_outputs'
+                    retained.append(name)
+                    parts.append(f'*{name}')
+                else:
+                    parts.extend(codegen.tensor_name(obj, prefix_attr='self.')
+                                 for obj in region.outputs if obj.requires_grad)
+            dependencies = '(' + ', '.join(parts) + ',)'
+            value = codegen.tensor_name(value)
+            body.append(f'{value} = _module_streams.after_backward({value}, {dependencies}, {keys!r})')
+            contexts.insert(0, f'_module_streams.backward_point({keys!r})')
+        codes = async_code(node, submit=False) if prepared else emit([node])
+        if contexts:
+            with Block(f'with {", ".join(contexts)}:') as block:
+                block.insert_body(codes)
+            body.extend(block.code)
+        else:
+            body.extend(codes)
+        if prepared:
+            body.append(f'del {pending_names[node]}')
+        if retained:
+            body.append('del ' + ', '.join(retained))
+
     def flush():
         if pending:
             body.extend(emit(pending))
@@ -117,47 +216,14 @@ def emit_module_streams(codegen, segment, runtime_devid):
             flush()
             body.extend(f'_module_streams.capture({key!r})' for key in captures.get(node, ()))
             body.extend(f'_module_streams.join({key!r})' for key in waits.get(node, ()))
+        if node in deferred:
+            flush()
+            body.extend(async_code(node, submit=True))
+            continue
         if node in backwards:
             flush()
-            anchored = backwards[node]
-            dependencies = [obj for region in anchored for obj in region.outputs if obj.requires_grad]
-            if dependencies:
-                value = next(
-                    (
-                        obj
-                        for obj in node.iobjs()
-                        if isinstance(obj, IRTensor) and obj.requires_grad and not obj.is_attr()
-                    ),
-                    None,
-                )
-                if value is None:
-                    raise ValueError(f'Backward overlap anchor {node.signature} has no differentiable input')
-                keys = tuple(region.key for region in anchored)
-                parts, retained = [], []
-                for region in anchored:
-                    if region.retain_backward_outputs:
-                        name = f'_{region.key}_backward_outputs'
-                        retained.append(name)
-                        parts.append(f'*{name}')
-                    else:
-                        parts.extend(
-                            codegen.tensor_name(obj, prefix_attr='self.')
-                            for obj in region.outputs
-                            if obj.requires_grad
-                        )
-                dependencies = '(' + ', '.join(parts) + ',)'
-                value = codegen.tensor_name(value)
-                body.append(f'{value} = _module_streams.after_backward({value}, {dependencies}, {keys!r})')
-                contexts = [
-                    f'_module_streams.backward_point({keys!r})',
-                    *ready_at.get(node, ()),
-                ]
-                with Block(f'with {", ".join(contexts)}:') as block:
-                    block.insert_body(emit([node]))
-                body.extend(block.code)
-                if retained:
-                    body.append('del ' + ', '.join(retained))
-                continue
+            emit_anchor(node)
+            continue
         if node in starts:
             flush()
             region = starts[node]
@@ -186,11 +252,11 @@ def emit_module_streams(codegen, segment, runtime_devid):
                 )
                 body.append(f'del _{region.key}_backward_boundaries')
                 body.append(f'_{region.key}_backward_outputs = {names(dependencies)}')
+            if region.key in finish_after:
+                emit_anchor(finish_after[region.key], prepared=True)
         elif node in ready_at:
             flush()
-            with Block(f'with {", ".join(ready_at[node])}:') as block:
-                block.insert_body(emit([node]))
-            body.extend(block.code)
+            emit_anchor(node)
         elif node not in owners:
             pending.append(node)
     flush()

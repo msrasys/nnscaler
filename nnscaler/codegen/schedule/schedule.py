@@ -488,7 +488,7 @@ class ScheduleCodeGen(FuncEmission):
             tensor_name = self.tensor_name(pending_out)
             req_grad = isinstance(pending_out, IRTensor) and pending_out.requires_grad
             context = self._get_node_stream_context(node)
-            track_stream = self.execplan.use_multi_streams or bool(context and context.stream)
+            track_stream = getattr(self.execplan, 'track_stream_inputs', self.execplan.use_multi_streams) or bool(context and context.stream)
             codes.append(
                 f'{tensor_name} = nnscaler.runtime.executor.aexecute('
                 f'model.{adapter_name}_wait, *({tensor_name}, ), requires_grad={req_grad}, '
@@ -807,9 +807,10 @@ class ScheduleCodeGen(FuncEmission):
         # A default-stream consumer can also receive data from a named stream.
         # Record actual resolved inputs inside the executor, after metadata
         # replay and any asynchronous communication callbacks.
-        track_stream = bool(stream_context and stream_context.stream) or self.execplan.use_multi_streams
-        # Omitted flags in direct/older callers default to safe tracking.
-        # Only an explicitly single-stream plan may skip it.
+        track_stream = bool(stream_context and stream_context.stream) or getattr(
+            self.execplan, 'track_stream_inputs', self.execplan.use_multi_streams)
+        # Managed module scopes guard their boundaries locally. Older/direct
+        # callers and operators with unmanaged streams retain safe tracking.
         stream_kwarg = f', track_stream={track_stream}'
         prefix_codes = list(sample_reads.codes) if sample_reads else []
         if sample_reads and produced_tids is not None:

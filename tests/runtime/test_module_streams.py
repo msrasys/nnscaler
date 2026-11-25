@@ -16,6 +16,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires 
 
 def test_after_launch_does_not_wait_for_anchor_completion():
     x = torch.ones(1024, device='cuda')
+    with ModuleStreams() as streams:
+        with streams.fork('warm', 'test_after', (x,)):
+            warm = x + 3
+        streams.publish((warm,))
+    del warm
     torch.cuda.synchronize()
     anchor_done, side_done = torch.cuda.Event(), torch.cuda.Event()
     with ModuleStreams() as streams:

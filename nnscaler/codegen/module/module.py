@@ -35,6 +35,7 @@ from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.graph.schedule.module_streams import checkpoint_stream
 from nnscaler.codegen.module.stream import emit_module_streams
+from nnscaler.runtime.async_op import registered_async_ops
 
 from nnscaler.flags import CompileFlag
 from nnscaler.utils import fields
@@ -110,6 +111,9 @@ class ModuleCodeGen(FuncEmission):
         """
         super().__init__()
         self.execplan: ExecutionPlan = execplan
+        # Only names are needed in codegen workers. Runtime implementations
+        # are registered when the generated module imports each operator.
+        self.async_op_signatures = frozenset(registered_async_ops())
         if any(fnmatchcase(node.signature, pattern)
                for node in execplan.graph.select(ntype=IRFwOperation)
                for pattern in CompileFlag.multi_stream_ops):
@@ -689,6 +693,7 @@ class ModuleCodeGen(FuncEmission):
             cb.insert_body(f'use_scheduler = {graph_sched is not None}')
             cb.insert_body(f'nmicros_per_scheduler_step = {graph_sched.nmicros if graph_sched is not None else 1}')
             cb.insert_body(f'use_multi_streams = {self.execplan.use_multi_streams}')
+            cb.insert_body(f'track_stream_inputs = {self.execplan.track_stream_inputs}')
             cb.insert_body(f'cuda_sync_required = {self.execplan.cuda_sync_required}')
             parameter_streams = {name: next(iter(streams)) for name, streams in self.module_parameter_uses.items()
                                  if len(streams) == 1 and None not in streams}
@@ -1354,7 +1359,7 @@ class ModuleCodeGen(FuncEmission):
         stream = checkpoint_stream(nodes, CompileFlag.module_streams)
         context = ''
         if stream is not None:
-            self.execplan.use_multi_streams = True
+            self.execplan.mark_module_streams()
             dependencies = list(dict.fromkeys([*inputs, *[obj for node in nodes for obj in node.iobjs() if obj.is_attr()]]))
             dependencies = self.tuple_name(dependencies, prefix_attr='self.')
             context = (f', context_fn=lambda: nnscaler.runtime.checkpoint_stream.contexts('

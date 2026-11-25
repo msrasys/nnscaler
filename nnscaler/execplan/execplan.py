@@ -268,6 +268,7 @@ class ExecutionPlan:
         self._weight_reducer_stream_context: Optional[StreamContext] = None
         self._zero_grad_stream_context: Optional[StreamContext] = None
         self._use_multi_streams = False
+        self._track_stream_inputs = False
         self._cuda_sync_required = False
 
         # Placement is fixed while constructing the execution plan. Reused
@@ -352,6 +353,17 @@ class ExecutionPlan:
     @use_multi_streams.setter
     def use_multi_streams(self, value: bool):
         self._use_multi_streams = value
+        self._track_stream_inputs = value
+
+    @property
+    def track_stream_inputs(self) -> bool:
+        return getattr(self, '_track_stream_inputs', self._use_multi_streams)
+
+    def mark_module_streams(self):
+        # Explicit module/checkpoint scopes protect their own inputs, outputs
+        # and backward storage. External/unmanaged streams still set the full
+        # plan's conservative tracking through use_multi_streams above.
+        self._use_multi_streams = True
 
     @property
     def cuda_sync_required(self) -> bool:

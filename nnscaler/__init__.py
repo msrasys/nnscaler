@@ -24,6 +24,7 @@ from nnscaler.graph.parser.register import register_op
 from nnscaler.graph.schedule.module_streams import ModuleStreamRule
 from nnscaler.runtime.weight_accumulator import WeightGradientAccumulator, prepare_weight_backward
 from nnscaler.runtime.stream import ModuleStreams
+from nnscaler.runtime.async_op import AsyncResult, register_async_op
 from nnscaler.runtime.backward import BackwardLaunchPoint, BackwardValue, after_backward, capture_async_backward
 from nnscaler.runtime.function.function import (
     anchor,

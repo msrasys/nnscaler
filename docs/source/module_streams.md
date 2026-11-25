@@ -13,8 +13,8 @@ config = ComputeConfig(
     runtime_ngpus=2,
     module_streams=(ModuleStreamRule(
         module='*.shared', stream='shared_expert',
-        launch_before='*.dispatch', split_before='down_proj',
-        resume_before='*.combine', overlap_backward=True,
+        launch_after='*.dispatch', split_before='down_proj',
+        resume_after='*.combine', overlap_backward=True,
     ),),
 )
 ```
@@ -25,6 +25,27 @@ inside the enclosing invocation; repeated calls have independent boundaries.
 resume fields to move a whole branch. `launch_after`/`resume_after` capture input
 readiness before their anchors and submit the branch afterwards. Without a
 launch anchor, the branch stays in its original position.
+
+For communication operators, register a submission/binding implementation:
+
+```python
+from nnscaler import AsyncResult, register_async_op
+
+register_async_op(dispatch, submit=enqueue_dispatch, complete=bind_dispatch)
+```
+
+`enqueue_dispatch(*args, **kwargs)` returns `AsyncResult(prepared, wait)`. It
+submits communication and protects storage used on its private streams. `wait()`
+joins that work to the consuming stream. `bind_dispatch(prepared, *args, **kwargs)`
+then attaches the operator's autograd behavior without submitting it again.
+It must use the supplied inputs, which can include backward-ordering identities.
+Differentiable preparation, such as selecting routing probabilities, may run
+during submission; the transport's controlled input edge is bound at completion.
+
+For registered async operators, after-launch rules emit submission first, then
+the independent module, then completion. The compiler keeps inputs alive across
+these phases and validates that the module does not consume unfinished outputs.
+An exception in the module still joins submitted work before releasing storage.
 
 `operators` optionally selects signature globs inside a module invocation.
 Exclusive local layout adapters and builtin metadata reads follow that branch;
@@ -38,7 +59,8 @@ experimental launch modes. ZeRO 0/1 are supported.
 
 ## Backward and checkpoint readiness
 
-`overlap_backward=True` applies to `launch_before`/`resume_before` rules. It adds
+`overlap_backward=True` supports before-launch rules and after-launch rules with
+registered async operators. It adds
 control edges so an asynchronous anchor submits its backward work before the
 independent branch runs. The backend calls `capture_async_backward()` during
 forward, then calls the captured object's `record_ready()` immediately before
@@ -89,6 +111,10 @@ Declare an operator that manages internal streams with
 `NNSCALER_MULTI_STREAM_OPS`. This enables scheduled lifetime protection on all
 pipeline ranks and codegen workers. The operator still owns its CUDA ordering
 and must join its forward work before the next microbatch uses the caller.
+
+Explicit module/checkpoint scopes manage their own cross-stream lifetimes and
+do not enable whole-plan `track_stream` processing. Unmanaged internal streams
+and explicit scheduler streams keep the conservative executor protection.
 
 ## Cooperative weight gradients
 

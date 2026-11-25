@@ -158,7 +158,7 @@ def test_codegen_splits_branch_and_joins_at_consumer(tmp_path, workers):
 
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('workers', [1, 2])
-def test_scheduled_executor_tracks_intra_module_streams(tmp_path, workers):
+def test_scheduled_executor_leaves_managed_module_tracking_local(tmp_path, workers):
     parallelize(
         EndToEndFork(),
         {'data': torch.randn(4, 8)},
@@ -170,7 +170,8 @@ def test_scheduled_executor_tracks_intra_module_streams(tmp_path, workers):
     )
     code = next(tmp_path.rglob('gencode0.py')).read_text()
     assert 'use_multi_streams = True' in code
-    assert 'track_stream=True' in code
+    assert 'track_stream_inputs = False' in code
+    assert 'track_stream=False' in code
 
 
 @replace_all_device_with('cpu', force=True)
@@ -264,8 +265,10 @@ class SerialStreams:
     def backward_point(self, keys):
         yield
 
-    def submit(self, key, name, function, args, tracked_inputs):
-        self.results[key] = function(*args)
+    def submit(self, operator, *args, **kwargs):
+        from nnscaler.runtime.async_op import PendingOp
+
+        return PendingOp(operator, args, kwargs)
 
     def resolve(self, key, caller_indices=None):
         return self.results.pop(key)
