@@ -117,7 +117,8 @@ def test_weight_rules_reject_ambiguous_modes(kwargs):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-def test_generated_weight_affinity_cuda_keeps_input_backward_independent(tmp_path, monkeypatch):
+@pytest.mark.parametrize('replay_stream', [False, True])
+def test_generated_weight_affinity_cuda_keeps_input_backward_independent(tmp_path, monkeypatch, replay_stream):
     import torch.distributed as dist
     import nnscaler
     from nnscaler.runtime.weight_accumulator import WeightGradientAccumulator
@@ -134,9 +135,12 @@ def test_generated_weight_affinity_cuda_keeps_input_backward_independent(tmp_pat
         nnscaler.init()
         model = ObserveModel().cuda()
         reference = copy.deepcopy(model)
+        rules = (RULE,)
+        if replay_stream:
+            rules += (ModuleStreamRule('expert', stream='expert_recompute', recompute_only=True),)
         generated = parallelize(model, {'x': torch.randn(4,8,device='cuda',requires_grad=True)}, policy,
-                                ComputeConfig(1,1,module_streams=(RULE,)),gen_savedir=tmp_path,
-                                instance_name='cuda_weight_scope')
+                                ComputeConfig(1,1,module_streams=rules),gen_savedir=tmp_path,
+                                instance_name=f'cuda_weight_scope_{replay_stream}')
         weight = next(generated.parameters())
         reducer = Reducer([0])
         reducer.add_param(weight)
