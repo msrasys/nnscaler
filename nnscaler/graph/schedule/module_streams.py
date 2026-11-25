@@ -45,7 +45,7 @@ class ModuleStreamRule:
     weight_backward_only: bool = False
     accumulate_weight_grads: bool = False
     cuda_graph: bool | str = False
-    _codegen_version: int = field(default_factory=lambda: 31, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 32, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):

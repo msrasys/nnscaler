@@ -108,9 +108,15 @@ def emit_module_streams(codegen, segment, runtime_devid):
     starts = {region.nodes[0]: region for region in regions.values()}
     owners = {node: region for region in regions.values() for node in region.nodes}
     captures, backwards = defaultdict(list), defaultdict(list)
+    preparations = {}
     for region in regions.values():
         if region.ready_before is not None:
             captures[region.ready_before].append(region.key)
+            # A later region may consume an earlier region on the same stream.
+            # Only stage inputs that already exist before this anchor.
+            later_outputs = {v for n in nodes[nodes.index(region.ready_before):] for v in n.oobjs()}
+            if region.cuda_graph == 'forward' and not later_outputs.intersection(region.inputs):
+                preparations[region.key] = f'_{region.key}_prepared_graph'
         if region.overlap_backward:
             backwards[region.backward_anchor].append(region)
     # A checkpoint must join before entering, even if only an internal node
@@ -248,6 +254,17 @@ def emit_module_streams(codegen, segment, runtime_devid):
             flush()
             body.extend(f'_module_streams.capture({key!r})' for key in captures.get(node, ()))
             body.extend(f'_module_streams.join({key!r})' for key in waits.get(node, ()))
+            for key in captures.get(node, ()):
+                if key not in preparations:
+                    continue
+                region = regions[key]
+                preserve = ', preserve_accumulators=True' if region.overlap_backward else ''
+                with Block(f'with _module_streams.prepare({key!r}, {region.stream!r}, '
+                           f'{names(region.inputs)}{preserve}):') as block:
+                    graph_key = (codegen.node_name(segment), key)
+                    block.insert_body([f'{preparations[key]} = nnscaler.runtime.module_graph.prepare_module_graph('
+                                       f'self, {graph_key!r}, {names(region.inputs)})'])
+                body.extend(block.code)
         if node in deferred:
             flush()
             body.extend(async_code(node, submit=True))
@@ -270,7 +287,8 @@ def emit_module_streams(codegen, segment, runtime_devid):
             ) as block:
                 codes = emit(region.nodes)
                 if region.cuda_graph:
-                    codes = emit_graph_region(codegen, segment, region, codes, lifetime)
+                    codes = emit_graph_region(codegen, segment, region, codes, lifetime,
+                                              prepared=preparations.get(region.key))
                 block.insert_body(codes)
             body.extend(block.code)
             caller = region.caller_outputs

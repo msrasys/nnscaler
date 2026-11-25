@@ -7,7 +7,7 @@ import weakref
 import pytest
 import torch
 
-from nnscaler.runtime.module_graph import ModuleGraph, run_module_graph, prepare_module_graphs
+from nnscaler.runtime.module_graph import ModuleGraph, run_module_graph, prepare_module_graph, prepare_module_graphs
 from nnscaler.runtime.stream import drain_stream_holds
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
@@ -15,6 +15,76 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires 
 
 def transform(x, weight):
     return (x @ weight).sin()
+
+
+def test_preparation_does_not_replay_or_create_autograd_edges(monkeypatch):
+    from nnscaler.runtime.module_graph import _profiles
+    owner = torch.nn.Module()
+    weight = torch.nn.Parameter(torch.randn(16, 16, device='cuda'))
+    xs = [torch.randn(8, 16, device='cuda', requires_grad=True) for _ in range(3)]
+    calls = [run_module_graph(owner, 'test', transform, (x, weight), (1,), capture_backward=False)
+             for x in xs]
+    for y in calls:
+        y.sum().backward()
+    prepare_module_graphs(owner)
+    replays = []
+    replay = torch.cuda.CUDAGraph.replay
+    monkeypatch.setattr(torch.cuda.CUDAGraph, 'replay', lambda graph: (replays.append(graph), replay(graph))[1])
+    prepared = [prepare_module_graph(owner, 'test', (x, weight)) for x in xs]
+    assert not replays
+    assert all(not value.requires_grad for call in prepared for value in call.ticket.outputs)
+    actual = [run_module_graph(owner, 'test', transform, (x, weight), (1,),
+                               capture_backward=False, prepared=call)
+              for x, call in zip(xs, prepared)]
+    assert len(replays) == 3
+    for i in (2, 0, 1):
+        reference = transform(xs[i], weight)
+        torch.testing.assert_close(actual[i], reference)
+        observed = torch.autograd.grad(actual[i].sum(), (xs[i], weight))
+        expected = torch.autograd.grad(reference.sum(), (xs[i], weight))
+        torch.testing.assert_close(observed, expected)
+    assert len(_profiles[owner]['test'].pool.free) == 3
+    with pytest.raises(ValueError, match='different module graph'):
+        run_module_graph(owner, 'test', transform, (xs[0], weight), (1,),
+                         capture_backward=False, prepared=prepared[0])
+
+
+def test_abandoned_and_mutated_preparations_release_the_slot():
+    from nnscaler.runtime.module_graph import _profiles
+    owner = torch.nn.Module()
+    weight = torch.nn.Parameter(torch.randn(16, 16, device='cuda'))
+    x = torch.randn(8, 16, device='cuda', requires_grad=True)
+    run_module_graph(owner, 'test', transform, (x, weight), (1,), capture_backward=False).sum().backward()
+    prepare_module_graphs(owner)
+    pool = _profiles[owner]['test'].pool
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        call = prepare_module_graph(owner, 'test', (x, weight))
+        assert not pool.free
+        del call
+        assert len(pool.free) == 1
+        call = prepare_module_graph(owner, 'test', (x, weight))
+        with torch.no_grad():
+            x.add_(1)
+        with pytest.raises(RuntimeError, match='changed before execution'):
+            run_module_graph(owner, 'test', transform, (x, weight), (1,),
+                             capture_backward=False, prepared=call)
+        assert len(pool.free) == 1
+        for _ in range(4):
+            call = prepare_module_graph(owner, 'test', (x, weight))
+            y = run_module_graph(owner, 'test', transform, (x, weight), (1,),
+                                 capture_backward=False, prepared=call)
+            ref = weakref.ref(y)
+            y.sum().backward()
+            del y
+            assert ref() is None
+            assert len(pool.free) == 1
+    finally:
+        if enabled:
+            gc.enable()
+    torch.cuda.synchronize()
+    drain_stream_holds(wait=True)
 
 
 @pytest.mark.parametrize('capture_backward', [True, False])

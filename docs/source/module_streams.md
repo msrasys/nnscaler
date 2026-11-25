@@ -156,6 +156,10 @@ slot-local autograd tape, allocating temporary gradients normally instead of
 reserving backward buffers for every live forward. This saves memory without
 adding recomputation. Selected backends must support retained, stateless backward
 execution; parameter versions are still checked at the public boundary.
+For after-launch regions whose inputs are available before the anchor, the
+compiler stages input copies, output allocation and stream bookkeeping before
+submission. Graph replay and its autograd edges are created after submission,
+so preparation does not consume the communication's compute window.
 
 ## Cooperative weight gradients
 

@@ -109,6 +109,7 @@ class ModuleStreams:
         self.owners = []
         self.pending_ops = []
         self.region_streams, self.backward_points = {}, {}
+        self.prepared = {}
         return self
 
     def submit(self, operator, *args, **kwargs):
@@ -156,7 +157,8 @@ class ModuleStreams:
         self.ready[key] = event
 
     @contextmanager
-    def fork(self, key, name, inputs, *, preserve_accumulators=False):
+    def prepare(self, key, name, inputs, *, preserve_accumulators=False):
+        """Prepare independent inputs before an anchor, without running the module."""
         if key in self.region_streams:
             raise ValueError(f'Duplicate module stream region: {key}')
         device = self.caller.device
@@ -180,6 +182,20 @@ class ModuleStreams:
             stream.wait_stream(self.caller)
         with torch.cuda.stream(stream), input_stream_lifetime(inputs, True) as owners:
             self.owners.extend(owners)
+            self.prepared[key] = (name, tuple(inputs), preserve_accumulators, accumulator_holds)
+            yield
+
+    @contextmanager
+    def fork(self, key, name, inputs, *, preserve_accumulators=False):
+        context = (torch.cuda.stream(self.region_streams[key]) if key in self.prepared else
+                   self.prepare(key, name, inputs, preserve_accumulators=preserve_accumulators))
+        with context:
+            prepared_name, prepared_inputs, preserve, accumulator_holds = self.prepared.pop(key)
+            if (name != prepared_name or preserve != preserve_accumulators
+                    or len(inputs) != len(prepared_inputs)
+                    or any(a is not b for a, b in zip(inputs, prepared_inputs))):
+                raise ValueError('Prepared module stream inputs must match its fork')
+            stream = self.region_streams[key]
             try:
                 yield
             finally:
@@ -237,6 +253,7 @@ class ModuleStreams:
         with input_stream_lifetime(self.owners, True):
             pass
         self.owners.clear()
+        self.prepared.clear()
 
 
 def drain_stream_holds(*, wait=False):

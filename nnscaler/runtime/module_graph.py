@@ -140,13 +140,14 @@ class _ForwardReplay(torch.autograd.Function):
         ctx.save_for_backward(*(inputs[i] for i in sorted(pool.parameters)))
         ctx.set_materialize_grads(False)
         slot = pool.slots[ticket.slot]
-        copied = set()
-        for i, (target, value) in enumerate(zip(slot['inputs'], inputs)):
-            if i not in pool.parameters and target.data_ptr() not in copied:
-                target.copy_(value)
-                copied.add(target.data_ptr())
+        prepared = getattr(ticket, 'outputs', None)
+        if prepared is not None:
+            del ticket.outputs  # Returned tensors must not form a ticket/autograd cycle.
+        if prepared is None:
+            _copy_inputs(pool, slot, inputs)
         slot['forward'].replay()
-        values = tuple(value.detach().clone() for value in slot['outputs'])
+        values = (tuple(value.detach().clone() for value in slot['outputs']) if prepared is None else
+                  tuple(target.copy_(value) for target, value in zip(prepared, slot['outputs'])))
         ctx.mark_non_differentiable(*(v for v, grad in zip(values, pool.output_requires_grad) if not grad))
         return values
 
@@ -172,6 +173,50 @@ class _ForwardReplay(torch.autograd.Function):
             return (None, *result)
         finally:
             torch.autograd.Variable._execution_engine.queue_callback(ticket.release)
+
+
+def _copy_inputs(pool, slot, inputs):
+    copied = set()
+    for i, (target, value) in enumerate(zip(slot['inputs'], inputs)):
+        if i not in pool.parameters and target.data_ptr() not in copied:
+            target.copy_(value)
+            copied.add(target.data_ptr())
+
+
+class _PreparedForward:
+    def __init__(self, pool, inputs):
+        if pool.capture_backward:
+            raise ValueError('Prepared forwards require forward-only module graphs')
+        self.inputs = tuple(inputs)
+        self.versions = tuple(v._version for v in inputs)
+        self.ticket = pool._reserve(inputs)
+        try:
+            slot = pool.slots[self.ticket.slot]
+            self.ticket.outputs = tuple(torch.empty_like(v) for v in slot['outputs'])
+            with torch.no_grad():
+                _copy_inputs(pool, slot, inputs)
+        except BaseException:
+            self.ticket.release()
+            raise
+
+    def run(self, inputs):
+        if (self.ticket is None or len(inputs) != len(self.inputs)
+                or any(a is not b for a, b in zip(inputs, self.inputs))):
+            raise ValueError('A prepared module graph must consume its original inputs exactly once')
+        ticket, self.ticket = self.ticket, None
+        try:
+            if not torch.is_grad_enabled() or tuple(v._version for v in inputs) != self.versions:
+                raise RuntimeError('Prepared module graph inputs or grad mode changed before execution')
+            if torch.cuda.current_stream(inputs[0].device) != ticket.owner.stream:
+                raise RuntimeError('Module graph execution requires its original stream')
+            with ticket.owner.lock:
+                outputs = _ForwardReplay.apply(ticket, *inputs)
+            return outputs[0] if ticket.owner.single else outputs
+        except BaseException:
+            ticket.release()
+            raise
+        finally:
+            self.inputs = ()
 
 
 class ModuleGraph:
@@ -243,8 +288,7 @@ class ModuleGraph:
         with torch.cuda.stream(self.stream), input_stream_lifetime((self,), True):
             pass
 
-    @_capture_guard
-    def __call__(self, *inputs):
+    def _reserve(self, inputs):
         if torch.cuda.current_stream(inputs[0].device) != self.stream:
             raise RuntimeError('Module graph execution requires its original stream')
         if _signature(inputs, self.parameters) != self.signature:
@@ -254,7 +298,11 @@ class ModuleGraph:
         with self.lock:
             if not self.free:
                 raise RuntimeError('Module graph live forwards exceeded the calibrated capacity')
-            ticket = _Ticket(self, self.free.popleft())
+            return _Ticket(self, self.free.popleft())
+
+    @_capture_guard
+    def __call__(self, *inputs):
+        ticket = self._reserve(inputs)
         try:
             with self.lock:
                 if self.capture_backward:
@@ -322,8 +370,26 @@ class _Profile:
 
 
 @_capture_guard
-def run_module_graph(owner, key, function, inputs, parameters, *, capture_backward=True):
+def prepare_module_graph(owner, key, inputs):
+    """Copy inputs and reserve outputs before an independent async submission.
+
+    Calibration and native forward/backward graphs keep their ordinary path.
+    Preparation creates no autograd edges and launches no model computation.
+    """
+    if not torch.is_grad_enabled():
+        return None
+    with _registry_lock:
+        profile = _profiles.get(owner, {}).get(key)
+    if profile is None or profile.pool is None or profile.capture_backward:
+        return None
+    return _PreparedForward(profile.pool, inputs)
+
+
+@_capture_guard
+def run_module_graph(owner, key, function, inputs, parameters, *, capture_backward=True, prepared=None):
     """Run or calibrate one compiler-selected pure region."""
+    if prepared is not None and not torch.is_grad_enabled():
+        raise RuntimeError('Prepared module graph grad mode changed before execution')
     if not torch.is_grad_enabled() or not any(v.requires_grad for v in inputs):
         return function(*inputs)
     if torch._C._current_graph_task_id() >= 0:
@@ -334,6 +400,12 @@ def run_module_graph(owner, key, function, inputs, parameters, *, capture_backwa
             if owner in _prepared:
                 raise RuntimeError('A module graph region was first used after calibration; calibrate all training paths')
             profiles[key] = _Profile(function, inputs, parameters, capture_backward)
+    if prepared is not None:
+        if prepared.ticket is None or prepared.ticket.owner is not profiles[key].pool:
+            raise ValueError('Prepared forward belongs to a different module graph')
+        result = prepared.run(inputs)
+        profiles[key].replays += 1
+        return result
     return profiles[key].run(inputs)
 
 

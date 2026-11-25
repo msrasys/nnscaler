@@ -12,7 +12,7 @@ from nnscaler.ir.operator import IRFwOperation
 from nnscaler.graph.schedule.module_streams import weight_gradient_stream
 
 
-def emit_graph_region(codegen, segment, region, codes, lifetime):
+def emit_graph_region(codegen, segment, region, codes, lifetime, *, prepared=None):
     if CompileFlag.use_zero > 1:
         raise ValueError('Module CUDA graphs require stable parameter storage (ZeRO 0/1)')
     if not region.outputs or any(not isinstance(v, IRTensor) for v in (*region.inputs, *region.outputs)):
@@ -49,8 +49,11 @@ def emit_graph_region(codegen, segment, region, codes, lifetime):
     parameters = tuple(i for i, value in enumerate(region.inputs) if value.is_param())
     key = (codegen.node_name(segment), region.key)
     inputs = codegen.tuple_name(region.inputs, prefix_attr='self.')
+    preparation = f', prepared={prepared}' if prepared is not None else ''
     code.append(f'{output_names} = nnscaler.runtime.module_graph.run_module_graph('
-                f'self, {key!r}, {name}, {inputs}, {parameters!r}, capture_backward={region.cuda_graph is True!r})')
+                f'self, {key!r}, {name}, {inputs}, {parameters!r}, capture_backward={region.cuda_graph is True!r}{preparation})')
+    if prepared is not None:
+        code.append(f'del {prepared}')
     released = [v for v in region.inputs
                 if lifetime.releasable_after_line(v, lifetime.get_line(region.nodes[-1]) + 1)]
     if released:

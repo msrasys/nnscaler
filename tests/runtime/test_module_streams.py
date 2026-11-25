@@ -14,7 +14,8 @@ from nnscaler.runtime.stream import ModuleStreams, drain_stream_holds
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 
 
-def test_after_launch_does_not_wait_for_anchor_completion():
+@pytest.mark.parametrize('prepared', [False, True])
+def test_after_launch_does_not_wait_for_anchor_completion(prepared):
     x = torch.ones(1024, device='cuda')
     with ModuleStreams() as streams:
         with streams.fork('warm', 'test_after', (x,)):
@@ -25,6 +26,9 @@ def test_after_launch_does_not_wait_for_anchor_completion():
     anchor_done, side_done = torch.cuda.Event(), torch.cuda.Event()
     with ModuleStreams() as streams:
         streams.capture('side')
+        if prepared:
+            with streams.prepare('side', 'test_after', (x,)):
+                pass
         # Model an asynchronous communication wait inserted on the caller.
         torch.cuda._sleep(500_000_000)
         anchor_done.record()
