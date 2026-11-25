@@ -132,13 +132,58 @@ class _Replay(torch.autograd.Function):
             torch.autograd.Variable._execution_engine.queue_callback(ctx.ticket.release)
 
 
+class _ForwardReplay(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, ticket, *inputs):
+        pool = ticket.owner
+        ctx.ticket = ticket
+        ctx.save_for_backward(*(inputs[i] for i in sorted(pool.parameters)))
+        ctx.set_materialize_grads(False)
+        slot = pool.slots[ticket.slot]
+        copied = set()
+        for i, (target, value) in enumerate(zip(slot['inputs'], inputs)):
+            if i not in pool.parameters and target.data_ptr() not in copied:
+                target.copy_(value)
+                copied.add(target.data_ptr())
+        slot['forward'].replay()
+        values = tuple(value.detach().clone() for value in slot['outputs'])
+        ctx.mark_non_differentiable(*(v for v, grad in zip(values, pool.output_requires_grad) if not grad))
+        return values
+
+    @staticmethod
+    def backward(ctx, *gradients):
+        ticket, pool = ctx.ticket, ctx.ticket.owner
+        if ticket.used or torch.is_grad_enabled():
+            raise RuntimeError('Module graphs require one first-order backward per forward')
+        ticket.used = True
+        try:
+            ctx.saved_tensors
+            slot = pool.slots[ticket.slot]
+            required = tuple(x for x in slot['inputs'] if x.requires_grad)
+            outputs = tuple(y for y in slot['outputs'] if y.requires_grad)
+            incoming = tuple(torch.zeros_like(y) if g is None else g
+                             for y, g in zip(slot['outputs'], gradients) if y.requires_grad)
+            values = iter(torch.autograd.grad(outputs, required, incoming,
+                                              allow_unused=True, retain_graph=True))
+            result = []
+            for value in slot['inputs']:
+                grad = next(values) if value.requires_grad else None
+                result.append(None if grad is None else grad.clone())
+            return (None, *result)
+        finally:
+            torch.autograd.Variable._execution_engine.queue_callback(ticket.release)
+
+
 class ModuleGraph:
     """A fixed-capacity replay pool; construction must happen with no live calls."""
 
-    def __init__(self, function, sample_inputs, parameters=(), *, capacity=1, stream=None):
+    def __init__(self, function, sample_inputs, parameters=(), *, capacity=1, stream=None, capture_backward=True):
         if type(capacity) is not int or capacity < 1:
             raise ValueError('Module graph capacity must be positive')
+        if type(capture_backward) is not bool:
+            raise TypeError('capture_backward must be a boolean')
         self.parameters = frozenset(parameters)
+        self.capture_backward = capture_backward
         if any(type(i) is not int or i < 0 or i >= len(sample_inputs) for i in self.parameters):
             raise ValueError('Module graph parameter indices must refer to inputs')
         self.signature = _signature(sample_inputs, self.parameters)
@@ -171,8 +216,24 @@ class ModuleGraph:
                 if not any(self.output_requires_grad):
                     raise ValueError('Module graphs require a differentiable output')
                 del outputs
-                native = torch.cuda.make_graphed_callables(function, inputs, allow_unused_input=True)
-                self.slots.append(dict(inputs=inputs, native=native))
+                if capture_backward:
+                    native = torch.cuda.make_graphed_callables(function, inputs, allow_unused_input=True)
+                    self.slots.append(dict(inputs=inputs, native=native))
+                else:
+                    # The retained tape reads buffers refreshed by forward replay.
+                    # Saved hooks keep slot-owned values without stale version
+                    # checks; public parameters are checked by the outer node.
+                    for _ in range(3):
+                        warm, _ = _tuple(function(*inputs))
+                        needed = tuple(v for v in inputs if v.requires_grad)
+                        torch.autograd.grad(tuple(v for v in warm if v.requires_grad), needed,
+                                            tuple(torch.zeros_like(v) for v in warm if v.requires_grad),
+                                            allow_unused=True)
+                    graph = torch.cuda.CUDAGraph()
+                    with (torch.autograd.graph.saved_tensors_hooks(lambda v: v.detach(), lambda v: v),
+                          torch.cuda.graph(graph, stream=capture_stream)):
+                        outputs, _ = _tuple(function(*inputs))
+                    self.slots.append(dict(inputs=inputs, forward=graph, outputs=outputs))
             torch.cuda.synchronize(sample_inputs[0].device)
 
     @_capture_guard
@@ -196,12 +257,15 @@ class ModuleGraph:
             ticket = _Ticket(self, self.free.popleft())
         try:
             with self.lock:
-                outputs, _ = _tuple(self.slots[ticket.slot]['native'](*inputs))
-                nodes = {value.grad_fn for value in outputs if value.grad_fn is not None}
-                for node in nodes:
-                    node.register_hook(_clone_gradients)
-                ticket.parameters = tuple(inputs[i] for i in sorted(self.parameters))
-                outputs = _Replay.apply(ticket, *outputs)
+                if self.capture_backward:
+                    outputs, _ = _tuple(self.slots[ticket.slot]['native'](*inputs))
+                    nodes = {value.grad_fn for value in outputs if value.grad_fn is not None}
+                    for node in nodes:
+                        node.register_hook(_clone_gradients)
+                    ticket.parameters = tuple(inputs[i] for i in sorted(self.parameters))
+                    outputs = _Replay.apply(ticket, *outputs)
+                else:
+                    outputs = _ForwardReplay.apply(ticket, *inputs)
         except BaseException:
             ticket.release()
             raise
@@ -209,10 +273,11 @@ class ModuleGraph:
 
 
 class _Profile:
-    def __init__(self, function, inputs, parameters):
+    def __init__(self, function, inputs, parameters, capture_backward):
         self.function, self.parameters = function, tuple(parameters)
         self.signature = _signature(inputs, self.parameters)
         self.stream = torch.cuda.current_stream(inputs[0].device)
+        self.capture_backward = capture_backward
         self.templates = tuple(value if i in parameters else None for i, value in enumerate(inputs))
         self.live = self.peak = 0
         self.replays = 0
@@ -252,11 +317,12 @@ class _Profile:
                     if alias not in buffers:buffers[alias] = torch.zeros(shape, dtype=dtype, device=device)
                     template = buffers[alias].detach().requires_grad_(requires_grad)
                 samples.append(template)
-            self.pool = ModuleGraph(self.function, tuple(samples), self.parameters, capacity=self.peak, stream=self.stream)
+            self.pool = ModuleGraph(self.function, tuple(samples), self.parameters, capacity=self.peak,
+                                    stream=self.stream, capture_backward=self.capture_backward)
 
 
 @_capture_guard
-def run_module_graph(owner, key, function, inputs, parameters):
+def run_module_graph(owner, key, function, inputs, parameters, *, capture_backward=True):
     """Run or calibrate one compiler-selected pure region."""
     if not torch.is_grad_enabled() or not any(v.requires_grad for v in inputs):
         return function(*inputs)
@@ -267,7 +333,7 @@ def run_module_graph(owner, key, function, inputs, parameters):
         if key not in profiles:
             if owner in _prepared:
                 raise RuntimeError('A module graph region was first used after calibration; calibrate all training paths')
-            profiles[key] = _Profile(function, inputs, parameters)
+            profiles[key] = _Profile(function, inputs, parameters, capture_backward)
     return profiles[key].run(inputs)
 
 
@@ -303,7 +369,7 @@ def module_graph_stats(module):
     """Return calibration and replay counts without synchronizing the GPU."""
     with _registry_lock:
         return [dict(module=name, region=key, captured=p.pool is not None,
-                     capacity=p.peak, replays=p.replays,
+                     capacity=p.peak, replays=p.replays, capture_backward=p.capture_backward,
                      live=p.live if p.pool is None else len(p.pool.slots)-len(p.pool.free))
                 for name, child in module.named_modules()
                 for key, p in _profiles.get(child, {}).items()]

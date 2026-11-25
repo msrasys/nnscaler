@@ -50,7 +50,7 @@ def emit_graph_region(codegen, segment, region, codes, lifetime):
     key = (codegen.node_name(segment), region.key)
     inputs = codegen.tuple_name(region.inputs, prefix_attr='self.')
     code.append(f'{output_names} = nnscaler.runtime.module_graph.run_module_graph('
-                f'self, {key!r}, {name}, {inputs}, {parameters!r})')
+                f'self, {key!r}, {name}, {inputs}, {parameters!r}, capture_backward={region.cuda_graph is True!r})')
     released = [v for v in region.inputs
                 if lifetime.releasable_after_line(v, lifetime.get_line(region.nodes[-1]) + 1)]
     if released:

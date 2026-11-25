@@ -43,9 +43,10 @@ class Model(torch.nn.Module):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+@pytest.mark.parametrize('capture_mode', [True, 'forward'])
 @pytest.mark.parametrize('workers', [1, 2])
 @pytest.mark.parametrize('split', [False, True])
-def test_generated_graph_regions_calibrate_then_train_after_weight_updates(tmp_path, monkeypatch, workers, split):
+def test_generated_graph_regions_calibrate_then_train_after_weight_updates(tmp_path, monkeypatch, workers, split, capture_mode):
     from nnscaler.runtime.module_graph import _profiles
     from nnscaler.flags import RuntimeFlag
     # build_optimizer configures global accumulation flags for its own loop.
@@ -57,12 +58,12 @@ def test_generated_graph_regions_calibrate_then_train_after_weight_updates(tmp_p
         model = Model().cuda()
         reference = copy.deepcopy(model)
         rule = ModuleStreamRule('branch', stream='shared', launch_after='*.ready_anchor',
-                                overlap_backward=True, cuda_graph=True,
+                                overlap_backward=True, cuda_graph=capture_mode,
                                 **(dict(split_before='down', resume_after='*.combine_anchor',
                                         backward_on='*.combine_anchor') if split else {}))
         generated = parallelize(model, {'x': torch.randn(4,8,device='cuda',requires_grad=True)}, pas_dp,
             ComputeConfig(1,1,module_streams=(rule,)), gen_savedir=tmp_path,
-            instance_name=f'graphed_branch_{workers}_{split}', codegen_workers=workers)
+            instance_name=f'graphed_branch_{workers}_{split}_{capture_mode}', codegen_workers=workers)
         optimizer = nnscaler.build_optimizer(generated, torch.optim.SGD, lr=.001)
         ref_optimizer = torch.optim.SGD(reference.parameters(), lr=.001)
         for step in range(3):

@@ -43,8 +43,8 @@ class ModuleStreamRule:
     backward_on: str | None = None
     operators: str | tuple[str, ...] | None = None
     weight_backward_only: bool = False
-    cuda_graph: bool = False
-    _codegen_version: int = field(default_factory=lambda: 27, init=False, repr=False)
+    cuda_graph: bool | str = False
+    _codegen_version: int = field(default_factory=lambda: 28, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):
@@ -64,9 +64,11 @@ class ModuleStreamRule:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f'{name} must be a nonempty string or None')
-        for name in ('recompute_only', 'overlap_backward', 'weight_backward_only', 'cuda_graph'):
+        for name in ('recompute_only', 'overlap_backward', 'weight_backward_only'):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f'{name} must be a boolean')
+        if not (type(self.cuda_graph) is bool or self.cuda_graph == 'forward'):
+            raise ValueError('cuda_graph must be a boolean or "forward"')
         if (self.launch_before and self.launch_after) or (self.resume_before and self.resume_after):
             raise ValueError('Use either before or after for each launch anchor')
         if (self.split_before is None) != (self.resume_before is None and self.resume_after is None):
@@ -150,7 +152,7 @@ class ModuleStreamRegion:
     backward_anchor: object = None
     retain_backward_outputs: bool = False
     prioritize_backward: bool = False
-    cuda_graph: bool = False
+    cuda_graph: bool | str = False
 
 
 def _unsafe(node):

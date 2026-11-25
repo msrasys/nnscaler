@@ -147,6 +147,12 @@ Replay supports one first-order backward per forward; inference stays eager.
 Backend caches must register a `register_capture_context` factory when a cache
 hit would omit work required after parameter updates, such as weight quantization.
 
+`cuda_graph='forward'` captures only forward execution. Backward uses the retained
+slot-local autograd tape, allocating temporary gradients normally instead of
+reserving backward buffers for every live forward. This saves memory without
+adding recomputation. Selected backends must support retained, stateless backward
+execution; parameter versions are still checked at the public boundary.
+
 ## Cooperative weight gradients
 
 Cooperative operators can also be selected by the compiler:
