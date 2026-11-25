@@ -205,6 +205,24 @@ def test_direct_leaf_grads_preserve_partial_backward_and_tensor_hooks(hooked):
     assert not region.tasks
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_direct_grads_survive_caller_reads_after_zero_grad():
+    from nnscaler.runtime.stream import register_parameter_stream
+    w = torch.nn.Parameter(torch.randn(128, 128, device='cuda'))
+    register_parameter_stream(w, 'accumulator_test')
+    x = torch.randn(256, 128, device='cuda', requires_grad=True)
+    outputs, region = run([x], w, [], direct=True)
+    outputs[0].sum().backward()
+    expected = w.grad.cpu()
+    torch.cuda._sleep(50_000_000)
+    read = w.grad.clone()
+    w.grad = None
+    del outputs
+    with torch.cuda.stream(region.stream):
+        scratch = [torch.empty_like(w).fill_(float('nan')) for _ in range(32)]
+    torch.testing.assert_close(read.cpu(), expected)
+
+
 @pytest.mark.parametrize('kind', ['direct', 'legacy'])
 @pytest.mark.parametrize('recompute', [False, True])
 def test_fragment_gradients_publish_once_and_support_repeated_backward(kind, recompute):

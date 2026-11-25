@@ -135,6 +135,10 @@ after previous backwards finish, and synchronizes pipeline ranks before replay.
 For a custom optimizer loop, call
 `nnscaler.runtime.module_graph.prepare_module_graphs(model)` at that boundary.
 
+Adjacent graph regions on the same stream are coalesced when their input
+readiness and backward anchors match. This avoids separate forks and graph
+launches between independent sibling modules without moving their execution.
+
 Each live forward owns a native PyTorch graph pair and its captured state, so
 FIFO and other backward orders do not overwrite another forward's activations.
 Returned outputs and gradients have independent storage. `module_graph_stats(model)` reports

@@ -254,7 +254,9 @@ class WeightGradientAccumulator:
 
             def cleanup(region=self, task=task):
                 pending = region.tasks.pop(gid, None)
-                if pending is not None:
+                if pending is not None or task.direct:
+                    # Direct grads are not autograd edge tensors. Protect them
+                    # on the backward caller before it reads/resets .grad.
                     region._join_accumulation(task)
                 for hook in task.hooks:
                     hook.remove()
