@@ -9,7 +9,7 @@ from torch.fx.node import Target
 
 from nnscaler.flags import CompileFlag
 
-from . import pytree_utils, metadata
+from . import pytree_utils, metadata, staged_copy
 
 if TYPE_CHECKING:
     from .concrete_tracer import ConcreteTracer
@@ -88,7 +88,7 @@ class BaseTraceStrategy:
         def place(tensor):
             key = id(tensor)
             if key not in moved:
-                moved[key] = tensor.to(device).requires_grad_(tensor.requires_grad)
+                moved[key] = staged_copy.to_device(tensor, device).requires_grad_(tensor.requires_grad)
             return moved[key]
 
         return pytree_utils.tree_map_only(torch.Tensor, place, args)

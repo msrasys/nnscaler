@@ -36,6 +36,12 @@ class CompileFlag:
     trace_strategy = os.environ.get('TRACE_STRATEGY', default='cuda_run_cpu_offload')
     # Disable only the opt-in CPU fake-output cache; keep ordinary-op reuse.
     cache_cpu_fake_outputs = _to_bool('NNSCALER_CACHE_CPU_FAKE_OUTPUTS', True)
+    # Copy large dense tensors between CUDA and pageable host memory through pinned buffers
+    # while tracing; the driver's pageable path can be several times slower. 0 disables it.
+    trace_staged_copy = _to_bool('NNSCALER_TRACE_STAGED_COPY', True)
+    trace_staged_copy_min_mb = _to_int('NNSCALER_TRACE_STAGED_COPY_MIN_MB', default=4)
+    trace_staged_copy_chunk_mb = _to_int('NNSCALER_TRACE_STAGED_COPY_CHUNK_MB', default=128)
+    trace_staged_copy_threads = _to_int('NNSCALER_TRACE_STAGED_COPY_THREADS', default=16)
     # Maximum concurrent initial-weight shard writes during parsing. Use 1 for serial saves.
     attr_save_workers = _to_int('ATTR_SAVE_WORKERS', default=8)
     # reduce scatter adapter can reduce the communication cost, and improve the performance

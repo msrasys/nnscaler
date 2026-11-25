@@ -188,6 +188,13 @@ The `reuse_cache` tracing strategy releases its execution-only tensor cache
 after each trace, including failed traces, before initial weights are written.
 Recorded graph metadata and tensors referenced by the model are retained.
 
+While tracing, tensors of at least `NNSCALER_TRACE_STAGED_COPY_MIN_MB` (default 4)
+move between CUDA and pageable host memory through two pinned buffers of
+`NNSCALER_TRACE_STAGED_COPY_CHUNK_MB` (default 128), with host copies split over
+`NNSCALER_TRACE_STAGED_COPY_THREADS` (default 16) threads. Values, layout and the
+autograd relation match `Tensor.to`. Set `NNSCALER_TRACE_STAGED_COPY=0` to use
+`Tensor.to` for every transfer.
+
 ```python
 class BroadcastGenFilesStrategy(Enum):
     NONE = 'none'
