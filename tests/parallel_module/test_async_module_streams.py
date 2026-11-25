@@ -74,17 +74,20 @@ def after_async(module, metadata, inputs, kwargs, outputs):
 
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('workers', [1, 2])
-def test_after_submit_binds_backward_after_side_outputs(tmp_path, monkeypatch, workers):
+@pytest.mark.parametrize('split', [False, True])
+def test_after_submit_binds_backward_after_side_outputs(tmp_path, monkeypatch, workers, split):
     monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', SerialStreams)
     model = AsyncModel()
     reference = copy.deepcopy(model)
-    instance = f'async_after_{workers}'
-    rule = ModuleStreamRule('side', launch_after='*.submitted_sin', overlap_backward=True)
+    instance = f'async_after_{workers}_{split}'
+    rule = (ModuleStreamRule('side', launch_before='*.submitted_sin', split_before='down',
+                             resume_after='*.submitted_sin', overlap_backward=True)
+            if split else ModuleStreamRule('side', launch_after='*.submitted_sin', overlap_backward=True))
     parallelize(model, {'x': torch.randn(4, 8, requires_grad=True)}, 'dp',
                 ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
                 codegen_workers=workers, load_module=False, instance_name=instance)
     code = next(tmp_path.rglob('gencode0.py')).read_text()
-    assert code.index('_module_streams.submit(') < code.index('_module_streams.fork(')
+    assert (code.index('_module_streams.submit(') < code.index('_module_streams.fork(')) != split
     assert code.index('_module_streams.fork(') < code.index('_module_streams.after_backward(')
     assert code.index('_module_streams.after_backward(') < code.index('.complete(')
     assert 'track_stream_inputs = False' in code

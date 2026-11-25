@@ -127,6 +127,23 @@ and explicit scheduler streams keep the conservative executor protection.
 
 ## Cooperative weight gradients
 
+Cooperative operators can also be selected by the compiler:
+
+```python
+ModuleStreamRule(
+    '*.expert.compute', operators='*.expert_ffn',
+    stream='expert_dw', weight_backward_only=True,
+)
+```
+
+This keeps forward placement and checkpointing intact, wraps matching operators
+in a weight-gradient scope, and establishes the parameter gradient stream before
+reducer hooks are built. Thus parameter publication does not insert a dW wait
+onto the unrelated dX path. The selected backend must bind every trainable
+parameter through `prepare_weight_backward`; unsupported operators fail explicitly.
+Recomputed calls use the original parameter values and do not publish gradients
+from the discarded replay graph. Weight-only rules cannot also move forward work.
+
 `WeightGradientAccumulator(stream, parameters)` is a context manager scoped to
 one forward invocation. A cooperative backend binds parameters using
 `prepare_weight_backward(parameters)` before its autograd `Function.apply` and

@@ -11,7 +11,7 @@ from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import Block
 from nnscaler.flags import CompileFlag
 from nnscaler.graph.schedule.checkpoint_readiness import plan_checkpoint_readiness
-from nnscaler.graph.schedule.module_streams import plan_module_streams
+from nnscaler.graph.schedule.module_streams import plan_module_streams, weight_gradient_stream
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.ir.cten import IRTensor
 
@@ -26,8 +26,9 @@ def _record_parameter_streams(codegen, nodes, regions):
             origins.update(codegen.module_parameter_origins.get(value, ()))
         multiref = node.name == 'multiref' and node.kwargs.get('clone_level', 0) == 0
         if not multiref:
+            gradient_stream = weight_gradient_stream(node, CompileFlag.module_streams)
             for name in origins:
-                codegen.module_parameter_uses.setdefault(name, set()).add(streams.get(node))
+                codegen.module_parameter_uses.setdefault(name, set()).add(gradient_stream or streams.get(node))
         if (
             multiref
             or isinstance(node, IRAdapter)
@@ -87,6 +88,11 @@ def emit_module_streams(codegen, segment, runtime_devid):
         lifetime_nodes.insert(lifetime_nodes.index(after_nodes[-1]) + 1, anchor)
         finish_after[after_regions[-1].key] = anchor
         pending_names[anchor] = f'_async_operator_{index}'
+    for region in regions.values():
+        if region.overlap_backward and region.backward_anchor in deferred:
+            # A before-anchor chunk can be consumed by an after-anchor suffix
+            # before binding the control edge. Keep its graph output explicitly.
+            region.retain_backward_outputs = True
     lifetime = LifeCycle(lifetime_nodes, segment.inputs(), segment.outputs())
     starts = {region.nodes[0]: region for region in regions.values()}
     owners = {node: region for region in regions.values() for node in region.nodes}
@@ -227,7 +233,7 @@ def emit_module_streams(codegen, segment, runtime_devid):
         if node in starts:
             flush()
             region = starts[node]
-            if region.retain_backward_outputs:
+            if region.prioritize_backward:
                 body.append(
                     f'_{region.key}_backward_boundaries = '
                     f'nnscaler.runtime.backward.backward_boundaries({names(region.inputs)})'
@@ -246,11 +252,12 @@ def emit_module_streams(codegen, segment, runtime_devid):
                 body.append(f'_module_streams.publish({names(producer)}, stream={region.stream!r})')
             if region.retain_backward_outputs:
                 dependencies = tuple(obj for obj in region.outputs if obj.requires_grad)
-                body.append(
-                    f'nnscaler.runtime.backward.prioritize_backward('
-                    f'{names(dependencies)}, _{region.key}_backward_boundaries)'
-                )
-                body.append(f'del _{region.key}_backward_boundaries')
+                if region.prioritize_backward:
+                    body.append(
+                        f'nnscaler.runtime.backward.prioritize_backward('
+                        f'{names(dependencies)}, _{region.key}_backward_boundaries)'
+                    )
+                    body.append(f'del _{region.key}_backward_boundaries')
                 body.append(f'_{region.key}_backward_outputs = {names(dependencies)}')
             if region.key in finish_after:
                 emit_anchor(finish_after[region.key], prepared=True)

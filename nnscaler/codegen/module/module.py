@@ -33,7 +33,7 @@ from nnscaler.codegen.syntax.blocks import ClassBlock, ForBlock, FunctionBlock, 
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
 from nnscaler.codegen.lifecycle import LifeCycle
-from nnscaler.graph.schedule.module_streams import checkpoint_stream
+from nnscaler.graph.schedule.module_streams import checkpoint_stream, weight_gradient_stream
 from nnscaler.codegen.module.stream import emit_module_streams
 from nnscaler.runtime.async_op import registered_async_ops
 
@@ -1167,6 +1167,20 @@ class ModuleCodeGen(FuncEmission):
                     node.kwargs['clone_level'] = 1
 
                 code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=self.plan_ndevs, runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
+                weight_stream = weight_gradient_stream(node, CompileFlag.module_streams)
+                if weight_stream:
+                    parameters = list(dict.fromkeys(
+                        self.tensor_name(t, prefix_attr='self.') for t in node.iobjs()
+                        if isinstance(t, IRTensor) and t.is_param() and t.requires_grad
+                    ))
+                    if parameters:
+                        self.execplan.mark_module_streams()
+                        with Block(
+                            f'with nnscaler.WeightGradientAccumulator({weight_stream!r}, '
+                            f'({", ".join(parameters)}, )):'
+                        ) as block:
+                            block.insert_body(code)
+                        code = block.code
                 if not param_inputs or CompileFlag.use_zero <= 1:
                     node_code += code
                 else:

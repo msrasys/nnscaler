@@ -42,7 +42,8 @@ class ModuleStreamRule:
     recompute_ready_on: str | None = None
     backward_on: str | None = None
     operators: str | tuple[str, ...] | None = None
-    _codegen_version: int = field(default_factory=lambda: 24, init=False, repr=False)
+    weight_backward_only: bool = False
+    _codegen_version: int = field(default_factory=lambda: 25, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):
@@ -62,7 +63,7 @@ class ModuleStreamRule:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f'{name} must be a nonempty string or None')
-        for name in ('recompute_only', 'overlap_backward'):
+        for name in ('recompute_only', 'overlap_backward', 'weight_backward_only'):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f'{name} must be a boolean')
         if (self.launch_before and self.launch_after) or (self.resume_before and self.resume_after):
@@ -82,6 +83,12 @@ class ModuleStreamRule:
                 raise ValueError('Operator selection cannot split modules or select recompute regions')
         if self.recompute_ready_on is not None and not self.recompute_only:
             raise ValueError('recompute_ready_on requires a recompute_only rule')
+        if self.weight_backward_only and (
+            not self.operators or self.recompute_only or self.overlap_backward
+            or self.launch_before or self.launch_after or self.split_before
+            or self.resume_before or self.resume_after or self.backward_on
+        ):
+            raise ValueError('Weight-backward rules require cooperative operators without forward placement')
         if self.recompute_only and (
             self.launch_before
             or self.launch_after
@@ -139,6 +146,7 @@ class ModuleStreamRegion:
     overlap_backward: bool = False
     backward_anchor: object = None
     retain_backward_outputs: bool = False
+    prioritize_backward: bool = False
 
 
 def _unsafe(node):
@@ -220,7 +228,7 @@ def plan_module_streams(nodes, outputs, rules):
     regions, placements, selected = {}, defaultdict(list), set()
 
     for rule in normalize_module_stream_rules(rules):
-        if rule.recompute_only:
+        if rule.recompute_only or rule.weight_backward_only:
             continue
         invocations = defaultdict(list)
         scopes = {}
@@ -387,6 +395,7 @@ def plan_module_streams(nodes, outputs, rules):
                     overlap_backward=rule.overlap_backward,
                     backward_anchor=backward_anchor,
                     retain_backward_outputs=backward_override is not None,
+                    prioritize_backward=backward_override is not None,
                 )
                 regions[key] = region
                 placements[destination].append(region)
@@ -452,6 +461,19 @@ def plan_module_streams(nodes, outputs, rules):
                     joins[target].append(region.key)
                     break
     return ordered, regions, dict(joins)
+
+
+def weight_gradient_stream(node, rules):
+    """Select a cooperative operator's dW stream without moving forward work."""
+    streams = {
+        rule.stream for rule in rules
+        if rule.weight_backward_only
+        and any(fnmatchcase(path, rule.module) for path in (node.module_stack or {}))
+        and any(fnmatchcase(node.signature, pattern) for pattern in rule.operators)
+    }
+    if len(streams) > 1:
+        raise ValueError('Conflicting weight-gradient streams for an operator')
+    return next(iter(streams), None)
 
 
 def checkpoint_stream(nodes, rules):
