@@ -41,6 +41,15 @@ then attaches the operator's autograd behavior without submitting it again.
 It must use the supplied inputs, which can include backward-ordering identities.
 Differentiable preparation, such as selecting routing probabilities, may run
 during submission; the transport's controlled input edge is bound at completion.
+Such preparation can change autograd's ready-queue order. Its binding can use
+`runtime.backward.prioritize_backward` with the original input boundaries to
+keep the caller's backward submission ahead of the side branch.
+
+By default NNScaler also guards submitted inputs and payloads until the join.
+A backend that already records **all** input/output storage on its private
+streams and the caller, and retains opaque owners, may return
+`AsyncResult(..., manages_lifetime=True)` to avoid redundant traversal. This is
+an explicit backend ownership contract; other operators keep the default guard.
 
 For registered async operators, after-launch rules emit submission first, then
 the independent module, then completion. The compiler keeps inputs alive across

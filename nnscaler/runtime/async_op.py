@@ -21,6 +21,9 @@ _operators = set()
 class AsyncResult:
     value: Any
     wait: Callable[[], None]
+    # Opt in only when the backend already protects every input/output storage
+    # on both its private streams and the caller, including opaque owners.
+    manages_lifetime: bool = False
 
 
 def register_async_op(operator, *, submit, complete):
@@ -55,6 +58,8 @@ class PendingOp:
         result = submit(*args, **kwargs)
         if not isinstance(result, AsyncResult) or not callable(result.wait):
             raise TypeError('Async submission must return AsyncResult(value, wait)')
+        if type(result.manages_lifetime) is not bool:
+            raise TypeError('manages_lifetime must be a boolean')
         self._result = result
 
     def _wait(self):
@@ -76,7 +81,8 @@ class PendingOp:
         if self._closed:
             return
         self._wait()
-        with input_stream_lifetime((self._inputs, self._result.value), True):
-            pass
+        if not self._result.manages_lifetime:
+            with input_stream_lifetime((self._inputs, self._result.value), True):
+                pass
         self._closed = True
         self._inputs = self._result = self._complete = None
