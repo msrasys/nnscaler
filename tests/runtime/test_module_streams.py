@@ -41,6 +41,32 @@ def test_after_launch_does_not_wait_for_anchor_completion(prepared):
     torch.testing.assert_close(y, torch.full_like(y, 4))
 
 
+def test_prepared_inputs_do_not_advance_compute_before_anchor_readiness():
+    x = torch.ones(1024, device='cuda')
+    output = torch.empty_like(x)
+    with ModuleStreams() as streams:
+        with streams.fork('warm', 'test_prepared_ready', (x,)):
+            output.copy_(x).add_(3)
+    torch.cuda.synchronize()
+    ready, anchor_done, side_done = (torch.cuda.Event() for _ in range(3))
+    with ModuleStreams() as streams:
+        with streams.prepare('side', 'test_prepared_ready', (x,)):
+            output.copy_(x)
+        # The independent input copy is ready before the communication input.
+        torch.cuda._sleep(200_000_000)
+        ready.record()
+        streams.capture('side')
+        torch.cuda._sleep(500_000_000)
+        anchor_done.record()
+        with streams.fork('side', 'test_prepared_ready', (x,)):
+            output.add_(3)
+            side_done.record()
+        side_done.synchronize()
+        assert ready.query(), 'prepared computation ran before the anchor input was ready'
+        assert not anchor_done.query(), 'prepared computation waited for the anchor result'
+    torch.testing.assert_close(output, torch.full_like(output, 4))
+
+
 @pytest.mark.parametrize('recompute', [False, True])
 def test_module_stream_forward_backward_matches_serial(recompute):
     torch.manual_seed(1107)

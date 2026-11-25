@@ -111,13 +111,14 @@ def emit_module_streams(codegen, segment, runtime_devid):
     owners = {node: region for region in regions.values() for node in region.nodes}
     captures, backwards = defaultdict(list), defaultdict(list)
     preparation_points = plan_module_graph_preparation(nodes, regions)
+    preparations_at = defaultdict(list)
     preparations = {}
     for region in regions.values():
         if region.ready_before is not None:
-            point = preparation_points.get(region.key, region.ready_before)
-            captures[point].append(region.key)
+            captures[region.ready_before].append(region.key)
             if region.key in preparation_points:
                 preparations[region.key] = f'_{region.key}_prepared_graph'
+                preparations_at[preparation_points[region.key]].append(region.key)
         if region.overlap_backward:
             backwards[region.backward_anchor].append(region)
     # A checkpoint must join before entering, even if only an internal node
@@ -251,13 +252,11 @@ def emit_module_streams(codegen, segment, runtime_devid):
     for node in nodes:
         if node in owners and node not in starts:
             continue
-        if node in captures or node in waits:
+        if node in captures or node in waits or node in preparations_at:
             flush()
             body.extend(f'_module_streams.capture({key!r})' for key in captures.get(node, ()))
             body.extend(f'_module_streams.join({key!r})' for key in waits.get(node, ()))
-            for key in captures.get(node, ()):
-                if key not in preparations:
-                    continue
+            for key in preparations_at.get(node, ()):
                 region = regions[key]
                 preserve = ', preserve_accumulators=True' if region.overlap_backward else ''
                 with Block(f'with _module_streams.prepare({key!r}, {region.stream!r}, '

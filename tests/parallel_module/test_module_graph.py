@@ -59,7 +59,8 @@ def test_graph_preparation_moves_before_independent_main_work(tmp_path):
     parallelize(EarlyPreparationModel(), {'x': torch.randn(4, 8, requires_grad=True)}, pas_dp,
                 ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path, load_module=False)
     source = next(tmp_path.rglob('gencode0.py')).read_text()
-    assert source.index('.prepare(') < source.index('torch.tanh(') < source.index('.submit(')
+    assert source.index('.prepare(') < source.index('torch.tanh(') < source.index('.capture(')
+    assert source.index('.capture(') < source.index('.submit(')
     assert source.index('.submit(') < source.index('.fork(') < source.index('run_module_graph(')
 
 

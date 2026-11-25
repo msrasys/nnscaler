@@ -159,8 +159,9 @@ execution; parameter versions are still checked at the public boundary.
 For after-launch regions whose inputs are available before the anchor, the
 compiler stages input copies, output allocation and stream bookkeeping as soon
 as those inputs are ready, without crossing mutations or checkpoint boundaries.
-Graph replay and its autograd edges are created after submission,
-so preparation does not consume the communication's compute window.
+Graph replay and its autograd edges are created after submission. Computation
+still waits for the anchor's input readiness, even when the graph's input copy
+finishes earlier, so it does not occupy SMs before communication can start.
 
 ## Cooperative weight gradients
 

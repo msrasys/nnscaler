@@ -176,13 +176,14 @@ class ModuleStreams:
         stream = _get_module_stream(device, name)
         self.region_streams[key] = stream
         self.streams.add(stream)
-        if key in self.ready:
-            stream.wait_event(self.ready[key])
+        ready = self.ready.get(key)
+        if ready is not None:
+            stream.wait_event(ready)
         else:
             stream.wait_stream(self.caller)
         with torch.cuda.stream(stream), input_stream_lifetime(inputs, True) as owners:
             self.owners.extend(owners)
-            self.prepared[key] = (name, tuple(inputs), preserve_accumulators, accumulator_holds)
+            self.prepared[key] = (name, tuple(inputs), preserve_accumulators, accumulator_holds, ready)
             yield
 
     @contextmanager
@@ -190,12 +191,17 @@ class ModuleStreams:
         context = (torch.cuda.stream(self.region_streams[key]) if key in self.prepared else
                    self.prepare(key, name, inputs, preserve_accumulators=preserve_accumulators))
         with context:
-            prepared_name, prepared_inputs, preserve, accumulator_holds = self.prepared.pop(key)
+            prepared_name, prepared_inputs, preserve, accumulator_holds, prepared_ready = self.prepared.pop(key)
             if (name != prepared_name or preserve != preserve_accumulators
                     or len(inputs) != len(prepared_inputs)
                     or any(a is not b for a, b in zip(inputs, prepared_inputs))):
                 raise ValueError('Prepared module stream inputs must match its fork')
             stream = self.region_streams[key]
+            ready = self.ready.get(key)
+            if ready is not None and ready is not prepared_ready:
+                # Input copies may precede the anchor's input readiness. Keep
+                # model computation aligned with that later launch boundary.
+                stream.wait_event(ready)
             try:
                 yield
             finally:
