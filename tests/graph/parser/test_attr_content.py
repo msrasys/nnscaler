@@ -405,3 +405,86 @@ def test_load_attr_content_rejects_missing_tensor(tmp_path, with_index):
     with pytest.raises(RuntimeError, match='tensor ID'):
         module.load_attr_content(str(stem))
     assert torch.equal(module.weight_10, torch.zeros(2))
+
+
+def _frame_with_weights(count=3):
+    frame = Frame()
+    tensors = [IRFullTensor((4,), name=f'w{idx}') for idx in range(count)]
+    values = [torch.arange(4) + idx * 4 for idx in range(count)]
+    for idx, (tensor, value) in enumerate(zip(tensors, values)):
+        frame.add_attr(tensor, value, f'w{idx}')
+    return frame, tensors, values
+
+
+def test_background_save_matches_foreground_and_joins_on_exit(tmp_path: Path, monkeypatch):
+    frame, tensors, values = _frame_with_weights()
+    release = Event()
+    original = frame_module._atomic_torch_save
+
+    def slow_save(content, path):
+        assert release.wait(10)
+        original(content, path)
+
+    monkeypatch.setattr(frame_module, '_atomic_torch_save', slow_save)
+    file_stem = tmp_path / FxModuleParser.ATTR_CONTENT_FILE_STEM
+    with frame_module.background_attr_saves():
+        assert frame.save_attr_content(file_stem, params_per_file=5, max_workers=2) is None
+        # The call returns before any shard or index is written.
+        assert not any(tmp_path.iterdir())
+        release.set()
+    assert torch.load(f'{file_stem}.index', weights_only=True) == {t.tid: i for i, t in enumerate(tensors)}
+    for idx, (tensor, value) in enumerate(zip(tensors, values)):
+        assert torch.equal(torch.load(f'{file_stem}.{idx}', weights_only=True)[tensor.tid], value)
+    assert {path.name for path in tmp_path.iterdir()} == {
+        'fullmodel.pt.0', 'fullmodel.pt.1', 'fullmodel.pt.2', 'fullmodel.pt.index',
+    }
+
+
+def test_background_save_captures_values_and_chunks_at_request(tmp_path: Path, monkeypatch):
+    frame, tensors, values = _frame_with_weights(2)
+    release = Event()
+    original = frame_module._atomic_torch_save
+    monkeypatch.setattr(frame_module, '_atomic_torch_save',
+                        lambda content, path: (release.wait(10), original(content, path)))
+    file_stem = tmp_path / FxModuleParser.ATTR_CONTENT_FILE_STEM
+    with frame_module.background_attr_saves():
+        frame.save_attr_content(file_stem, params_per_file=5, max_workers=1)
+        extra = IRFullTensor((4,), name='late')
+        frame.add_attr(extra, torch.zeros(4), 'late')
+        release.set()
+    assert torch.load(f'{file_stem}.index', weights_only=True) == {t.tid: i for i, t in enumerate(tensors)}
+
+
+def test_background_save_error_is_raised_on_exit(tmp_path: Path, monkeypatch):
+    frame, _, _ = _frame_with_weights()
+
+    def failing_save(content, path):
+        raise OSError('disk full')
+
+    monkeypatch.setattr(frame_module, '_atomic_torch_save', failing_save)
+    with pytest.raises(RuntimeError, match='Background attribute save failed') as info:
+        with frame_module.background_attr_saves():
+            frame.save_attr_content(tmp_path / 'fullmodel.pt', params_per_file=5, max_workers=2)
+    assert isinstance(info.value.__cause__, OSError)
+    assert not (tmp_path / 'fullmodel.pt.index').exists()
+
+
+def test_background_save_body_error_wins_and_writes_are_joined(tmp_path: Path, monkeypatch):
+    frame, _, _ = _frame_with_weights()
+    finished = []
+    original = frame_module._atomic_torch_save
+    monkeypatch.setattr(frame_module, '_atomic_torch_save',
+                        lambda content, path: (original(content, path), finished.append(path.name)))
+    with pytest.raises(ValueError, match='policy failed'):
+        with frame_module.background_attr_saves():
+            frame.save_attr_content(tmp_path / 'fullmodel.pt', params_per_file=5, max_workers=2)
+            raise ValueError('policy failed')
+    assert sorted(finished) == ['fullmodel.pt.0', 'fullmodel.pt.1', 'fullmodel.pt.2', 'fullmodel.pt.index']
+
+
+def test_save_outside_background_context_is_synchronous(tmp_path: Path):
+    frame, _, _ = _frame_with_weights()
+    with frame_module.background_attr_saves():
+        pass
+    frame.save_attr_content(tmp_path / 'fullmodel.pt', params_per_file=5, max_workers=2)
+    assert (tmp_path / 'fullmodel.pt.index').exists()

@@ -246,3 +246,82 @@ def test_io_errors_do_not_retry_with_dill(monkeypatch):
     monkeypatch.setattr(dill, 'dump', unexpected_fallback)
     with pytest.raises(OSError, match='disk full'):
         dump_codegen_payload({'data': b'x' * 100_000}, BrokenStream())
+
+
+def _make_closures():
+    # One local function, many closures: what `_reshape_anno` produces per node.
+    def factory(first, second, name):
+        def modifier(kwargs):
+            return first, second, name
+        return modifier
+    states = [(('a', 'b'), ('b', 'a'), 'shape'), (('a', 'b'), ('b', 'a'), 'shape'),
+              (('a', None), ('a',), 'size'), (1, 2, 'x'), (True, 2, 'x'), (1.0, 2, 'x'),
+              (0.0, 2, 'x'), (-0.0, 2, 'x'), ((1, 2), frozenset({3}), 'x'), ((1, True), 2, 'x')]
+    return [factory(*state) for state in states], states
+
+
+def test_callable_dump_cache_is_exact():
+    from nnscaler.codegen import serialization as S
+    import dill, io, pickle
+
+    closures, states = _make_closures()
+    pickler = S._CodegenPickler(io.BytesIO(), {})
+    reduced = [pickler.reducer_override(fn) for fn in closures]
+    for fn, (loader, (data,)) in zip(closures, reduced):
+        assert loader is S._load_dill_callable
+        # Cached bytes equal a fresh dump of this very function.
+        assert data == dill.dumps(fn, protocol=pickle.HIGHEST_PROTOCOL)
+    # Equal state shares one dump; 1/True/1.0 and 0.0/-0.0 stay distinct.
+    assert reduced[0][1][0] is reduced[1][1][0]
+    assert len({id(r[1][0]) for r in reduced}) == len(states) - 1
+    for fn, (loader, (data,)) in zip(closures, reduced):
+        loaded = loader(data)
+        assert loaded({}) == fn({}) and [type(v) for v in loaded({})] == [type(v) for v in fn({})]
+
+
+def test_callable_dump_cache_skips_unkeyable_state():
+    from nnscaler.codegen import serialization as S
+
+    def factory(value):
+        def modifier():
+            return value
+        return modifier
+    fn = factory(object())  # not copyable: the pickler refuses it as before
+    import io, pickle
+    with pytest.raises(pickle.PicklingError):
+        S._CodegenPickler(io.BytesIO(), {}).reducer_override(fn)
+    assert S._callable_key(factory([object()])) is None
+
+
+def test_graph_dumps_loads_with_dill_and_falls_back(monkeypatch):
+    import dill, io
+    from nnscaler.codegen import serialization as S
+    from nnscaler.graph.graph import IRGraph
+
+    graph = IRGraph([], [], [], 'empty')
+    data = graph.dumps()
+    ids, loaded = dill.load(io.BytesIO(data))
+    assert isinstance(loaded, IRGraph) and loaded.name == 'empty'
+    calls = []
+    monkeypatch.setattr(S, 'try_dumps_graph', lambda obj, g: calls.append(g) or None)
+    fallback = graph.dumps()
+    assert calls == [graph]
+    assert isinstance(dill.load(io.BytesIO(fallback))[1], IRGraph)
+
+
+def test_callable_dump_cache_on_reshape_modifiers():
+    from nnscaler.codegen import serialization as S
+    from nnscaler.graph.function.function import _reshape_anno
+    import dill, io, pickle
+
+    shapes = [([4, 6], [24], 'shape'), ([4, 6], [24], 'shape'), ([2, 3, 4], [6, 4], 'shape'), ([4, 6], [24], 'size')]
+    modifiers = []
+    for in_shape, ou_shape, name in shapes:
+        _, rules = _reshape_anno(in_shape, ou_shape, name)
+        modifiers += [rule.modifier() for rule in rules if rule.modifier() is not None]
+    assert modifiers and all(fn.__qualname__ == '_reshape_anno.<locals>.modifier' for fn in modifiers)
+    pickler = S._CodegenPickler(io.BytesIO(), {})
+    for fn in modifiers:
+        loader, (data,) = pickler.reducer_override(fn)
+        assert data == dill.dumps(fn, protocol=pickle.HIGHEST_PROTOCOL)
+    assert len(pickler._callable_dumps) < len(modifiers)

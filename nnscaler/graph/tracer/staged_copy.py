@@ -17,6 +17,8 @@ dtype and autograd relation (a non-leaf when the source requires grad in grad
 mode). Anything else falls back to ``tensor.to(device)``.
 """
 
+import ctypes
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -28,6 +30,34 @@ from nnscaler.flags import CompileFlag
 
 
 _PARALLEL_HOST_COPY_BYTES = 4 << 20
+_MADV_HUGEPAGE = 14
+_HUGE_PAGE_BYTES = 2 << 20
+_madvise = None
+
+
+def _advise_huge_pages(tensor: torch.Tensor) -> None:
+    """Best effort: back a fresh host buffer with transparent huge pages.
+
+    First-touch faults dominate filling fresh pageable memory; 2 MiB pages cut
+    them ~512x (about 2x copy throughput with THP in `madvise` mode). Memory
+    use is unchanged: only whole aligned 2 MiB ranges inside the mapping qualify.
+    """
+    global _madvise
+    if not CompileFlag.trace_staged_copy_huge_pages or not sys.platform.startswith('linux'):
+        return
+    if _madvise is None:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+            _madvise = libc.madvise
+        except (OSError, AttributeError):
+            _madvise = False
+    if not _madvise:
+        return
+    start = (tensor.data_ptr() + _HUGE_PAGE_BYTES - 1) & ~(_HUGE_PAGE_BYTES - 1)
+    end = (tensor.data_ptr() + tensor.untyped_storage().nbytes()) & ~(_HUGE_PAGE_BYTES - 1)
+    if end > start:
+        _madvise(start, end - start, _MADV_HUGEPAGE)  # failure only loses the speedup
 _MIN_BYTES_PER_COPY_THREAD = 1 << 20
 
 
@@ -62,6 +92,7 @@ class _Stager:
 
     def to_host(self, src: torch.Tensor) -> torch.Tensor:
         out = torch.empty(src.shape, dtype=src.dtype)
+        _advise_huge_pages(out)
         src_bytes = src.detach().reshape(-1).view(torch.uint8)
         dst_bytes = out.reshape(-1).view(torch.uint8)
         total = src_bytes.numel()

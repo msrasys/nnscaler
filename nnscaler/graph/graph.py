@@ -1145,9 +1145,14 @@ class IRGraph(IRSegment):
             def __exit__(self, exc_type, exc_value, traceback):
                 IRObject.__getstate__ = lambda self: self.__dict__.copy()
 
+        from nnscaler.codegen.serialization import try_dumps_graph
+
         with PicklingContextSave():
             save = (IDGenerator().get_states(), self)
-            return dill.dumps(save)
+            # The C pickler is several times faster than dill's pure-Python
+            # pickler on large graphs; `load` reads both through dill.
+            data = try_dumps_graph(save, self)
+            return data if data is not None else dill.dumps(save)
 
     def dump(self, filename: str) -> None:
         """

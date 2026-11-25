@@ -11,7 +11,7 @@ import itertools
 import sys
 import importlib
 from dataclasses import dataclass, asdict, field, replace
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import logging
 import copy
 import os
@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import torch.distributed
@@ -41,6 +42,7 @@ from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.wrapnn import convert_to_wrapnn, wrapnn
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph.parser import FxModuleParser
+from nnscaler.graph.parser.frame import background_attr_saves
 from nnscaler.graph.schedule.predefined import PredefinedSched
 from nnscaler.graph.schedule.schedplan import SchedulePlan
 
@@ -1110,9 +1112,12 @@ def _remove_legacy_attr_meta_files(outdir: Path) -> None:
 
 
 def _promote_codegen_outputs(staging_dir: Path, outdir: Path, runtime_ngpus: int) -> None:
-    for rank in range(runtime_ngpus):
-        filename = _GENCODE_FILE_TEMPLATE.format(rank)
-        os.replace(staging_dir / filename, outdir / filename)
+    filenames = [_GENCODE_FILE_TEMPLATE.format(rank) for rank in range(runtime_ngpus)]
+    # Each rename is a metadata round trip on shared filesystems (~8 ms on the PVC);
+    # issue them concurrently. The attribute metadata is still published last.
+    with ThreadPoolExecutor(max_workers=min(32, max(1, len(filenames)))) as executor:
+        for future in [executor.submit(os.replace, staging_dir / f, outdir / f) for f in filenames]:
+            future.result()
     os.replace(
         staging_dir / ParallelModule.ATTR_META_FILE,
         outdir / ParallelModule.ATTR_META_FILE,
@@ -1540,7 +1545,10 @@ def parallelize(
             if not reusable:
                 config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
                 ComputeConfig.safe_dump_to_file(compute_config, config_file)  # always refresh compute config
-                with _compile_flags(compute_config):
+                # Initial weights are written while partitioning and codegen run;
+                # the context joins the writes before generation is reported done.
+                with _compile_flags(compute_config), (
+                        background_attr_saves() if CompileFlag.async_attr_save else nullcontext()):
                     regen_status = _gencode(
                         module_or_module_class,
                         dummy_forward_args,

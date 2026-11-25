@@ -4,6 +4,7 @@
 """Subprocess entry point for multi-process per-rank code generation."""
 
 import argparse
+import gc
 import io
 import logging
 from pathlib import Path
@@ -25,8 +26,18 @@ def _restore_compile_flags(flags: dict[str, object]) -> None:
 
 def generate_rank_range(payload_file: Path, outdir: Path, rank_start: int, rank_end: int) -> None:
     started_at = time.monotonic()
-    with payload_file.open('rb') as payload_stream:
-        payload = load_codegen_payload(payload_stream)
+    # Unpickling builds the whole IR graph; with collection enabled the
+    # collector repeatedly traverses it (~3x slower load). The payload lives
+    # until the worker exits, so freeze it out of later collections.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with payload_file.open('rb') as payload_stream:
+            payload = load_codegen_payload(payload_stream)
+    finally:
+        gc.freeze()
+        if gc_was_enabled:
+            gc.enable()
     logger.info('Loaded codegen payload in %.2f seconds', time.monotonic() - started_at)
 
     _restore_compile_flags(payload['compile_flags'])

@@ -978,6 +978,12 @@ fails, the error propagates after active writers finish, temporary files are
 cleaned up, and completed shards may remain without an index. Logs report
 the writer count, each shard's save duration, and the overall save duration.
 
+`parallelize` writes these files in the background while partitioning, adapter
+generation and code generation run, and waits for them before it returns, so a
+write error still fails code generation. The parser captures the tensors and
+the file grouping when it requests the save; the tensors stay alive until the
+write finishes. Set `NNSCALER_ASYNC_ATTR_SAVE=0` to write them in the parser.
+
 ### Debug Config
 
 ``` python

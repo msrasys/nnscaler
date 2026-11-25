@@ -121,10 +121,56 @@ def _can_copy_closure_cell(function, name: str, value: Any) -> bool:
     )
 
 
+_EMPTY_CELL = object()
+
+
+def _exact_key(value: Any) -> Any:
+    """A hashable key equal only for values dill serializes identically.
+
+    Tags every value with its type (1, 1.0 and True compare equal) and spells
+    floats with repr (-0.0 == 0.0). Only state accepted by the copy checks
+    reaches this: immutable scalars, tuples/frozensets of them, read-only lists
+    of strings, modules, importable functions and types (by identity).
+    """
+    kind = type(value)
+    if kind in (list, tuple):
+        return kind, tuple(_exact_key(item) for item in value)
+    if kind is frozenset:
+        return kind, frozenset(_exact_key(item) for item in value)
+    if kind in (float, complex):
+        return kind, repr(value)
+    if kind in (type(None), bool, int, str, bytes):
+        return kind, value
+    if isinstance(value, (types.ModuleType, types.FunctionType, type)):
+        return kind, id(value)
+    raise TypeError(f'no exact key for {kind.__name__}')
+
+
+def _callable_key(obj: types.FunctionType) -> Optional[tuple]:
+    """Key of everything dill writes for a function, or None if not exact."""
+    try:
+        cells = []
+        for cell in obj.__closure__ or ():
+            try:
+                cells.append(_exact_key(cell.cell_contents))
+            except ValueError:  # empty cell
+                cells.append(_EMPTY_CELL)
+        return (
+            id(obj.__code__), id(obj.__globals__), obj.__module__, obj.__name__, obj.__qualname__,
+            _exact_key(obj.__doc__), tuple(cells),
+            _exact_key(tuple(obj.__defaults__ or ())),
+            _exact_key(tuple((obj.__kwdefaults__ or {}).items())),
+            _exact_key(tuple(obj.__dict__.items())),
+            _exact_key(tuple(getattr(obj, '__annotations__', {}).items())),
+        )
+    except TypeError:
+        return None
+
+
 class _CodegenPickler(pickle.Pickler):
     """Use C pickle for the graph and dill only for non-importable functions."""
 
-    def __init__(self, stream: BinaryIO, payload: dict[str, Any]):
+    def __init__(self, stream: BinaryIO, payload: dict[str, Any], graph: Any = None):
         super().__init__(stream, protocol=pickle.HIGHEST_PROTOCOL)
         from nnscaler.graph.parser.register import CustomizedOps
 
@@ -133,6 +179,11 @@ class _CodegenPickler(pickle.Pickler):
         self._factory_fallbacks = {}
         self._registered_factories = {}
         self._closure_owners = {}
+        # Many graph nodes carry distinct closures of one local function with
+        # equal state (e.g. 6k `_reshape_anno` modifiers, 5 distinct dumps).
+        # Reuse their dill bytes; the entry keeps the code and globals alive
+        # so their ids in the key stay unique.
+        self._callable_dumps = {}
         for signature, factory in CustomizedOps.kOpMap.items():
             module_name = _registered_op_module(CustomizedOps.kOpRuntime.get(signature))
             if module_name is not None:
@@ -142,8 +193,9 @@ class _CodegenPickler(pickle.Pickler):
 
         # graph.ckp recreates local factory functions through dill. Their
         # identities differ from kOpMap even though their signatures match.
-        module_codegen = payload.get('module_codegen')
-        graph = getattr(getattr(module_codegen, 'execplan', None), 'graph', None)
+        if graph is None:
+            module_codegen = payload.get('module_codegen')
+            graph = getattr(getattr(module_codegen, 'execplan', None), 'graph', None)
         if graph is not None:
             for node in graph.nodes(flatten=True):
                 factory = getattr(node, '_create_fn', ())
@@ -178,8 +230,32 @@ class _CodegenPickler(pickle.Pickler):
                 state = (*(obj.__defaults__ or ()), *(obj.__kwdefaults__ or {}).values(), *obj.__dict__.values())
                 if not all(_can_copy_callable_state(value) for value in state):
                     raise pickle.PicklingError('codegen callable has mutable defaults or attributes')
-                return _load_dill_callable, (dill.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL),)
+                key = _callable_key(obj)
+                if key is None:
+                    return _load_dill_callable, (dill.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL),)
+                entry = self._callable_dumps.get(key)
+                if entry is None:
+                    entry = self._callable_dumps[key] = (
+                        dill.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL), obj.__code__, obj.__globals__)
+                return _load_dill_callable, (entry[0],)
         return NotImplemented
+
+
+def try_dumps_graph(obj: Any, graph: Any) -> Optional[bytes]:
+    """Pickle `obj` (which contains `graph`) with the C pickler, or return None.
+
+    The result loads with `dill.load`: graph nodes and tensors pickle as with dill,
+    and only non-importable functions are embedded as dill bytes. Callers fall
+    back to `dill.dumps` when this returns None.
+    """
+    stream = io.BytesIO()
+    with codegen_pickle_recursion_limit():
+        try:
+            _CodegenPickler(stream, {}, graph=graph).dump(obj)
+        except (pickle.PicklingError, AttributeError, TypeError, RecursionError) as exc:
+            _logger.info('Fast graph serialization unavailable; falling back to dill: %s', exc)
+            return None
+    return stream.getvalue()
 
 
 def dump_codegen_payload(payload: dict[str, Any], stream: BinaryIO) -> str:

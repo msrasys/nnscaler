@@ -42,6 +42,9 @@ class CompileFlag:
     trace_staged_copy_min_mb = _to_int('NNSCALER_TRACE_STAGED_COPY_MIN_MB', default=4)
     trace_staged_copy_chunk_mb = _to_int('NNSCALER_TRACE_STAGED_COPY_CHUNK_MB', default=128)
     trace_staged_copy_threads = _to_int('NNSCALER_TRACE_STAGED_COPY_THREADS', default=16)
+    trace_staged_copy_huge_pages = _to_bool('NNSCALER_TRACE_STAGED_COPY_HUGE_PAGES', True)
+    # Write initial weights in the background while partitioning and codegen run.
+    async_attr_save = _to_bool('NNSCALER_ASYNC_ATTR_SAVE', True)
     # Maximum concurrent initial-weight shard writes during parsing. Use 1 for serial saves.
     attr_save_workers = _to_int('ATTR_SAVE_WORKERS', default=8)
     # reduce scatter adapter can reduce the communication cost, and improve the performance

@@ -193,7 +193,14 @@ move between CUDA and pageable host memory through two pinned buffers of
 `NNSCALER_TRACE_STAGED_COPY_CHUNK_MB` (default 128), with host copies split over
 `NNSCALER_TRACE_STAGED_COPY_THREADS` (default 16) threads. Values, layout and the
 autograd relation match `Tensor.to`. Set `NNSCALER_TRACE_STAGED_COPY=0` to use
-`Tensor.to` for every transfer.
+`Tensor.to` for every transfer. Host destinations are advised to use transparent huge
+pages (Linux, THP `madvise` mode), which halves first-touch cost; set
+`NNSCALER_TRACE_STAGED_COPY_HUGE_PAGES=0` to skip the advice.
+
+`graph.ckp` is written with the C pickler used for codegen worker payloads (only
+non-importable functions are embedded as dill bytes, and registered op factories
+are restored by import); `IRGraph.load` reads it with `dill` as before. If the
+graph cannot be pickled that way, the whole dump falls back to `dill`.
 
 ```python
 class BroadcastGenFilesStrategy(Enum):
