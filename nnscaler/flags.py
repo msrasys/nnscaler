@@ -109,6 +109,10 @@ class CompileFlag:
     # Default is False (FB schedules).
     use_fbw = _to_bool('USE_FBW')
 
+    # free a pipeline stage output's storage once it has been sent, keeping the tensor
+    # as a backward root (same idea as Megatron's deallocate_pipeline_outputs)
+    pipeline_deallocate_outputs = _to_bool('PIPELINE_DEALLOCATE_OUTPUTS', True)
+
 
 class RuntimeFlag:
 
