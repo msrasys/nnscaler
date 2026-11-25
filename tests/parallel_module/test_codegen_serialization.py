@@ -195,6 +195,46 @@ def test_legacy_dill_payload_still_loads():
     assert restored['fn'](2) == 5
 
 
+@pytest.mark.parametrize('serializer', ['pickle', 'dill', 'nested_callable'])
+def test_cuda_storage_in_payload_loads_on_cpu(serializer, monkeypatch):
+    # Produce a real CUDA-tagged torch storage without allocating a GPU.
+    # The worker must remap it before the default CUDA deserializer runs.
+    registry = list(torch.serialization._package_registry)
+    monkeypatch.setattr(torch.serialization, '_package_registry', registry)
+    torch.serialization.register_package(
+        0, lambda storage: 'cuda:0' if storage.device.type == 'cpu' else None,
+        lambda storage, location: None,
+    )
+    tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    view = tensor[:, 1:]
+    payload = {'tensor': tensor, 'alias': tensor, 'view': view,
+               'device_metadata': torch.device('cuda:0')}
+    stream = io.BytesIO()
+    if serializer == 'pickle':
+        assert dump_codegen_payload(payload, stream) == 'pickle'
+    elif serializer == 'dill':
+        dill.dump(payload, stream)
+    else:
+        def read_tensor(value=tensor):
+            return value
+        # Exercise the nested dill callable resolver too.
+        from nnscaler.codegen.serialization import _load_dill_callable
+        restored = _load_dill_callable(dill.dumps(read_tensor))()
+        assert restored.device.type == 'cpu'
+        assert torch.equal(restored, tensor)
+        return
+    assert b'cuda:0' in stream.getvalue()
+    stream.seek(0)
+    restored = load_codegen_payload(stream)
+    assert restored['tensor'].device.type == 'cpu'
+    assert restored['tensor'] is restored['alias']
+    assert torch.equal(restored['tensor'], tensor)
+    assert torch.equal(restored['view'], view)
+    assert restored['view'].stride() == view.stride()
+    assert restored['view'].storage_offset() == view.storage_offset()
+    assert restored['device_metadata'] == torch.device('cuda:0')
+
+
 def test_io_errors_do_not_retry_with_dill(monkeypatch):
     class BrokenStream(io.BytesIO):
         def write(self, data):

@@ -5,6 +5,7 @@
 
 from contextlib import contextmanager
 import importlib
+import io
 import logging
 import pickle
 import sys
@@ -12,6 +13,7 @@ import types
 from typing import Any, BinaryIO, Optional
 
 import dill
+import torch
 
 
 # Partitioned training graphs can be substantially deeper than Python's
@@ -70,11 +72,25 @@ def _load_registered_factory(module_name: str, signature: str, fallback: bytes):
     # only from a setup function in the parent process.
     if signature in CustomizedOps.kOpMap:
         return CustomizedOps.kOpMap[signature]
-    return dill.loads(fallback)
+    return _CodegenUnpickler(io.BytesIO(fallback)).load()
 
 
 def _load_dill_callable(data: bytes):
-    return dill.loads(data)
+    return _CodegenUnpickler(io.BytesIO(data)).load()
+
+
+def _load_codegen_storage(data: bytes):
+    # Codegen inspects tensor values but never executes the traced graph.
+    # Restoring CUDA storages in every worker duplicates them on the original
+    # device (usually cuda:0), exhausting GPU memory even on small payloads.
+    return torch.load(io.BytesIO(data), map_location='cpu', weights_only=False)
+
+
+class _CodegenUnpickler(dill.Unpickler):
+    def find_class(self, module: str, name: str):
+        if module == 'torch.storage' and name == '_load_from_bytes':
+            return _load_codegen_storage
+        return super().find_class(module, name)
 
 
 def _can_copy_callable_state(value: Any) -> bool:
@@ -187,6 +203,10 @@ def dump_codegen_payload(payload: dict[str, Any], stream: BinaryIO) -> str:
 
 
 def load_codegen_payload(stream: BinaryIO) -> dict[str, Any]:
-    """Read both fast pickle payloads and legacy/fallback dill payloads."""
+    """Read fast and legacy payloads with tensor storage restored on CPU.
+
+    Device metadata in the IR is preserved. This mapping is limited to worker
+    payloads; ordinary model and checkpoint loading retain their device rules.
+    """
     with codegen_pickle_recursion_limit():
-        return dill.load(stream)
+        return _CodegenUnpickler(stream).load()
