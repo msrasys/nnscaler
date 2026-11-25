@@ -162,6 +162,11 @@ class ComputeConfig:
     # whether to use async communication for cross-stage collective operations.
     # This option only works for pipeline.
     use_async_comm: bool = False
+    # whether to free a pipeline stage output's storage once it has been sent to the
+    # next stage. The tensor stays alive only as a backward root, so this saves one
+    # boundary activation per in-flight micro-batch.
+    # This option only works for pipeline.
+    pipeline_deallocate_outputs: bool = True
 
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
@@ -486,6 +491,7 @@ def _compile_flags(compute_config: ComputeConfig):
         async_reducer=compute_config.use_async_reducer, reducer_op='sum',
         max_reducer_bucket=compute_config.max_bucket_size_bytes,
         async_comm=compute_config.use_async_comm,
+        pipeline_deallocate_outputs=compute_config.pipeline_deallocate_outputs,
         use_zero=compute_config.use_zero,
         zero_ngroups=compute_config.zero_ngroups,
         zero_use_reduce_scatter=compute_config.zero_use_reduce_scatter,
