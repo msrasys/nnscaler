@@ -897,6 +897,12 @@ class ScheduleCodeGen(FuncEmission):
                         post_hook, hook_meta, bwd_input_str, is_pre=False,
                         outputs_str=bwd_output_str, track_stream=track_stream)
 
+                if CompileFlag.max_pending_backward_tasks:
+                    with Block('with nnscaler.runtime.stream.cuda_task_queue('
+                               f'{CompileFlag.max_pending_backward_tasks}):') as block:
+                        block.insert_body(codes)
+                    codes = block.code
+
                 """
                 In the end2end mode, although the graph's output may contain tensors that requires grad,
                 like the loss tensor, the backward pass has been done by the nnscaler runtime by calling

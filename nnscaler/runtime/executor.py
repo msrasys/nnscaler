@@ -13,7 +13,7 @@ import logging
 from torch.distributed import Work
 
 from ._patch_torch import stage_backward_input, stage_backward_weight
-from .stream import input_stream_lifetime, drain_stream_holds
+from .stream import input_stream_lifetime, drain_stream_holds, drain_cuda_tasks
 
 
 _logger = logging.getLogger(__name__)
@@ -710,6 +710,7 @@ class Executor:
     @staticmethod
     def clear():
         try:
+            drain_cuda_tasks()
             drain_stream_holds(wait=True)
         finally:
             Executor._detach = dict()

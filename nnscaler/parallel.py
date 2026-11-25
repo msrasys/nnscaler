@@ -180,6 +180,9 @@ class ComputeConfig:
     # Custom operators with internal side streams need scheduled input lifetime
     # tracking even when no module is moved by the compiler.
     multi_stream_ops: Tuple[str, ...] = field(default_factory=multi_stream_ops_from_env)
+    # Bound CPU submission ahead of completed CUDA backwards; zero is unlimited.
+    max_pending_backward_tasks: int = field(
+        default_factory=lambda: int(os.environ.get('NNSCALER_MAX_PENDING_BACKWARD_TASKS', '0')))
 
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
@@ -231,6 +234,10 @@ class ComputeConfig:
     def __post_init__(self):
         super().__setattr__('module_streams', normalize_module_stream_rules(self.module_streams))
         super().__setattr__('multi_stream_ops', normalize_multi_stream_ops(self.multi_stream_ops))
+        if type(self.max_pending_backward_tasks) is not int or self.max_pending_backward_tasks < 0:
+            raise ValueError('max_pending_backward_tasks must be a nonnegative integer')
+        if self.max_pending_backward_tasks and self.use_fbw:
+            raise ValueError('max_pending_backward_tasks requires complete backward tasks, not use_fbw')
         if self.module_streams and self.use_zero > 1:
             raise ValueError('module_streams currently supports ZeRO 0/1 only')
         if self.multi_stream_ops and self.use_zero > 1:
@@ -424,6 +431,7 @@ class ComputeConfig:
                     # intentionally normalizes user/YAML rules to today's ABI.
                     cfg.setdefault('module_streams', ())
                     cfg.setdefault('multi_stream_ops', ())
+                    cfg.setdefault('max_pending_backward_tasks', 0)
                     result = cls(**cfg)
                     for saved, rule in zip(cfg['module_streams'], result.module_streams):
                         version = (saved.get('_codegen_version') if isinstance(saved, dict)
@@ -483,6 +491,7 @@ def _compile_flags(compute_config: ComputeConfig):
         use_fbw=compute_config.use_fbw,
         module_streams=compute_config.module_streams,
         multi_stream_ops=compute_config.multi_stream_ops,
+        max_pending_backward_tasks=compute_config.max_pending_backward_tasks,
     )
 
 

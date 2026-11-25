@@ -4,9 +4,9 @@
 """Keep scheduled inputs alive until their consuming CUDA stream is done."""
 
 from contextlib import contextmanager, nullcontext
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from enum import Enum
-from threading import Lock
+from threading import Lock, RLock
 import weakref
 
 import torch
@@ -27,6 +27,48 @@ _SCALARS = (
 _module_streams = {}
 _module_streams_lock = Lock()
 _parameter_stream_names = {}
+_cuda_task_queues = {}
+_cuda_task_queues_lock = Lock()
+
+
+@contextmanager
+def cuda_task_queue(limit):
+    """Bound CPU submission of complete, caller-stream-joined CUDA tasks.
+
+    A completed autograd backward joins its side streams to the calling stream.
+    Recording that boundary lets later submissions wait for the oldest task,
+    rather than filling memory with buffers awaiting cross-stream reclamation.
+    The scope must not include a wait for work submitted by a later scope.
+    """
+    if type(limit) is not int or limit < 0:
+        raise ValueError('CUDA task queue limit must be a nonnegative integer')
+    if not limit or not torch.cuda.is_initialized():
+        yield
+        return
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError('CUDA task submission limits cannot run inside graph capture')
+    stream = torch.cuda.current_stream()
+    with _cuda_task_queues_lock:
+        events, lock = _cuda_task_queues.setdefault(stream, (deque(), RLock()))
+    with lock:
+        while len(events) >= limit:
+            events.popleft().synchronize()
+        try:
+            yield
+        finally:
+            done = torch.cuda.Event()
+            done.record(stream)
+            events.append(done)
+
+
+def drain_cuda_tasks():
+    """Drain submission boundaries at an explicit executor reset."""
+    with _cuda_task_queues_lock:
+        queues = list(_cuda_task_queues.values())
+    for events, lock in queues:
+        with lock:
+            while events:
+                events.popleft().synchronize()
 
 
 def has_module_streams():

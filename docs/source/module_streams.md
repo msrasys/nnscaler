@@ -66,6 +66,16 @@ rules and their compiler ABI are serialized in the compute configuration and
 invalidate generated-code reuse when changed. Regenerate plans made with older
 experimental launch modes. ZeRO 0/1 are supported.
 
+`ComputeConfig.max_pending_backward_tasks` optionally bounds CPU submission of
+complete scheduled CUDA backwards. Its environment default is
+`NNSCALER_MAX_PENDING_BACKWARD_TASKS` (`0`, unlimited). A positive limit waits
+for the oldest backward's caller-stream completion before submitting another.
+This limits storage awaiting cross-stream reclamation without changing the
+pipeline order or concurrency inside a backward. The setting is serialized in
+the generated package and requires regeneration; split `use_fbw` tasks are not
+supported. The corresponding runtime scope is `runtime.stream.cuda_task_queue`;
+all side-stream work must be joined to its caller before leaving the scope.
+
 ## Backward and checkpoint readiness
 
 `overlap_backward=True` supports before-launch rules and after-launch rules with

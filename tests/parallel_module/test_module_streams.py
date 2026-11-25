@@ -158,12 +158,14 @@ def test_codegen_splits_branch_and_joins_at_consumer(tmp_path, workers):
 
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('workers', [1, 2])
-def test_scheduled_executor_leaves_managed_module_tracking_local(tmp_path, workers):
+@pytest.mark.parametrize('task_limit', [0, 2])
+def test_scheduled_executor_leaves_managed_module_tracking_local(tmp_path, workers, task_limit):
     parallelize(
         EndToEndFork(),
         {'data': torch.randn(4, 8)},
         'data',
-        ComputeConfig(1, 2, use_end2end=True, module_streams=(RULE,)),
+        ComputeConfig(1, 2, use_end2end=True, module_streams=(RULE,),
+                      max_pending_backward_tasks=task_limit),
         gen_savedir=tmp_path,
         load_module=False,
         codegen_workers=workers,
@@ -172,6 +174,7 @@ def test_scheduled_executor_leaves_managed_module_tracking_local(tmp_path, worke
     assert 'use_multi_streams = True' in code
     assert 'track_stream_inputs = False' in code
     assert 'track_stream=False' in code
+    assert ('with nnscaler.runtime.stream.cuda_task_queue(2):' in code) == bool(task_limit)
 
 
 @replace_all_device_with('cpu', force=True)
