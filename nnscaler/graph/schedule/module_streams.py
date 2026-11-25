@@ -43,7 +43,8 @@ class ModuleStreamRule:
     backward_on: str | None = None
     operators: str | tuple[str, ...] | None = None
     weight_backward_only: bool = False
-    _codegen_version: int = field(default_factory=lambda: 26, init=False, repr=False)
+    cuda_graph: bool = False
+    _codegen_version: int = field(default_factory=lambda: 27, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):
@@ -63,7 +64,7 @@ class ModuleStreamRule:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f'{name} must be a nonempty string or None')
-        for name in ('recompute_only', 'overlap_backward', 'weight_backward_only'):
+        for name in ('recompute_only', 'overlap_backward', 'weight_backward_only', 'cuda_graph'):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f'{name} must be a boolean')
         if (self.launch_before and self.launch_after) or (self.resume_before and self.resume_after):
@@ -83,6 +84,8 @@ class ModuleStreamRule:
                 raise ValueError('Operator selection cannot split modules or select recompute regions')
         if self.recompute_ready_on is not None and not self.recompute_only:
             raise ValueError('recompute_ready_on requires a recompute_only rule')
+        if self.cuda_graph and (self.recompute_only or self.weight_backward_only):
+            raise ValueError('CUDA graph regions cannot also select recomputation or cooperative dW')
         if self.weight_backward_only and (
             not self.operators or self.recompute_only or self.overlap_backward
             or self.launch_before or self.launch_after or self.split_before
@@ -147,6 +150,7 @@ class ModuleStreamRegion:
     backward_anchor: object = None
     retain_backward_outputs: bool = False
     prioritize_backward: bool = False
+    cuda_graph: bool = False
 
 
 def _unsafe(node):
@@ -396,6 +400,7 @@ def plan_module_streams(nodes, outputs, rules):
                     backward_anchor=backward_anchor,
                     retain_backward_outputs=backward_override is not None,
                     prioritize_backward=backward_override is not None,
+                    cuda_graph=rule.cuda_graph,
                 )
                 regions[key] = region
                 placements[destination].append(region)
@@ -427,7 +432,8 @@ def plan_module_streams(nodes, outputs, rules):
         if region.overlap_backward and region.backward_anchor in owners:
             raise ValueError('Backward anchors must remain on the caller stream')
         if region.retain_backward_outputs:
-            if any(new_positions[n] >= new_positions[region.backward_anchor] for n in region.nodes):
+            if (region.ready_before is not region.backward_anchor
+                    and any(new_positions[n] >= new_positions[region.backward_anchor] for n in region.nodes)):
                 raise ValueError('Explicit backward anchor must follow all selected forward chunks')
         region.caller_outputs = tuple(
             obj for obj in region.outputs if obj in graph_outputs or any(node not in owners for node in consumers[obj])

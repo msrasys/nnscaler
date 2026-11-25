@@ -156,6 +156,7 @@ class ModuleCodeGen(FuncEmission):
             'import nnscaler.runtime.stream',
             'import nnscaler.runtime.backward',
             'import nnscaler.runtime.checkpoint_stream',
+            'import nnscaler.runtime.module_graph',
             'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
         ]

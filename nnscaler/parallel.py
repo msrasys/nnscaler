@@ -2186,8 +2186,13 @@ def build_optimizer(
 
     optimizer.step = types.MethodType(_patched_step, optimizer)
 
+    module_graphs_enabled = any(
+        rule.cuda_graph for pm in parallel_modules for rule in pm.compute_config.module_streams
+    )
+    module_graphs_prepared = False
     orig_zero_grad = optimizer.zero_grad
     def _patched_zero_grad(self, set_to_none: bool = True):
+        nonlocal module_graphs_prepared
         orig_zero_grad(set_to_none)
         for m in parallel_modules:
             m.zero_grad()
@@ -2205,6 +2210,9 @@ def build_optimizer(
                     else:
                         p.grad.requires_grad_(False)
                     p.grad.zero_()
+        if module_graphs_enabled and not module_graphs_prepared:
+            from nnscaler.runtime.module_graph import prepare_module_graphs
+            module_graphs_prepared = prepare_module_graphs(module, synchronize=True)
 
     optimizer.zero_grad = types.MethodType(_patched_zero_grad, optimizer)
 

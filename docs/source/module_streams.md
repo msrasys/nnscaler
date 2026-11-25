@@ -125,6 +125,29 @@ Explicit module/checkpoint scopes manage their own cross-stream lifetimes and
 do not enable whole-plan `track_stream` processing. Unmanaged internal streams
 and explicit scheduler streams keep the conservative executor protection.
 
+## CUDA replay within a module stream
+
+Set `cuda_graph=True` on a pure module-stream rule to reduce Python and kernel
+submission overhead. It can also be used on both pieces of a split module. The
+first optimizer step runs eagerly and measures the number of live forwards for
+each region. `build_optimizer` captures the regions at the next `zero_grad`,
+after previous backwards finish, and synchronizes pipeline ranks before replay.
+For a custom optimizer loop, call
+`nnscaler.runtime.module_graph.prepare_module_graphs(model)` at that boundary.
+
+Each live forward owns its input/saved state. Forward and backward workspaces
+use separate pools; backward temporary buffers are shared, so FIFO and other
+backward orders do not overwrite another forward's activations. Returned outputs
+and gradients have independent storage. `module_graph_stats(model)` reports
+calibration capacity and actual replay counts without GPU synchronization.
+
+Regions must have fixed, contiguous CUDA tensor boundaries and stable parameter
+storage. Checkpointed regions, hooks, internal streams and cooperative dW cannot
+be captured together. All training paths must be exercised during calibration.
+Replay supports one first-order backward per forward; inference stays eager.
+Backend caches must register a `register_capture_context` factory when a cache
+hit would omit work required after parameter updates, such as weight quantization.
+
 ## Cooperative weight gradients
 
 Cooperative operators can also be selected by the compiler:
