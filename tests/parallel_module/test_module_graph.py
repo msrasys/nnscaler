@@ -25,10 +25,11 @@ class Branch(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.linear = torch.nn.Linear(8, 8)
+        self.gate = torch.nn.Linear(8, 8)
         self.down = torch.nn.Linear(8, 8)
 
     def forward(self, x):
-        return self.down(self.linear(x).sin())
+        return self.down(self.linear(x).sin() * self.gate(x))
 
 
 class Model(torch.nn.Module):
