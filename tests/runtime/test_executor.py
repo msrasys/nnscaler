@@ -480,6 +480,54 @@ def test_custom_fbw_survives_reentrant_backward_in_callback():
     Executor.check_clear()
 
 
+def test_custom_fbw_survives_backward_after_delegation():
+    weight = torch.nn.Parameter(torch.tensor([2.0]))
+    boundary = weight * 3
+    other = torch.ones(1, requires_grad=True)
+    first = Executor.fexecute('first', lambda tensor: tensor * 5, boundary)
+    last = Executor.fexecute('last', lambda tensor: tensor * 11, boundary)
+    extra = Executor.fexecute('extra', lambda tensor: tensor * 7, other)
+    received = []
+
+    def resume(grad):
+        received.append(grad.item())
+        boundary.backward(grad)
+
+    def custom_input(name, inputs, outputs, grads, weights):
+        result = Executor.backward_input(name, inputs, outputs, grads, weights)
+        # Another segment handled after this one must not hide that it was handled.
+        Executor.backward('extra', [other], [extra], [torch.ones(1)])
+        return result
+
+    Executor.register_input_grad_callback(boundary, resume)
+    with executor.custom_fbw(custom_input, Executor.backward_weight):
+        executor.backward_input('first', [boundary], [first], [torch.ones(1)], [])
+        executor.backward_weight('first', [])
+    Executor.backward('last', [boundary], [last], [torch.ones(1)])
+    assert received == [5.0 + 11.0]
+    assert weight.grad.item() == (5.0 + 11.0) * 3
+    Executor.check_clear()
+
+
+def test_input_grad_callback_releases_registrations_when_callback_raises():
+    first = torch.ones(1, requires_grad=True) * 2
+    second = torch.ones(1, requires_grad=True) * 3
+    nested = torch.ones(1, requires_grad=True) * 4
+    output = Executor.fexecute('segment', lambda left, right: left + right, first, second)
+
+    def fail(grad):
+        # Unrelated to the failing segment, so it must survive the cleanup.
+        Executor.register_input_grad_callback(nested, lambda grad: None)
+        raise RuntimeError('outer backward failed')
+
+    Executor.register_input_grad_callback(first, fail)
+    Executor.register_input_grad_callback(second, lambda grad: None)
+    with pytest.raises(RuntimeError, match='outer backward failed'):
+        Executor.backward('segment', [first, second], [output], [torch.ones(1)])
+    # ``second`` would never fire, so it no longer holds its tensor and graph.
+    assert list(Executor._input_grad_callbacks) == [id(nested)]
+
+
 @pytest.mark.parametrize('split', [False, True])
 def test_input_grad_callback_accumulates_before_reentrant_backward(split):
     first = torch.tensor([1.0], requires_grad=True) * 1
