@@ -976,9 +976,8 @@ _gen_rank_code_worker_args: Optional[_GenRankCodeArgs] = None
 
 def _init_gen_rank_code_worker(dilled_codegen: bytes) -> None:
     global _gen_rank_code_worker_args
-    # IRObjects back-reference their owning cells, making large graph pickle traversals deep.
     with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True):
-        _gen_rank_code_worker_args = dill.loads(dilled_codegen)
+        _gen_rank_code_worker_args = IR.loads(dilled_codegen)
 
 
 def _gen_rank_code_worker(
@@ -1177,11 +1176,9 @@ def _gencode(
     else:
         # pickle doesn't work for graph/codegen objects, so use dill for worker payloads.
         # ExecutePlan is too complex. default recursion limit is too low for dill to serialize it.
-        # To further reduce the serialization overhead,
-        # we use a custom pickling context that removes `_cell` from IRObject's state.
-        # TODO: Currently it looks safe, but should we restore `_cell`(using similar approach as IRGraph.from_dill) after unpickling
-        with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True), graph.no_cell_pickle_context():
-            dilled_codegen = dill.dumps(codegen_args)
+        # Codegen reads `IRObject.device`, which comes from `IRObject.cell`, so the cells are kept.
+        with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True):
+            dilled_codegen = IR.dumps(codegen_args)
         # Avoid inheriting parent CUDA/PyTorch runtime state through fork.
         mp_context = multiprocessing.get_context('spawn')
         with ProcessPoolExecutor(

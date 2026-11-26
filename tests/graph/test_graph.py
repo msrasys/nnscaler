@@ -63,3 +63,60 @@ def test_recompute_and_offload_reject_empty_nodes():
         graph.recompute([])
     with pytest.raises(AssertionError, match='Cannot offload empty list of nodes'):
         graph.offload([])
+
+
+def test_graph_dump_keeps_cells(tmp_path):
+    """
+    A dump keeps `IRObject.cell`, the source of `IRObject.device`,
+    including an owner the graph does not hold and so `IRGraph.from_dill` cannot rebuild
+    (here the gradient's holder from `IR.set_object_device`);
+    a dump of an older version, which drops cells, still loads.
+    """
+    import dill
+    from nnscaler.ir.cten import IR
+    from nnscaler.ir.unique import IDGenerator
+
+    node = IRFwOperation('test', 'test', inputs=[IRFullTensor([4, 4], requires_grad=True)], num_outputs=1)
+    node.set_output(0, IRFullTensor([4, 4]))
+    graph = IRGraph.from_logic_graph([node], [node.input(0)], [node.output(0)], 'GenModule')
+    graph.node(0).device = 1
+    graph.node(0).input(0).grad = IR.copy_and_set_object_device(graph.node(0).input(0), 2)
+
+    graph.dump(tmp_path / 'graph.ckp')
+    loaded_node = IRGraph.load(tmp_path / 'graph.ckp').node(0)
+    assert all(t.cell is loaded_node for t in loaded_node.iobjs() + loaded_node.oobjs())
+    assert loaded_node.input(0).device == (1,) and loaded_node.input(0).grad.device == (2,)
+
+    # older versions dumped `(id_state, graph)` with one plain `dill.dumps` and dropped every cell:
+    # `IRGraph.from_dill` rebuilds the owners held by the graph, not the gradient's
+    with IR.no_cell_pickle_context():
+        (tmp_path / 'old.ckp').write_bytes(dill.dumps((IDGenerator().get_states(), graph)))
+    old_node = IRGraph.load(tmp_path / 'old.ckp').node(0)
+    assert old_node.input(0).cell is old_node and old_node.input(0).device == (1,)
+    assert old_node.input(0).grad.device == ()
+    with pytest.raises(ValueError, match='carries no IRObject cells'):
+        IR.loads((tmp_path / 'old.ckp').read_bytes())
+
+
+def test_dumps_from_threads_keep_their_cells():
+    """`IR.dumps` patches a class-wide `__getstate__`: dumps from several threads must not mix up their cells."""
+    from concurrent.futures import ThreadPoolExecutor
+    from nnscaler.ir.cten import IR, IRObject
+
+    def make_nodes(device):
+        nodes = []
+        for _ in range(10):
+            node = IRFwOperation('test', 'test', inputs=[IRFullTensor([2]).tosub()], num_outputs=0)
+            node.device = device
+            nodes.append(node)
+        return nodes
+
+    def dump_and_load(device):
+        for _ in range(50):
+            for node in IR.loads(IR.dumps(make_nodes(device))):
+                assert node.input(0).cell is node and node.input(0).device == (device,)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for future in [executor.submit(dump_and_load, device) for device in range(4)]:
+            future.result()                                # re-raises a worker's assertion or error
+    assert '__getstate__' not in IRObject.__dict__
