@@ -74,6 +74,21 @@ def test_trainer_pipeline(tmp_path):
         'fbw',
         ['--compute_config.use_fbw', 'True',]
     )
+    # Adapters are hoisted ahead of W across streams and `comm` waits on `comp` again after W.
+    launch_torchrun(4, trainer_worker_pipeline_multiple_stream, tmp_path, 'trainer_args_pipeline.yaml',
+        'fbw_async',
+        ['--compute_config.use_fbw', 'True', '--compute_config.use_async_comm', 'True']
+    )
+    # The reducer on `comm` has no wait of its own and relies on that re-wait to see W's gradients.
+    launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml',
+        'fbw_async_reducer_no_wait',
+        [
+            '--compute_config.pas_config.pipeline_scheduler',
+            'tests.test_policies.sched_1f1b_multi_stream_reducer_no_wait',
+            '--compute_config.use_fbw', 'True',
+            '--compute_config.use_async_comm', 'True',
+        ]
+    )
     launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline_autodist.yaml')
     launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml')
     launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml',
@@ -83,19 +98,30 @@ def test_trainer_pipeline(tmp_path):
             '--compute_config.use_fbw', 'True'
         ]
     )
+    launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml',
+        'explicit_fbw_async',
+        [
+            '--compute_config.pas_config.pipeline_scheduler', 'tests.test_policies.sched_explicit_fbw',
+            '--compute_config.use_async_comm', 'True',
+        ]
+    )
+    # Fill the last input-backward bubble on one stage with ready weight-backward work.
+    launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml',
+        'zero_bubble',
+        [
+            '--compute_config.pas_config.pipeline_scheduler', 'zero_bubble',
+            '--compute_config.use_async_comm', 'True',
+        ]
+    )
 
     merged_files = list((tmp_path).glob('merged_*.pt'))
-    assert len(merged_files) == 5
+    assert len(merged_files) == 9
     merged_state_dicts = [torch.load(merged_file, weights_only=False) for merged_file in merged_files]
 
-    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[1]['model'])
-    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[1]['optimizer'])
-    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[2]['model'])
-    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[2]['optimizer'])
-    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[3]['model'])
-    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[3]['optimizer'])
-    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[4]['model'])
-    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[4]['optimizer'])
+    reference = merged_state_dicts[0]
+    for state_dict in merged_state_dicts[1:]:
+        assert_equal(reference['model'], state_dict['model'])
+        assert_equal(reference['optimizer'], state_dict['optimizer'])
 
     # when compute_config.use_async_comm is True, and compute_config.use_fbw is True
     # the code will look like:
