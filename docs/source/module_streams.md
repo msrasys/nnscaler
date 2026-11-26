@@ -177,8 +177,10 @@ Adjacent graph regions on the same stream are coalesced when their input
 readiness and backward anchors match. This avoids separate forks and graph
 launches between independent sibling modules without moving their execution.
 
-Each live forward owns a native PyTorch graph pair and its captured state, so
-FIFO and other backward orders do not overwrite another forward's activations.
+Each live forward owns its captured state, so FIFO and other backward orders
+do not overwrite another forward's activations. Backward graphs in one region
+reuse temporary storage on their shared execution stream; their gradient
+results are copied before another replay can overwrite them.
 Returned outputs and gradients have independent storage. `module_graph_stats(model)` reports
 calibration capacity and actual replay counts without GPU synchronization.
 
@@ -190,9 +192,9 @@ Backend caches must register a `register_capture_context` factory when a cache
 hit would omit work required after parameter updates, such as weight quantization.
 
 `cuda_graph='forward'` captures only forward execution. Backward uses the retained
-slot-local autograd tape, allocating temporary gradients normally instead of
-reserving backward buffers for every live forward. This saves memory without
-adding recomputation. Selected backends must support retained, stateless backward
+slot-local autograd tape and allocates temporary gradients normally. Both modes
+preserve the captured forward activations without adding recomputation.
+Selected backends must support retained, stateless backward
 execution; parameter versions are still checked at the public boundary.
 For after-launch regions whose inputs are available before the anchor, the
 compiler stages input copies, output allocation and stream bookkeeping as soon

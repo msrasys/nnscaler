@@ -17,12 +17,13 @@ def transform(x, weight):
     return (x @ weight).sin()
 
 
-def test_preparation_does_not_replay_or_create_autograd_edges(monkeypatch):
+@pytest.mark.parametrize('capture_backward', [True, False])
+def test_preparation_does_not_replay_or_create_autograd_edges(monkeypatch, capture_backward):
     from nnscaler.runtime.module_graph import _profiles
     owner = torch.nn.Module()
     weight = torch.nn.Parameter(torch.randn(16, 16, device='cuda'))
     xs = [torch.randn(8, 16, device='cuda', requires_grad=True) for _ in range(3)]
-    calls = [run_module_graph(owner, 'test', transform, (x, weight), (1,), capture_backward=False)
+    calls = [run_module_graph(owner, 'test', transform, (x, weight), (1,), capture_backward=capture_backward)
              for x in xs]
     for y in calls:
         y.sum().backward()
@@ -34,7 +35,7 @@ def test_preparation_does_not_replay_or_create_autograd_edges(monkeypatch):
     assert not replays
     assert all(not value.requires_grad for call in prepared for value in call.ticket.outputs)
     actual = [run_module_graph(owner, 'test', transform, (x, weight), (1,),
-                               capture_backward=False, prepared=call)
+                               capture_backward=capture_backward, prepared=call)
               for x, call in zip(xs, prepared)]
     assert len(replays) == 3
     for i in (2, 0, 1):
@@ -46,7 +47,7 @@ def test_preparation_does_not_replay_or_create_autograd_edges(monkeypatch):
     assert len(_profiles[owner]['test'].pool.free) == 3
     with pytest.raises(ValueError, match='different module graph'):
         run_module_graph(owner, 'test', transform, (xs[0], weight), (1,),
-                         capture_backward=False, prepared=prepared[0])
+                         capture_backward=capture_backward, prepared=prepared[0])
 
 
 def test_abandoned_and_mutated_preparations_release_the_slot():
@@ -112,6 +113,7 @@ def test_live_forwards_arbitrary_backward_order_and_retained_values(order, captu
             value = pool(torch.randn_like(sample, requires_grad=True), weight)
             value.sum().backward()
         torch.testing.assert_close(actual, snapshots)
+        torch.testing.assert_close([x.grad for x in xs], [x.grad for x in refs])
         assert len(pool.free) == 3
     torch.cuda.synchronize()
     drain_stream_holds(wait=True)

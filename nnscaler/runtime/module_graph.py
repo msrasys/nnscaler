@@ -5,7 +5,8 @@
 
 Calibration observes the first optimizer step. Capture runs only at a subsequent
 gradient reset, after those backwards finish. Forward state belongs to a slot;
-native forward/backward graphs keep each slot's captured storage alive.
+forward graphs keep each slot's saved storage alive. Backward scratch is shared
+on the execution stream and copied before another replay can overwrite it.
 """
 
 from collections import deque
@@ -104,35 +105,7 @@ class _Calibrate(torch.autograd.Function):
         return (None, *grads)
 
 
-def _clone_gradients(gradients, _outputs):
-    # Native graphed callables return their static gradient buffers. Clone before
-    # the outer engine hands them to consumers or another forward reuses a slot.
-    return tuple(None if value is None else value.clone() for value in gradients)
-
-
-class _Replay(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, ticket, *outputs):
-        ctx.ticket = ticket
-        ctx.save_for_backward(*ticket.parameters)
-        ctx.set_materialize_grads(False)
-        values = tuple(value.clone() for value in outputs)
-        ctx.mark_non_differentiable(*(v for v, grad in zip(values, ticket.owner.output_requires_grad) if not grad))
-        return values
-
-    @staticmethod
-    def backward(ctx, *gradients):
-        if ctx.ticket.used or torch.is_grad_enabled():
-            raise RuntimeError('Module graphs require one first-order backward per forward')
-        ctx.ticket.used = True
-        try:
-            ctx.saved_tensors  # Check the model's parameter versions.
-            return (None, *gradients)
-        finally:
-            torch.autograd.Variable._execution_engine.queue_callback(ctx.ticket.release)
-
-
-class _ForwardReplay(torch.autograd.Function):
+class _GraphReplay(torch.autograd.Function):
     @staticmethod
     def forward(ctx, ticket, *inputs):
         pool = ticket.owner
@@ -160,6 +133,16 @@ class _ForwardReplay(torch.autograd.Function):
         try:
             ctx.saved_tensors
             slot = pool.slots[ticket.slot]
+            if pool.capture_backward:
+                with _capture_lock, pool.lock:
+                    if torch.cuda.current_stream(pool.stream.device) != pool.stream:
+                        raise RuntimeError('Module graph backward requires its forward stream')
+                    for target, gradient in zip(pool.backward_inputs, gradients):
+                        if target is not None:
+                            target.zero_() if gradient is None else target.copy_(gradient)
+                    slot['backward'].replay()
+                    result = tuple(None if value is None else value.clone() for value in pool.backward_outputs)
+                return (None, *result)
             required = tuple(x for x in slot['inputs'] if x.requires_grad)
             outputs = tuple(y for y in slot['outputs'] if y.requires_grad)
             incoming = tuple(torch.zeros_like(y) if g is None else g
@@ -185,8 +168,6 @@ def _copy_inputs(pool, slot, inputs):
 
 class _PreparedForward:
     def __init__(self, pool, inputs):
-        if pool.capture_backward:
-            raise ValueError('Prepared forwards require forward-only module graphs')
         self.inputs = tuple(inputs)
         self.versions = tuple(v._version for v in inputs)
         self.ticket = pool._reserve(inputs)
@@ -210,7 +191,7 @@ class _PreparedForward:
             if torch.cuda.current_stream(inputs[0].device) != ticket.owner.stream:
                 raise RuntimeError('Module graph execution requires its original stream')
             with ticket.owner.lock:
-                outputs = _ForwardReplay.apply(ticket, *inputs)
+                outputs = _GraphReplay.apply(ticket, *inputs)
             return outputs[0] if ticket.owner.single else outputs
         except BaseException:
             ticket.release()
@@ -236,6 +217,8 @@ class ModuleGraph:
         self.lock = RLock()
         self.free = deque(range(capacity))
         self.slots = []
+        self.backward_pool = torch.cuda.graph_pool_handle() if capture_backward else None
+        self.backward_inputs = self.backward_outputs = None
         capture_stream = (torch.cuda.Stream(device=sample_inputs[0].device)
                           if self.stream == torch.cuda.default_stream(sample_inputs[0].device) else self.stream)
         with _capture_lock, torch.cuda.stream(capture_stream), torch.enable_grad(), ExitStack() as stack:
@@ -261,25 +244,54 @@ class ModuleGraph:
                 if not any(self.output_requires_grad):
                     raise ValueError('Module graphs require a differentiable output')
                 del outputs
+                # Each live forward owns its saved tensors. Backwards share
+                # transient storage because replays and gradient copies are
+                # serialized on this pool's stream.
+                for _ in range(3):
+                    warm, _ = _tuple(function(*inputs))
+                    needed = tuple(v for v in inputs if v.requires_grad)
+                    torch.autograd.grad(tuple(v for v in warm if v.requires_grad), needed,
+                                        tuple(torch.zeros_like(v) for v in warm if v.requires_grad),
+                                        allow_unused=True)
+                del warm
+                graph = torch.cuda.CUDAGraph()
+                with (torch.autograd.graph.saved_tensors_hooks(lambda v: v.detach(), lambda v: v),
+                      torch.cuda.graph(graph, stream=capture_stream)):
+                    outputs, _ = _tuple(function(*inputs))
+                slot = dict(inputs=inputs, forward=graph, outputs=outputs)
                 if capture_backward:
-                    native = torch.cuda.make_graphed_callables(function, inputs, allow_unused_input=True)
-                    self.slots.append(dict(inputs=inputs, native=native))
-                else:
-                    # The retained tape reads buffers refreshed by forward replay.
-                    # Saved hooks keep slot-owned values without stale version
-                    # checks; public parameters are checked by the outer node.
-                    for _ in range(3):
-                        warm, _ = _tuple(function(*inputs))
-                        needed = tuple(v for v in inputs if v.requires_grad)
-                        torch.autograd.grad(tuple(v for v in warm if v.requires_grad), needed,
-                                            tuple(torch.zeros_like(v) for v in warm if v.requires_grad),
-                                            allow_unused=True)
-                    graph = torch.cuda.CUDAGraph()
-                    with (torch.autograd.graph.saved_tensors_hooks(lambda v: v.detach(), lambda v: v),
-                          torch.cuda.graph(graph, stream=capture_stream)):
-                        outputs, _ = _tuple(function(*inputs))
-                    self.slots.append(dict(inputs=inputs, forward=graph, outputs=outputs))
+                    self._capture_backward(slot, capture_stream)
+                self.slots.append(slot)
             torch.cuda.synchronize(sample_inputs[0].device)
+
+    def _capture_backward(self, slot, stream):
+        inputs, outputs = slot['inputs'], slot['outputs']
+        if self.backward_inputs is None:
+            self.backward_inputs = tuple(torch.zeros_like(y) if y.requires_grad else None for y in outputs)
+        needed = tuple(x for x in inputs if x.requires_grad)
+        differentiable = tuple(y for y in outputs if y.requires_grad)
+        incoming = tuple(g for g in self.backward_inputs if g is not None)
+
+        def gradients():
+            values = iter(torch.autograd.grad(differentiable, needed, incoming,
+                                              allow_unused=True, retain_graph=True))
+            return tuple(next(values) if x.requires_grad else None for x in inputs)
+
+        for _ in range(3):
+            values = gradients()
+        if self.backward_outputs is None:
+            self.backward_outputs = tuple(None if v is None else torch.empty_like(v) for v in values)
+        del values
+        backward = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(backward, stream=stream, pool=self.backward_pool):
+            values = gradients()
+            for target, value in zip(self.backward_outputs, values):
+                if (target is None) != (value is None):
+                    raise RuntimeError('Module graph gradient structure changed between slots')
+                if target is not None:
+                    target.copy_(value)
+            del values
+        slot['backward'] = backward
 
     @_capture_guard
     def release(self, index):
@@ -305,15 +317,7 @@ class ModuleGraph:
         ticket = self._reserve(inputs)
         try:
             with self.lock:
-                if self.capture_backward:
-                    outputs, _ = _tuple(self.slots[ticket.slot]['native'](*inputs))
-                    nodes = {value.grad_fn for value in outputs if value.grad_fn is not None}
-                    for node in nodes:
-                        node.register_hook(_clone_gradients)
-                    ticket.parameters = tuple(inputs[i] for i in sorted(self.parameters))
-                    outputs = _Replay.apply(ticket, *outputs)
-                else:
-                    outputs = _ForwardReplay.apply(ticket, *inputs)
+                outputs = _GraphReplay.apply(ticket, *inputs)
         except BaseException:
             ticket.release()
             raise
@@ -373,14 +377,14 @@ class _Profile:
 def prepare_module_graph(owner, key, inputs):
     """Copy inputs and reserve outputs before an independent async submission.
 
-    Calibration and native forward/backward graphs keep their ordinary path.
+    Calibration keeps its ordinary path.
     Preparation creates no autograd edges and launches no model computation.
     """
     if not torch.is_grad_enabled():
         return None
     with _registry_lock:
         profile = _profiles.get(owner, {}).get(key)
-    if profile is None or profile.pool is None or profile.capture_backward:
+    if profile is None or profile.pool is None:
         return None
     return _PreparedForward(profile.pool, inputs)
 
