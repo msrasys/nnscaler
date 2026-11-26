@@ -192,35 +192,40 @@ class MetadataBlock(torch.nn.Module):
 
 
 class MetadataModel(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, external_metadata=False):
         super().__init__()
         self.block = MetadataBlock()
+        self.external_metadata = external_metadata
 
     def forward(self, x, mask):
-        return self.block(x, {'mask': mask})
+        return self.block(x, mask if self.external_metadata else {'mask': mask})
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 @pytest.mark.parametrize('capture_mode', [True, 'forward'])
-def test_metadata_reads_stay_outside_capture_and_preserve_gradients(tmp_path, capture_mode):
+@pytest.mark.parametrize('external_metadata', [False, True])
+def test_metadata_reads_stay_outside_capture_and_preserve_gradients(tmp_path, capture_mode, external_metadata):
     from nnscaler.runtime.module_graph import prepare_module_graphs
     dist.init_process_group('nccl', init_method=f'file://{tmp_path}/metadata_pg', rank=0, world_size=1)
     try:
         nnscaler.init()
-        model = MetadataModel().cuda()
+        model = MetadataModel(external_metadata).cuda()
         reference = copy.deepcopy(model)
         x = torch.randn(4, 8, device='cuda', requires_grad=True)
         mask = torch.randn(4, device='cuda', requires_grad=True)
         rule = ModuleStreamRule('block', operators='*.graph_statistics', stream='stats',
                                 launch_after='*.ready_anchor', cuda_graph=capture_mode)
-        generated = parallelize(model, {'x': x, 'mask': mask}, pas_dp,
+        def argument(value):
+            return {'mask': value} if external_metadata else value
+        generated = parallelize(model, {'x': x, 'mask': argument(mask)}, pas_dp,
                                 ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
-                                instance_name=f'metadata_graph_{capture_mode}')
+                                instance_name=f'metadata_graph_{capture_mode}_{external_metadata}')
         for iteration in range(3):
+            mask = torch.randn_like(mask, requires_grad=True)
             for p in (x, mask, *generated.parameters(), *reference.parameters()):p.grad = None
-            actual = generated(x, mask)
+            actual = generated(x, argument(mask))
             rx, rm = x.detach().clone().requires_grad_(), mask.detach().clone().requires_grad_()
-            expected = reference(rx, rm)
+            expected = reference(rx, argument(rm))
             actual.square().sum().backward()
             expected.square().sum().backward()
             torch.testing.assert_close(actual, expected)

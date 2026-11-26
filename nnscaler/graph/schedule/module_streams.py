@@ -48,7 +48,7 @@ class ModuleStreamRule:
     weight_backward_only: bool = False
     accumulate_weight_grads: bool = False
     cuda_graph: bool | str = False
-    _codegen_version: int = field(default_factory=lambda: 36, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 37, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):
@@ -222,7 +222,7 @@ def _local_container_read(node):
     if node.signature != '_operator.getitem' or len(node.inputs()) != 2:
         return False
     container, key = node.inputs()
-    if not isinstance(container, IRObject) or not container.is_constant:
+    if not isinstance(container, IRObject) or isinstance(container, IRTensor):
         return False
     value = container.value
     return (type(value) is dict and type(key) in (str, int)) or (type(value) in (list, tuple) and type(key) is int)
