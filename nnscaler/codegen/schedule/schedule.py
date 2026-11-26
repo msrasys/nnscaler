@@ -266,14 +266,15 @@ class ScheduleCodeGen(FuncEmission):
                 allow_adapter_before_weight = CompileFlag.async_comm
 
                 def _adapter_syncs_with_weight(adapter: IRCell, weight_node: IRCell) -> bool:
-                    """Whether moving `adapter` ahead of `weight_node` would drop an explicit dependency.
+                    """Whether `adapter` may carry an event dependency on `weight_node`.
 
                     A plain `wait_streams` is not such a dependency: the adapter only needs the I
                     outputs, and waiting on the stream before W is the same ordering as in
-                    single-stream code. Only events carry a W-to-adapter dependency: the adapter
-                    waits on an event W records, or the adapter records an event after W's work
-                    (same stream as W, or waiting on W's stream), so a later waiter of that event
-                    would no longer cover W.
+                    single-stream code. Events can carry one: the adapter waits on an event W
+                    records, or it records an event that a later node waits on. A recorded event
+                    covers whatever the recording stream has waited for so far, which may include
+                    W through an earlier adapter's `wait_streams` on the same stream, so any
+                    recorded event is treated as a dependency.
                     """
                     actx = self._get_node_stream_context(execplan, adapter)
                     wctx = self._get_node_stream_context(execplan, weight_node)
@@ -282,11 +283,32 @@ class ScheduleCodeGen(FuncEmission):
                     if actx.wait_events and wctx and wctx.record_events:
                         if set(actx.wait_events) & set(wctx.record_events):
                             return True
-                    if actx.record_events:
-                        wstream = wctx.stream if wctx else None
-                        if actx.stream == wstream or wstream in (actx.wait_streams or ()):
-                            return True
-                    return False
+                    return bool(actx.record_events)
+
+                # Hoisting is decided once for the whole contiguous run of adapters after a
+                # pending W: moving an earlier adapter can break a dependency that only a later
+                # adapter of the same run makes visible, e.g. W -> A(wait_streams=[W's stream])
+                # -> B(same stream as A, record_events=[...]).
+                # Line of the last adapter of the run already decided, and the decision.
+                hoist_run_last_line = -1
+                hoist_run_allowed = False
+
+                def _can_hoist_adapter(line: int) -> bool:
+                    nonlocal hoist_run_last_line, hoist_run_allowed
+                    if line > hoist_run_last_line:
+                        end = line
+                        while (
+                            end < len(device_nodes)
+                            and _is_adapter(device_nodes[end])
+                            and _depends_totally_on(device_nodes[end], pending_weight_node)
+                        ):
+                            end += 1
+                        hoist_run_last_line = end - 1
+                        hoist_run_allowed = not any(
+                            _adapter_syncs_with_weight(adapter, pending_weight_node)
+                            for adapter in device_nodes[line:end]
+                        )
+                    return hoist_run_allowed
 
                 def _flush_pending_weight():
                     nonlocal pending_weight_node
@@ -357,12 +379,12 @@ class ScheduleCodeGen(FuncEmission):
                             # Standard pipeline adapters only consume gradients produced by I
                             # and do not require W to finish. Events can still encode a
                             # W-to-adapter dependency, and `_validate_events` checks the
-                            # original order, so such adapters keep their place.
+                            # original order, so such adapter runs keep their place.
                             if (
                                 allow_adapter_before_weight
                                 and _is_adapter(node)
                                 and _depends_totally_on(node, pending_weight_node)
-                                and not _adapter_syncs_with_weight(node, pending_weight_node)
+                                and _can_hoist_adapter(line)
                             ):
                                 # if the next node is an adapter that depends on the last backward,
                                 # we need to emit the adapter before the last backward_weight codes

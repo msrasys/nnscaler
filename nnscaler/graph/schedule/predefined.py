@@ -151,6 +151,10 @@ class PredefinedSched:
 
                 action = str(op.computation_type)
                 segment = fsegs[op.stage_index]
+                # A stage without grad-requiring ops has no backward segment (see `IRGraph.group`).
+                # Keep its F and drop its I/W; the slots they held stay as bubbles.
+                if action in ('I', 'W') and segment.mirror is None:
+                    continue
                 schedule_action = None
                 if action == 'I':
                     segment = segment.mirror

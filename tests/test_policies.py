@@ -1065,6 +1065,22 @@ def sched_explicit_fbw_with_recording_adapters(
     return schedule
 
 
+def sched_explicit_fbw_with_comp_weights(
+    graph: IRGraph,
+    num_microbatches: int,
+    num_stages: int,
+) -> SchedulePlan:
+    """Explicit I/W schedule whose W actions run on the `comp` stream."""
+    schedule = _build_explicit_fbw(
+        graph,
+        num_microbatches,
+        num_stages,
+        weight_stream_context=StreamContext(stream='comp'),
+    )
+    schedule.finish()
+    return schedule
+
+
 def forward_only_first_stage_policy(graph, cfg):
     """Stage 0 holds only the parameter-free ops before the first FFN.
 
@@ -1331,6 +1347,50 @@ def test_codegen_keeps_event_adapters_after_weight(tmp_path):
 
 
 @replace_all_device_with('cpu')
+def test_codegen_keeps_transitively_recording_adapters_after_weight(tmp_path, monkeypatch):
+    # W(comp) -> A(comm, wait_streams=['comp']) -> B(comm, record_events=['done']):
+    # B records no wait itself, but `done` covers W through A's earlier stream wait,
+    # so neither A nor B may be hoisted ahead of W.
+    # StreamConfig assigns one context to all result broadcast adapters, so give the
+    # two lowered broadcast adapters (one per microbatch) different contexts here.
+    wait_only = StreamContext(stream='comm', wait_streams=['comp'])
+    record_only = StreamContext(stream='comm', record_events=['done'])
+    place_adapters = SchedulePlan._place_adapters
+
+    def place_adapters_with_split_contexts(self):
+        place_adapters(self)
+        for block in self._step_adapters[self.nsteps - 1]:
+            if block.content not in self._dependency.recvers:
+                block._stream_context = wait_only if block.mid == 0 else record_only
+
+    monkeypatch.setattr(SchedulePlan, '_place_adapters', place_adapters_with_split_contexts)
+
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(4, 8, use_end2end=True, use_async_comm=True, pas_config={
+            'pipeline_nmicros': 2,
+            'pipeline_size': 2,
+            'pipeline_scheduler': sched_explicit_fbw_with_comp_weights,
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    for rank in range(4):
+        train_step, = _gencode_contains(
+            tmp_path,
+            FnPolicyModuleList,
+            rank,
+            r'def _train_step\([^)]*\):\n([\s\S]*?)\ndef _infer_step',
+        )
+        records = [m.start() for m in re.finditer(r"get_event\('done'\)\.record\(\)", train_step)]
+        weights = [m.start() for m in re.finditer(r'executor\.backward_weight\(', train_step)]
+        assert len(records) == 1 and len(weights) == 2
+        assert records[0] > max(weights)
+
+
+@replace_all_device_with('cpu')
 def test_codegen_keeps_recording_adapters_after_weight(tmp_path):
     # An adapter that waits on W's stream and records an event carries W to
     # later waiters of that event, so it must not be hoisted ahead of W.
@@ -1360,9 +1420,11 @@ def test_codegen_keeps_recording_adapters_after_weight(tmp_path):
 
 
 @replace_all_device_with('cpu')
-def test_codegen_allows_forward_only_stage(tmp_path):
+@pytest.mark.parametrize('scheduler', [sched_fb_skip_forward_only, 'zero_bubble'])
+def test_codegen_allows_forward_only_stage(tmp_path, scheduler):
     # A training plan may contain a stage without a backward segment; the
-    # pairing and FIFO checks must skip it instead of rejecting the plan.
+    # pairing and FIFO checks must skip it instead of rejecting the plan,
+    # and zero_bubble must keep its F without emitting I/W for it.
     parallelize(
         FnPolicyModuleList(),
         {'x': torch.randn(4, 4)},
@@ -1370,17 +1432,24 @@ def test_codegen_allows_forward_only_stage(tmp_path):
         ComputeConfig(3, 3, use_end2end=True, pas_config={
             'pipeline_nmicros': 2,
             'pipeline_size': 3,
-            'pipeline_scheduler': sched_fb_skip_forward_only,
+            'pipeline_scheduler': scheduler,
         }),
         gen_savedir=tmp_path,
         load_module=False,
     )
-    assert len(_gencode_contains(
-        tmp_path, FnPolicyModuleList, 0, r'nnscaler\.runtime\.executor\.fexecute\(',
-    )) == 2
-    assert len(_gencode_contains(
-        tmp_path, FnPolicyModuleList, 0, r'nnscaler\.runtime\.executor\.backward\(',
-    )) == 0
+    for rank in range(3):
+        # No `_infer_step` follows here, so the body runs to the next function or the end.
+        train_step, = _gencode_contains(
+            tmp_path,
+            FnPolicyModuleList,
+            rank,
+            r'def _train_step\([^)]*\):\n([\s\S]*?)(?:\ndef |\Z)',
+        )
+        assert train_step.count('executor.fexecute(') == 2
+        backwards = len(re.findall(r'executor\.backward(?:_input)?\(', train_step))
+        assert backwards == (0 if rank == 0 else 2)
+        if scheduler == 'zero_bubble':
+            assert train_step.count('executor.backward_weight(') == (0 if rank == 0 else 2)
 
 
 @replace_all_device_with('cpu')
