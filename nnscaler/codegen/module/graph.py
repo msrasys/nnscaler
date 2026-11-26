@@ -4,12 +4,39 @@
 """Extract a pure tensor region without retaining its owning module in closures."""
 
 import ast
+from dataclasses import replace
 from fnmatch import fnmatchcase
 
 from nnscaler.flags import CompileFlag
 from nnscaler.ir.cten import IRTensor
 from nnscaler.ir.operator import IRFwOperation
-from nnscaler.graph.schedule.module_streams import weight_gradient_stream
+from nnscaler.ir.adapter import IRAdapter
+from nnscaler.ir.adapter.prim import IdentityPrim, SelectPrim, ChunkPrim, VChunkPrim, SplitAllGatherPrim
+from nnscaler.graph.schedule.module_streams import weight_gradient_stream, _local_container_read, _local_adapter
+
+
+def split_graph_metadata(region):
+    """Read structural metadata on the host before a tensor-only graph call."""
+    if all(isinstance(value, IRTensor) for value in region.inputs):
+        return [], region
+    producers = {value: node for node in region.nodes for value in node.oobjs()}
+    host = set()
+    for node in region.nodes:
+        metadata_alias = node.name == 'multiref' and node.kwargs.get('clone_level', 0) == 0
+        local_view = isinstance(node, IRAdapter) and all(
+            type(primitive) in (IdentityPrim, SelectPrim, ChunkPrim, VChunkPrim, SplitAllGatherPrim)
+            for primitive in node.prims)
+        if (_local_container_read(node) or metadata_alias or local_view) and all(
+            value not in producers or producers[value] in host for value in node.iobjs()
+        ):
+            host.add(node)
+    if not host or len(host) == len(region.nodes):
+        return [], region
+    nodes = [node for node in region.nodes if node not in host]
+    produced = {value for node in nodes for value in node.oobjs()}
+    inputs = tuple(dict.fromkeys(value for node in nodes for value in node.iobjs()
+                                 if value not in produced))
+    return [node for node in region.nodes if node in host], replace(region, nodes=nodes, inputs=inputs)
 
 
 def emit_graph_region(codegen, segment, region, codes, lifetime, *, prepared=None):
@@ -18,12 +45,14 @@ def emit_graph_region(codegen, segment, region, codes, lifetime, *, prepared=Non
     if not region.outputs or any(not isinstance(v, IRTensor) for v in (*region.inputs, *region.outputs)):
         raise ValueError('Module CUDA graph regions require tensor-only boundaries')
     for node in region.nodes:
-        if (not isinstance(node, IRFwOperation) or node.recompute is not None
+        if ((not isinstance(node, IRFwOperation) and not (region.cuda_graph == 'forward' and _local_adapter(node)))
+                or node.recompute is not None
                 or node.pre_hook is not None or node.post_hook is not None
                 or node.signature in codegen.async_op_signatures
                 or any(fnmatchcase(node.signature, p) for p in CompileFlag.multi_stream_ops)
                 or weight_gradient_stream(node, CompileFlag.module_streams)):
-            raise ValueError('Module CUDA graphs require pure operators without checkpoints, hooks or internal streams')
+            raise ValueError('Module CUDA graphs require pure operators without checkpoints, hooks or internal streams: '
+                             f'{type(node).__name__} {node.signature}')
 
     arguments = [f'_graph_input_{i}' for i in range(len(region.inputs))]
     replacements = {codegen.tensor_name(value, prefix_attr='self.'): name

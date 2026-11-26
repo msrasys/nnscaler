@@ -61,6 +61,11 @@ Exclusive local layout adapters and builtin metadata reads follow that branch;
 other producer computations do not move implicitly. Operator selection cannot
 split a module or select a recomputation region.
 
+Graph regions may read tensor inputs from traced builtin metadata containers.
+Those reads and their local views run outside capture; only tensor computation
+is captured. Use a forward/backward graph for compiled operators whose backward
+donates saved buffers: forward-only replay retains its backward tape.
+
 Rules can also be supplied as JSON through `NNSCALER_MODULE_STREAMS`. Resolved
 rules and their compiler ABI are serialized in the compute configuration and
 invalidate generated-code reuse when changed. Regenerate plans made with older

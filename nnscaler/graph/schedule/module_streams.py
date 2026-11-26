@@ -15,7 +15,7 @@ import json
 import os
 
 from nnscaler.ir.operator import IRFwOperation
-from nnscaler.ir.cten import IRObject
+from nnscaler.ir.cten import IRObject, IRTensor
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.ir.adapter.prim import (
     IdentityPrim,
@@ -48,7 +48,7 @@ class ModuleStreamRule:
     weight_backward_only: bool = False
     accumulate_weight_grads: bool = False
     cuda_graph: bool | str = False
-    _codegen_version: int = field(default_factory=lambda: 35, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 36, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):
@@ -513,7 +513,8 @@ def plan_module_graph_preparation(nodes, regions):
     owners = {node: region for region in regions.values() for node in region.nodes}
     result = {}
     for region in regions.values():
-        if region.cuda_graph != 'forward' or region.ready_before is None:
+        if (region.cuda_graph != 'forward' or region.ready_before is None
+                or any(not isinstance(value, IRTensor) for value in region.inputs)):
             continue
         anchor = positions[region.ready_before]
         begin = max((producers.get(value, -1) + 1 for value in region.inputs), default=0)

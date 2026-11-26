@@ -174,3 +174,60 @@ def test_generated_graph_regions_calibrate_then_train_after_weight_updates(tmp_p
         torch.cuda.synchronize()
         nnscaler.uninit()
         if dist.is_initialized():dist.destroy_process_group()
+
+
+@nnscaler.register_op('n h, h, n -> h')
+def graph_statistics(x, scale, mask):
+    return (x * scale * mask[:, None]).sum(0)
+
+
+class MetadataBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.randn(8))
+
+    def forward(self, x, metadata):
+        y = ready_anchor(x * self.scale)
+        return y + graph_statistics(x, self.scale, metadata['mask'])
+
+
+class MetadataModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = MetadataBlock()
+
+    def forward(self, x, mask):
+        return self.block(x, {'mask': mask})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+@pytest.mark.parametrize('capture_mode', [True, 'forward'])
+def test_metadata_reads_stay_outside_capture_and_preserve_gradients(tmp_path, capture_mode):
+    from nnscaler.runtime.module_graph import prepare_module_graphs
+    dist.init_process_group('nccl', init_method=f'file://{tmp_path}/metadata_pg', rank=0, world_size=1)
+    try:
+        nnscaler.init()
+        model = MetadataModel().cuda()
+        reference = copy.deepcopy(model)
+        x = torch.randn(4, 8, device='cuda', requires_grad=True)
+        mask = torch.randn(4, device='cuda', requires_grad=True)
+        rule = ModuleStreamRule('block', operators='*.graph_statistics', stream='stats',
+                                launch_after='*.ready_anchor', cuda_graph=capture_mode)
+        generated = parallelize(model, {'x': x, 'mask': mask}, pas_dp,
+                                ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
+                                instance_name=f'metadata_graph_{capture_mode}')
+        for iteration in range(3):
+            for p in (x, mask, *generated.parameters(), *reference.parameters()):p.grad = None
+            actual = generated(x, mask)
+            rx, rm = x.detach().clone().requires_grad_(), mask.detach().clone().requires_grad_()
+            expected = reference(rx, rm)
+            actual.square().sum().backward()
+            expected.square().sum().backward()
+            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(x.grad, rx.grad)
+            torch.testing.assert_close(mask.grad, rm.grad)
+            for name, p in generated.named_parameters():
+                torch.testing.assert_close(p.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+            if iteration == 0:prepare_module_graphs(generated)
+    finally:
+        dist.destroy_process_group()

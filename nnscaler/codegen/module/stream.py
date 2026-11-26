@@ -18,7 +18,7 @@ from nnscaler.graph.schedule.module_streams import (
 from nnscaler.graph.schedule.weight_backward import plan_weight_backward
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.ir.cten import IRTensor
-from .graph import emit_graph_region
+from .graph import emit_graph_region, split_graph_metadata
 
 
 def _record_parameter_streams(codegen, nodes, regions):
@@ -313,9 +313,12 @@ def emit_module_streams(codegen, segment, runtime_devid):
             with Block(
                 f'with _module_streams.fork({region.key!r}, {region.stream!r}, ' f'{names(region.inputs)}{preserve}):'
             ) as block:
-                codes = emit(region.nodes)
+                prefix, captured = split_graph_metadata(region) if region.cuda_graph else ([], region)
+                if prefix:
+                    block.insert_body(emit(prefix))
+                codes = emit(captured.nodes)
                 if region.cuda_graph:
-                    codes = emit_graph_region(codegen, segment, region, codes, lifetime,
+                    codes = emit_graph_region(codegen, segment, captured, codes, lifetime,
                                               prepared=preparations.get(region.key))
                 block.insert_body(codes)
             body.extend(block.code)
