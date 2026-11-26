@@ -10,6 +10,15 @@ import torch
 import os
 from pathlib import Path
 
+
+def gpu_counts_enabled():
+    """Whether the backend should keep expert-layout metadata on the GPU."""
+    value = os.environ.get('NNSCALER_DEEPEP_GPU_COUNTS', '0')
+    if value not in ('0', '1'):
+        raise ValueError('NNSCALER_DEEPEP_GPU_COUNTS must be 0 or 1')
+    return value == '1'
+
+
 ENV_NAME = 'NNSCALER_DEEPEP_CONFIG'
 CONFIG_FIELDS = ('num_sms', 'nvl_chunk_size', 'nvl_buffer_size',
                  'rdma_chunk_size', 'rdma_buffer_size')

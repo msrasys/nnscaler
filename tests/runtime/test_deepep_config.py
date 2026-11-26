@@ -6,9 +6,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from nnscaler.runtime.deepep import CONFIG_FIELDS, configure_from_file, get_config_override, validate_configs
+from nnscaler.runtime.deepep import CONFIG_FIELDS, configure_from_file, get_config_override, gpu_counts_enabled, validate_configs
 
 SPEC = {'2': {'dispatch': [96, 128, 512, 6, 128], 'combine': [96, 64, 512, 6, 128]}}
+
+
+def test_gpu_counts_switch_rejects_ambiguous_values(monkeypatch):
+    monkeypatch.delenv('NNSCALER_DEEPEP_GPU_COUNTS', raising=False)
+    assert not gpu_counts_enabled()
+    monkeypatch.setenv('NNSCALER_DEEPEP_GPU_COUNTS', '1')
+    assert gpu_counts_enabled()
+    monkeypatch.setenv('NNSCALER_DEEPEP_GPU_COUNTS', 'true')
+    with pytest.raises(ValueError, match='must be 0 or 1'):
+        gpu_counts_enabled()
 
 
 def test_override_only_applies_to_configured_groups(monkeypatch):
