@@ -284,9 +284,15 @@ class ScheduleCodeGen(FuncEmission):
                             return True
                     if actx.record_events:
                         return True
-                    # Restoring the order needs a handle to W's stream, and W on the ambient
-                    # stream has none. Such a schedule cannot make a named stream wait on the
-                    # ambient stream through `wait_streams` either, so just keep the adapter.
+                    # Hoisting is safe only because `_flush_pending_weight` makes the adapter's
+                    # stream wait on W's stream again after W.
+                    # That wait needs a handle to W's stream, which exists only for a named stream.
+                    # When W runs on the ambient stream and the adapter on a named stream there is none,
+                    # so the adapter keeps its place.
+                    # Nothing is lost: `wait_streams` cannot name the ambient stream, so such a schedule
+                    # already races where the adapter reads data produced on the ambient stream.
+                    # The other combinations need no handle: an adapter on W's stream follows W anyway,
+                    # and an adapter on the ambient stream next to a named W waits via `get_stream`.
                     wstream = wctx.stream if wctx else None
                     return wstream is None and actx.stream is not None
 
