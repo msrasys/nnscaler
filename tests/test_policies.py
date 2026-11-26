@@ -1175,23 +1175,6 @@ def sched_1f1b_multi_stream_reducer_no_wait(
     return schedule
 
 
-def sched_1f1b_adapter_streams_only(
-    graph: IRGraph,
-    num_microbatches: int,
-    num_stages: int,
-) -> SchedulePlan:
-    """Plain 1F1B with segments on the ambient stream and adapters on `comm`."""
-    from nnscaler.graph.schedule.predefined import PredefinedSched
-    schedule = PredefinedSched.sched_1f1b(graph, num_microbatches, num_stages)
-    comm = StreamContext(stream='comm')
-    schedule.stream_config = StreamConfig(
-        inter_segment_move=comm,
-        result_broadcast=comm,
-        grad_reduce=comm,
-    )
-    return schedule
-
-
 def sched_1f1b_plan_local_streams(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
     sched = sched_1f1b_multi_stream(graph, num_microbatches, num_stages)
     sched.stream_config = StreamConfig(
@@ -1564,40 +1547,6 @@ def test_codegen_reorders_stream_waits_after_weight(tmp_path):
         assert re.search(
             r"wait_stream\([^\n]*get_stream\('comp'\)\)", train_step[last_weight:reducer],
         )
-
-
-@replace_all_device_with('cpu')
-def test_codegen_reorders_after_weight_on_ambient_stream(tmp_path):
-    # W runs on the ambient stream, which has no name, so codegen captures it
-    # before making `comm` wait on it again after W.
-    parallelize(
-        FnPolicyModuleList(),
-        {'x': torch.randn(4, 4)},
-        megatron_ffn_policy_list,
-        ComputeConfig(4, 8, use_end2end=True, use_fbw=True, use_async_comm=True, pas_config={
-            'pipeline_nmicros': 2,
-            'pipeline_size': 2,
-            'pipeline_scheduler': sched_1f1b_adapter_streams_only,
-        }),
-        gen_savedir=tmp_path,
-        load_module=False,
-    )
-    train_step, = _gencode_contains(
-        tmp_path,
-        FnPolicyModuleList,
-        0,
-        r'def _train_step\([^)]*\):\n([\s\S]*?)\ndef _infer_step',
-    )
-    inputs = [m.start() for m in re.finditer(r'executor\.backward_input\(', train_step)]
-    weights = [m.start() for m in re.finditer(r'executor\.backward_weight\(', train_step)]
-    recvs = [m.start() for m in re.finditer(r'= nnscaler\.runtime\.executor\.aexecute\(model\.adapter\d+, \*\(\)', train_step)]
-    # adapters are still hoisted ahead of W
-    assert any(i < r < w for i, w in zip(inputs, weights) for r in recvs)
-    last_weight = weights[-1]
-    reducer = re.search(r'aexecute\(model\.reducer\d+', train_step).start()
-    tail = train_step[last_weight:reducer]
-    assert '_weight_stream = torch.cuda.current_stream()' in tail
-    assert 'wait_stream(_weight_stream)' in tail
 
 
 @replace_all_device_with('cpu')

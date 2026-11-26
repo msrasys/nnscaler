@@ -282,7 +282,13 @@ class ScheduleCodeGen(FuncEmission):
                     if actx.wait_events and wctx and wctx.record_events:
                         if set(actx.wait_events) & set(wctx.record_events):
                             return True
-                    return bool(actx.record_events)
+                    if actx.record_events:
+                        return True
+                    # Restoring the order needs a handle to W's stream, and W on the ambient
+                    # stream has none. Such a schedule cannot make a named stream wait on the
+                    # ambient stream through `wait_streams` either, so just keep the adapter.
+                    wstream = wctx.stream if wctx else None
+                    return wstream is None and actx.stream is not None
 
                 # Streams of the adapters emitted ahead of the pending W.
                 hoisted_streams = []
@@ -298,17 +304,16 @@ class ScheduleCodeGen(FuncEmission):
                     # Nodes that follow it on the same stream, or that wait on that stream,
                     # inherit that ordering in the original plan, so re-wait on W's stream
                     # here to keep them after W.
-                    streams = [s for s in dict.fromkeys(hoisted_streams) if s != wstream]
-                    if streams:
-                        if wstream is None:
-                            # W ran on the ambient stream, which has no name to look up
-                            # from inside another stream's context, so capture it here.
-                            _append_code(fb, '_weight_stream = torch.cuda.current_stream()')
-                            weight_stream = '_weight_stream'
-                        else:
-                            weight_stream = f'nnscaler.runtime.device.DeviceGroup().get_stream({wstream!r})'
-                        for stream in streams:
-                            _append_code(fb, f'torch.cuda.current_stream().wait_stream({weight_stream})', stream)
+                    # `_adapter_syncs_with_weight` keeps adapters off other streams when W
+                    # runs on the ambient stream, so `wstream` is named whenever this emits.
+                    for stream in dict.fromkeys(hoisted_streams):
+                        if stream != wstream:
+                            _append_code(
+                                fb,
+                                'torch.cuda.current_stream().wait_stream('
+                                f'nnscaler.runtime.device.DeviceGroup().get_stream({wstream!r}))',
+                                stream,
+                            )
                     hoisted_streams.clear()
                     if pending_weight_release_codes:
                         _append_code(fb, pending_weight_release_codes)

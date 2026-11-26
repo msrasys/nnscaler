@@ -74,6 +74,21 @@ def test_trainer_pipeline(tmp_path):
         'fbw',
         ['--compute_config.use_fbw', 'True',]
     )
+    # Adapters are hoisted ahead of W across streams and `comm` waits on `comp` again after W.
+    launch_torchrun(4, trainer_worker_pipeline_multiple_stream, tmp_path, 'trainer_args_pipeline.yaml',
+        'fbw_async',
+        ['--compute_config.use_fbw', 'True', '--compute_config.use_async_comm', 'True']
+    )
+    # The reducer on `comm` has no wait of its own and relies on that re-wait to see W's gradients.
+    launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml',
+        'fbw_async_reducer_no_wait',
+        [
+            '--compute_config.pas_config.pipeline_scheduler',
+            'tests.test_policies.sched_1f1b_multi_stream_reducer_no_wait',
+            '--compute_config.use_fbw', 'True',
+            '--compute_config.use_async_comm', 'True',
+        ]
+    )
     launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline_autodist.yaml')
     launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml')
     launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml',
@@ -100,7 +115,7 @@ def test_trainer_pipeline(tmp_path):
     )
 
     merged_files = list((tmp_path).glob('merged_*.pt'))
-    assert len(merged_files) == 7
+    assert len(merged_files) == 9
     merged_state_dicts = [torch.load(merged_file, weights_only=False) for merged_file in merged_files]
 
     reference = merged_state_dicts[0]
