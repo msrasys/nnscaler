@@ -266,15 +266,14 @@ class ScheduleCodeGen(FuncEmission):
                 allow_adapter_before_weight = CompileFlag.async_comm
 
                 def _adapter_syncs_with_weight(adapter: IRCell, weight_node: IRCell) -> bool:
-                    """Whether `adapter` may carry an event dependency on `weight_node`.
+                    """Whether `adapter` must stay after `weight_node`.
 
-                    A plain `wait_streams` is not such a dependency: the adapter only needs the I
-                    outputs, and waiting on the stream before W is the same ordering as in
-                    single-stream code. Events can carry one: the adapter waits on an event W
-                    records, or it records an event that a later node waits on. A recorded event
-                    covers whatever the recording stream has waited for so far, which may include
-                    W through an earlier adapter's `wait_streams` on the same stream, so any
-                    recorded event is treated as a dependency.
+                    Stream waits are not checked here: an adapter only needs the I outputs,
+                    and the stream ordering it gives later nodes is restored after W
+                    (see `_flush_pending_weight`).
+                    Events cannot be restored that way, because an event's coverage is fixed
+                    when it is recorded: an adapter that waits on an event W records, or that
+                    records an event itself, keeps its place.
                     """
                     actx = self._get_node_stream_context(execplan, adapter)
                     wctx = self._get_node_stream_context(execplan, weight_node)
@@ -285,41 +284,32 @@ class ScheduleCodeGen(FuncEmission):
                             return True
                     return bool(actx.record_events)
 
-                # Hoisting is decided once for the whole contiguous run of adapters after a
-                # pending W: moving an earlier adapter can break a dependency that only a later
-                # adapter of the same run makes visible, e.g. W -> A(wait_streams=[W's stream])
-                # -> B(same stream as A, record_events=[...]).
-                # Line of the last adapter of the run already decided, and the decision.
-                hoist_run_last_line = -1
-                hoist_run_allowed = False
-
-                def _can_hoist_adapter(line: int) -> bool:
-                    nonlocal hoist_run_last_line, hoist_run_allowed
-                    if line > hoist_run_last_line:
-                        end = line
-                        while (
-                            end < len(device_nodes)
-                            and _is_adapter(device_nodes[end])
-                            and _depends_totally_on(device_nodes[end], pending_weight_node)
-                        ):
-                            end += 1
-                        hoist_run_last_line = end - 1
-                        hoist_run_allowed = not any(
-                            _adapter_syncs_with_weight(adapter, pending_weight_node)
-                            for adapter in device_nodes[line:end]
-                        )
-                    return hoist_run_allowed
+                # Streams of the adapters emitted ahead of the pending W.
+                hoisted_streams = []
 
                 def _flush_pending_weight():
                     nonlocal pending_weight_node
                     if pending_weight_node is None:
                         return
                     _append_skip_flag(pending_weight_node)
-                    _append_code(
-                        fb,
-                        pending_weight_codes,
-                        self._get_node_stream(execplan, pending_weight_node),
-                    )
+                    wstream = self._get_node_stream(execplan, pending_weight_node)
+                    _append_code(fb, pending_weight_codes, wstream)
+                    # A hoisted adapter waited on W's stream before W was enqueued.
+                    # Nodes that follow it on the same stream, or that wait on that stream,
+                    # inherit that ordering in the original plan, so re-wait on W's stream
+                    # here to keep them after W.
+                    streams = [s for s in dict.fromkeys(hoisted_streams) if s != wstream]
+                    if streams:
+                        if wstream is None:
+                            # W ran on the ambient stream, which has no name to look up
+                            # from inside another stream's context, so capture it here.
+                            _append_code(fb, '_weight_stream = torch.cuda.current_stream()')
+                            weight_stream = '_weight_stream'
+                        else:
+                            weight_stream = f'nnscaler.runtime.device.DeviceGroup().get_stream({wstream!r})'
+                        for stream in streams:
+                            _append_code(fb, f'torch.cuda.current_stream().wait_stream({weight_stream})', stream)
+                    hoisted_streams.clear()
                     if pending_weight_release_codes:
                         _append_code(fb, pending_weight_release_codes)
                     pending_weight_node = None
@@ -384,7 +374,7 @@ class ScheduleCodeGen(FuncEmission):
                                 allow_adapter_before_weight
                                 and _is_adapter(node)
                                 and _depends_totally_on(node, pending_weight_node)
-                                and _can_hoist_adapter(line)
+                                and not _adapter_syncs_with_weight(node, pending_weight_node)
                             ):
                                 # if the next node is an adapter that depends on the last backward,
                                 # we need to emit the adapter before the last backward_weight codes
@@ -394,10 +384,14 @@ class ScheduleCodeGen(FuncEmission):
                                 # the outputs of the previous backward/forward segments.
                                 # So all adapters should be emitted before the last backward_weight codes.
                                 _append_skip_flag(node) # should no-op for adapters.
-                                _append_code(fb, codes, self._get_node_stream(execplan, node))
+                                hoisted_streams.append(self._get_node_stream(execplan, node))
+                                _append_code(fb, codes, hoisted_streams[-1])
                                 pending_weight_release_codes.extend(release_codes)
                                 release_codes = []
                             else:
+                                # W is emitted here and nothing is pending afterwards,
+                                # so the nodes after this one keep their original order.
+                                # Only the adapters before the first one that must stay are hoisted.
                                 _flush_pending_weight()
                                 _append_skip_flag(node)
                                 _append_code(fb, codes, self._get_node_stream(execplan, node))
