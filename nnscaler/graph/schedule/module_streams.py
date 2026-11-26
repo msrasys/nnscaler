@@ -40,18 +40,21 @@ class ModuleStreamRule:
     recompute_only: bool = False
     overlap_backward: bool = False
     recompute_ready_on: str | None = None
+    recompute_prefetch_on: str | None = None
+    recompute_prefetch_phase: str = 'forward'
+    recompute_prefetch_bytes: int = 1024 ** 3
     backward_on: str | None = None
     operators: str | tuple[str, ...] | None = None
     weight_backward_only: bool = False
     accumulate_weight_grads: bool = False
     cuda_graph: bool | str = False
-    _codegen_version: int = field(default_factory=lambda: 33, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 35, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f'{name} must be a nonempty string')
-        if self.stream == 'default':
+        if self.stream == 'default' and self.recompute_prefetch_on is None:
             raise ValueError('Module streams must use a distinct, named stream')
         for name in (
             'launch_before',
@@ -60,6 +63,7 @@ class ModuleStreamRule:
             'resume_before',
             'resume_after',
             'recompute_ready_on',
+            'recompute_prefetch_on',
             'backward_on',
         ):
             value = getattr(self, name)
@@ -87,6 +91,15 @@ class ModuleStreamRule:
                 raise ValueError('Operator selection cannot split modules or select recompute regions')
         if self.recompute_ready_on is not None and not self.recompute_only:
             raise ValueError('recompute_ready_on requires a recompute_only rule')
+        if self.recompute_prefetch_on is not None:
+            if not self.recompute_only or self.recompute_ready_on is not None:
+                raise ValueError('Checkpoint prefetch requires recompute_only without recompute_ready_on')
+        elif self.recompute_prefetch_phase != 'forward' or self.recompute_prefetch_bytes != 1024 ** 3:
+            raise ValueError('Prefetch phase/budget require recompute_prefetch_on')
+        if self.recompute_prefetch_phase not in ('forward', 'backward'):
+            raise ValueError('Prefetch phase must be forward or backward')
+        if type(self.recompute_prefetch_bytes) is not int or self.recompute_prefetch_bytes <= 0:
+            raise ValueError('Checkpoint prefetch budget must be a positive integer')
         if self.accumulate_weight_grads and not self.weight_backward_only:
             raise ValueError('accumulate_weight_grads requires weight_backward_only')
         if self.cuda_graph and (self.recompute_only or self.weight_backward_only):

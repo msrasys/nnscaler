@@ -105,6 +105,29 @@ still applies.
 
 ## Runtime branch API
 
+An existing checkpoint can also replay at a later registered async operator:
+
+```python
+ModuleStreamRule('*.attention', stream='default', recompute_only=True,
+                 recompute_prefetch_on='*.combine',
+                 recompute_prefetch_phase='forward',
+                 recompute_prefetch_bytes=8 * 1024**3)
+```
+
+The phase is `forward` or `backward`. Replay keeps the original checkpoint
+operations and belongs to the same forward invocation. All prefetch rules share
+one per-device byte budget; exhausted budgets retain ordinary lazy replay.
+`stream='default'` runs replay on the caller before installing the backend's
+result wait. Named streams are also supported. Forward prefetches join before
+the segment returns; saved inputs and parameters retain their version checks.
+Nested checkpoints, higher-order gradients and graph capture are unsupported.
+As with module streams, custom operators in the selected checkpoint must be pure.
+
+For backward prefetch, the backend calls the captured launch point's
+`record_ready()` before submission and `submitted()` immediately afterwards,
+before waiting for communication results. This also supports an aggregate launch
+point shared with other backward branches.
+
 Custom backends can manage their own phases through `ModuleStreams`:
 
 ```python

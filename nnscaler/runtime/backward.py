@@ -152,6 +152,10 @@ class BackwardLaunchPoint:
             for target in self.streams if stream is None else (stream,):
                 target.wait_event(self.ready)
 
+    def submitted(self):
+        """Backend hook after enqueueing communication, before its result wait."""
+        pass
+
 
 class _BackwardLaunchPoints:
     """One backend event can gate independent side regions and checkpoints."""
@@ -164,6 +168,10 @@ class _BackwardLaunchPoints:
         ready.record()
         for point in self.points:
             point.ready = ready
+
+    def submitted(self):
+        for point in self.points:
+            point.submitted()
 
 
 def capture_async_backward():

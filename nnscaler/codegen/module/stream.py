@@ -11,6 +11,7 @@ from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import Block
 from nnscaler.flags import CompileFlag
 from nnscaler.graph.schedule.checkpoint_readiness import plan_checkpoint_readiness
+from nnscaler.graph.schedule.checkpoint_prefetch import plan_checkpoint_prefetch
 from nnscaler.graph.schedule.module_streams import (
     plan_module_streams, plan_module_graph_preparation, weight_gradient_stream, direct_weight_gradients,
 )
@@ -78,8 +79,21 @@ def emit_module_streams(codegen, segment, runtime_devid):
         ):
             raise ValueError('Recompute readiness cannot also move its checkpoint or backend forward')
         ready_at[anchor].append(readiness[gid])
+    prefetch_plans = plan_checkpoint_prefetch(nodes, CompileFlag.module_streams)
+    prefetch_names = {plan.gid: plan.key for plan in prefetch_plans}
+    prefetch_forward = defaultdict(list)
+    for plan in prefetch_plans:
+        if plan.anchor.signature not in codegen.async_op_signatures:
+            raise ValueError('Checkpoint prefetch requires a registered async operator')
+        if any(plan.anchor in region.nodes or any(node.recompute == plan.gid for node in region.nodes)
+               for region in regions.values()):
+            raise ValueError('Checkpoint prefetch cannot also move its checkpoint or anchor forward')
+        if plan.rule.recompute_prefetch_phase == 'forward':
+            prefetch_forward[plan.anchor].append(plan.key)
+        else:
+            ready_at[plan.anchor].append(plan.key)
     _record_parameter_streams(codegen, nodes, regions)
-    if not regions and not anchors and not weight_plans:
+    if not regions and not anchors and not weight_plans and not prefetch_plans:
         return codegen._emit_segment_nodes(segment, nodes, runtime_devid)
 
     codegen.execplan.mark_module_streams()
@@ -90,6 +104,8 @@ def emit_module_streams(codegen, segment, runtime_devid):
             deferred[anchor].append(region)
         elif anchor is not None and region.overlap_backward and region.backward_anchor is anchor:
             raise ValueError('Backward overlap after launch requires a registered async operator')
+    for anchor in prefetch_forward:
+        deferred.setdefault(anchor, [])
     finish_after, pending_names = {}, {}
     lifetime_nodes = list(nodes)
     for index, (anchor, after_regions) in enumerate(deferred.items()):
@@ -97,9 +113,10 @@ def emit_module_streams(codegen, segment, runtime_devid):
         position = nodes.index(anchor)
         if nodes[position + 1:position + 1 + len(after_nodes)] != after_nodes:
             raise ValueError('Async after-launch regions must immediately follow their anchor')
-        lifetime_nodes.remove(anchor)
-        lifetime_nodes.insert(lifetime_nodes.index(after_nodes[-1]) + 1, anchor)
-        finish_after[after_regions[-1].key] = anchor
+        if after_nodes:
+            lifetime_nodes.remove(anchor)
+            lifetime_nodes.insert(lifetime_nodes.index(after_nodes[-1]) + 1, anchor)
+            finish_after[after_regions[-1].key] = anchor
         pending_names[anchor] = f'_async_operator_{index}'
     for region in regions.values():
         if region.overlap_backward and region.backward_anchor in deferred:
@@ -143,9 +160,16 @@ def emit_module_streams(codegen, segment, runtime_devid):
             release_unused=False,
             checkpoint_readiness=readiness,
             weight_regions=weight_names,
+            checkpoint_prefetch=prefetch_names,
         )
 
     body = [f'{name} = nnscaler.runtime.backward.BackwardLaunchPoint(())' for name in readiness.values()]
+    for plan in prefetch_plans:
+        body.extend([
+            f'{plan.key} = nnscaler.runtime.checkpoint_prefetch.Prefetch('
+            f'{plan.rule.stream!r}, {plan.rule.recompute_prefetch_bytes})',
+            f'_prefetch_regions.append({plan.key})',
+        ])
     unused = lifetime.release_tensors_after_line(-1)
     if unused:
         body.append(codegen.emit_release(unused))
@@ -195,6 +219,8 @@ def emit_module_streams(codegen, segment, runtime_devid):
         return async_codes[node][0 if submit else 1]
 
     def emit_anchor(node, *, prepared=False):
+        if prepared:
+            body.extend(f'{key}.prefetch()' for key in prefetch_forward.get(node, ()))
         anchored = backwards.get(node, ())
         dependencies = [obj for region in anchored for obj in region.outputs if obj.requires_grad]
         retained = []
@@ -268,6 +294,8 @@ def emit_module_streams(codegen, segment, runtime_devid):
         if node in deferred:
             flush()
             body.extend(async_code(node, submit=True))
+            if not deferred[node]:
+                emit_anchor(node, prepared=True)
             continue
         if node in backwards or node in weight_anchors:
             flush()
@@ -314,12 +342,16 @@ def emit_module_streams(codegen, segment, runtime_devid):
         elif node not in owners:
             pending.append(node)
     flush()
-    if regions:
+    if regions or deferred:
         with Block('with nnscaler.runtime.stream.ModuleStreams() as _module_streams:') as block:
             block.insert_body(body)
         body = block.code
     if weight_plans:
         with Block('with nnscaler.runtime.weight_accumulator.weight_backward_scopes() as _weight_regions:') as block:
+            block.insert_body(body)
+        body = block.code
+    if prefetch_plans:
+        with Block('with nnscaler.runtime.checkpoint_prefetch.prefetch_scopes() as _prefetch_regions:') as block:
             block.insert_body(body)
         body = block.code
     return body

@@ -156,6 +156,7 @@ class ModuleCodeGen(FuncEmission):
             'import nnscaler.runtime.stream',
             'import nnscaler.runtime.backward',
             'import nnscaler.runtime.checkpoint_stream',
+            'import nnscaler.runtime.checkpoint_prefetch',
             'import nnscaler.runtime.module_graph',
             'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
@@ -1067,7 +1068,7 @@ class ModuleCodeGen(FuncEmission):
         return self._emit_segment_nodes(segment, list(segment.nodes()), runtime_devid)
 
     def _emit_segment_nodes(self, segment, nodes, runtime_devid, lifetime=None, *, release_unused=True,
-                            checkpoint_readiness=None, weight_regions=None):
+                            checkpoint_readiness=None, weight_regions=None, checkpoint_prefetch=None):
         """Emit ordinary nodes/checkpoints with a caller-provided lifetime plan."""
         lifetime = lifetime or LifeCycle(nodes, segment.inputs(), segment.outputs())
         rc_groups: List[List[IRCell]] = list(
@@ -1088,7 +1089,8 @@ class ModuleCodeGen(FuncEmission):
                 rc_segment = segment.create_segment(rc_group)
                 rc_codes = self._emit_recompute(rc_group,
                     rc_segment.inputs(), rc_segment.outputs(), lifetime, runtime_devid,
-                    backward_ready=(checkpoint_readiness or {}).get(gid), weight_regions=weight_regions)
+                    backward_ready=(checkpoint_readiness or {}).get(gid), weight_regions=weight_regions,
+                    prefetch=(checkpoint_prefetch or {}).get(gid))
                 codes += rc_codes
                 # release input tensors after exiting a RC group:
                 last_node = rc_group[-1]
@@ -1319,7 +1321,8 @@ class ModuleCodeGen(FuncEmission):
         return node_codes
 
     def _emit_recompute(self, nodes: Tuple[IRCell], inputs: List[IRSubTensor], outputs: List[IRSubTensor],
-                        lifecycle: LifeCycle, runtime_devid: int, *, backward_ready=None, weight_regions=None) -> List[str]:
+                        lifecycle: LifeCycle, runtime_devid: int, *, backward_ready=None, weight_regions=None,
+                        prefetch=None) -> List[str]:
         """
         Emit code to define a Python function for Recomputing and invoke it
         e.g. (the lines are split into `List[str]`)
@@ -1380,9 +1383,12 @@ class ModuleCodeGen(FuncEmission):
             self.execplan.mark_module_streams()
             dependencies = list(dict.fromkeys([*inputs, *[obj for node in nodes for obj in node.iobjs() if obj.is_attr()]]))
             dependencies = self.tuple_name(dependencies, prefix_attr='self.')
-            context = (f', context_fn=lambda: nnscaler.runtime.checkpoint_stream.contexts('
-                       f'{stream!r}, {dependencies}'
-                       f'{", backward_ready=" + backward_ready if backward_ready else ""})')
+            if prefetch is not None:
+                context = f', context_fn=lambda: {prefetch}.contexts({dependencies})'
+            else:
+                context = (f', context_fn=lambda: nnscaler.runtime.checkpoint_stream.contexts('
+                           f'{stream!r}, {dependencies}'
+                           f'{", backward_ready=" + backward_ready if backward_ready else ""})')
         checkpoint_inputs = ', '.join(input_names + captures)
         codes.append(f'{output_names_tuple} = ckpt.checkpoint(recompute, {checkpoint_inputs}, '
                      f'use_reentrant=False{context})')
