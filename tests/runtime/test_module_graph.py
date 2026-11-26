@@ -17,6 +17,48 @@ def transform(x, weight):
     return (x @ weight).sin()
 
 
+def test_single_use_backward_state_replays_across_slots():
+    class SingleUse(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            ctx.used = False
+            ctx.save_for_backward(x)
+            return x.sin()
+
+        @staticmethod
+        def backward(ctx, gradient):
+            if ctx.used:
+                raise RuntimeError('Backward state may be consumed only once')
+            ctx.used = True
+            return gradient * ctx.saved_tensors[0].cos()
+
+    def function(x, weight):
+        return SingleUse.apply(x + weight)
+
+    weight = torch.nn.Parameter(torch.randn(256, 64, device='cuda'))
+    sample = torch.randn_like(weight, requires_grad=True)
+    probe = function(sample, weight)
+    torch.autograd.grad(probe.sum(), (sample, weight), retain_graph=True)
+    with pytest.raises(RuntimeError, match='only once'):
+        torch.autograd.grad(probe.sum(), (sample, weight), retain_graph=True)
+    del probe
+    pool = ModuleGraph(function, (sample, weight), (1,), capacity=2)
+    for _ in range(3):
+        with torch.no_grad():
+            weight.add_(.01)
+        inputs = [torch.randn_like(sample, requires_grad=True) for _ in range(2)]
+        actual = [pool(x, weight) for x in inputs]
+        expected = [function(x, weight) for x in inputs]
+        for i in (1, 0):
+            observed = torch.autograd.grad(actual[i].sum(), (inputs[i], weight))
+            reference = torch.autograd.grad(expected[i].sum(), (inputs[i], weight))
+            torch.testing.assert_close(actual[i], expected[i])
+            torch.testing.assert_close(observed, reference)
+        assert len(pool.free) == 2
+    torch.cuda.synchronize()
+    drain_stream_holds(wait=True)
+
+
 @pytest.mark.parametrize('capture_backward', [True, False])
 def test_preparation_does_not_replay_or_create_autograd_edges(monkeypatch, capture_backward):
     from nnscaler.runtime.module_graph import _profiles

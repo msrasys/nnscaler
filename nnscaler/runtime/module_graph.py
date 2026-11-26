@@ -250,21 +250,32 @@ class ModuleGraph:
                 for _ in range(3):
                     warm, _ = _tuple(function(*inputs))
                     needed = tuple(v for v in inputs if v.requires_grad)
-                    torch.autograd.grad(tuple(v for v in warm if v.requires_grad), needed,
-                                        tuple(torch.zeros_like(v) for v in warm if v.requires_grad),
-                                        allow_unused=True)
+                    gradients = iter(torch.autograd.grad(
+                        tuple(v for v in warm if v.requires_grad), needed,
+                        tuple(torch.zeros_like(v) for v in warm if v.requires_grad),
+                        allow_unused=True))
+                    warm_gradients = tuple(next(gradients) if v.requires_grad else None for v in inputs)
+                    del gradients
                 del warm
                 graph = torch.cuda.CUDAGraph()
-                with (torch.autograd.graph.saved_tensors_hooks(lambda v: v.detach(), lambda v: v),
+                saved = []
+
+                def pack(value, saved=saved):
+                    value = value.detach()
+                    saved.append(value)
+                    return value
+
+                with (torch.autograd.graph.saved_tensors_hooks(pack, lambda v: v),
                       torch.cuda.graph(graph, stream=capture_stream)):
                     outputs, _ = _tuple(function(*inputs))
-                slot = dict(inputs=inputs, forward=graph, outputs=outputs)
+                slot = dict(inputs=inputs, forward=graph, outputs=outputs, saved=saved)
                 if capture_backward:
-                    self._capture_backward(slot, capture_stream)
+                    self._capture_backward(slot, capture_stream, warm_gradients)
+                del warm_gradients
                 self.slots.append(slot)
             torch.cuda.synchronize(sample_inputs[0].device)
 
-    def _capture_backward(self, slot, stream):
+    def _capture_backward(self, slot, stream, warm_gradients):
         inputs, outputs = slot['inputs'], slot['outputs']
         if self.backward_inputs is None:
             self.backward_inputs = tuple(torch.zeros_like(y) if y.requires_grad else None for y in outputs)
@@ -274,15 +285,14 @@ class ModuleGraph:
 
         def gradients():
             values = iter(torch.autograd.grad(differentiable, needed, incoming,
-                                              allow_unused=True, retain_graph=True))
+                                              allow_unused=True))
             return tuple(next(values) if x.requires_grad else None for x in inputs)
 
-        for _ in range(3):
-            values = gradients()
         if self.backward_outputs is None:
-            self.backward_outputs = tuple(None if v is None else torch.empty_like(v) for v in values)
-        del values
+            self.backward_outputs = tuple(None if v is None else torch.empty_like(v) for v in warm_gradients)
         backward = torch.cuda.CUDAGraph()
+        # Compiled backwards may donate saved buffers. Capture one backward per
+        # forward; the slot keeps its detached saved tensors alive for replay.
         with torch.cuda.graph(backward, stream=stream, pool=self.backward_pool):
             values = gradients()
             for target, value in zip(self.backward_outputs, values):
