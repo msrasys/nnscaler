@@ -1,0 +1,108 @@
+{
+  "name": "kimi_k25_ep8_pp4",
+  "description": "Kimi-K2.5 1T-class Multimodal VLM (27L ViT + 61L DeepSeek-V3 MLA/384-Expert MoE): 32-GPU PP=4 x TP=8 & EP=8",
+  "mesh": {
+    "plan_ngpus": 32,
+    "pipeline_nstages": 4,
+    "pipeline_size": 4,
+    "pipeline_nmicros": 8,
+    "pipeline_scheduler": "1f1b",
+    "zero_stage": 1
+  },
+  "rewrites": {
+    "expand_moe_ops": false,
+    "sum_ce_loss": true,
+    "decouple_row_tp_bias": true
+  },
+  "default_partition": "replicate",
+  "recompute_modules": [
+    "layers\\.\\d+$"
+  ],
+  "stage_splits": [
+    { "layers": "0..15", "stage_id": 0 },
+    { "layers": "16..30", "stage_id": 1 },
+    { "layers": "31..45", "stage_id": 2 },
+    { "layers": "46..60", "stage_id": 3 }
+  ],
+  "rules": [
+    {
+      "name": "lm_head_vocab_tp8",
+      "fqn_regex": "(^|\\.)lm_head$",
+      "op_regex": "linear",
+      "partition": "vocab_parallel"
+    },
+    {
+      "name": "vision_qkv_col_tp8",
+      "fqn_regex": "vision_tower\\.layers\\.\\d+\\.attn\\.(q_proj|k_proj|v_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "vision_varlen_sdpa_head_tp8",
+      "op_regex": "kimi_k25_vision_varlen_sdpa",
+      "partition": "head_parallel",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "vision_proj_row_tp8",
+      "fqn_regex": "vision_tower\\.layers\\.\\d+\\.attn\\.proj$",
+      "op_regex": "linear",
+      "partition": "tp_row",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "vision_mlp_col_tp8",
+      "fqn_regex": "vision_tower\\.layers\\.\\d+\\.mlp\\.fc1$",
+      "op_regex": "linear",
+      "partition": "tp_col",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "vision_mlp_row_tp8",
+      "fqn_regex": "vision_tower\\.layers\\.\\d+\\.mlp\\.fc2$",
+      "op_regex": "linear",
+      "partition": "tp_row",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "mla_qkv_col_tp8",
+      "fqn_regex": "self_attn\\.(q_proj|q_b_proj|kv_b_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "mla_concat_kv_head_tp8",
+      "op_regex": "kimi_mla_concat_kv",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "mla_sdpa_head_tp8",
+      "op_regex": "scaled_dot_product_attention",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "mla_o_row_tp8",
+      "fqn_regex": "self_attn\\.o_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "dense_and_shared_mlp_col_tp8",
+      "fqn_regex": "mlp\\.(shared_experts\\.)?(gate_proj|up_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "dense_and_shared_mlp_row_tp8",
+      "fqn_regex": "mlp\\.(shared_experts\\.)?down_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "moe_experts_ep8",
+      "op_regex": "kimi_moe_grouped_gemm",
+      "partition": "expert_parallel"
+    }
+  ]
+}

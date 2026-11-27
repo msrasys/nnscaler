@@ -1,0 +1,77 @@
+{
+  "name": "kimi_linear_48b_ep8_tp8",
+  "description": "Kimi-Linear-48B-A3B (27L: 20 KDA + 7 NoPE-MLA, 32 heads, 256 experts): 8-GPU KDA-TP=8 + MLA-TP=8 + MoE-EP=8 + Vocab-TP=8",
+  "mesh": {
+    "plan_ngpus": 8,
+    "pipeline_nstages": 1,
+    "pipeline_size": 1,
+    "pipeline_nmicros": 1,
+    "zero_stage": 1
+  },
+  "rewrites": {
+    "expand_moe_ops": false,
+    "sum_ce_loss": true,
+    "decouple_row_tp_bias": true
+  },
+  "default_partition": "replicate",
+  "recompute_modules": [
+    "layers\\.\\d+$"
+  ],
+  "rules": [
+    {
+      "name": "lm_head_vocab_tp",
+      "fqn_regex": "(^|\\.)lm_head$",
+      "op_regex": "linear",
+      "partition": "vocab_parallel"
+    },
+    {
+      "name": "kda_and_mla_qkv_col_tp",
+      "fqn_regex": "self_attn\\.(q_proj|k_proj|v_proj|q_b_proj|kv_b_proj|b_proj|g_b_proj|forget_gate\\.f_b_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "kda_conv1d_head_tp",
+      "op_regex": "kimi_causal_conv1d",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "kda_chunk_head_tp",
+      "op_regex": "kimi_chunk_kda",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "mla_concat_kv_head_tp",
+      "op_regex": "kimi_mla_concat_kv",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "mla_sdpa_head_tp",
+      "op_regex": "scaled_dot_product_attention",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "attn_o_row_tp",
+      "fqn_regex": "self_attn\\.o_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "dense_and_shared_mlp_col_tp",
+      "fqn_regex": "mlp\\.(shared_experts\\.)?(gate_proj|up_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "dense_and_shared_mlp_row_tp",
+      "fqn_regex": "mlp\\.(shared_experts\\.)?down_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "moe_experts_ep",
+      "op_regex": "kimi_moe_grouped_gemm",
+      "partition": "expert_parallel"
+    }
+  ]
+}

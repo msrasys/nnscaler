@@ -1,0 +1,74 @@
+{
+  "name": "glm5_next_hybrid_ep4",
+  "description": "GLM-5-Next Hybrid KDA + NoPE-MLA/DSA + MoE: 4-GPU KDA-TP=4 + MLA-TP=4 + MoE-EP=4 + Vocab-TP=4",
+  "mesh": {
+    "plan_ngpus": 4,
+    "pipeline_nstages": 1,
+    "pipeline_size": 1,
+    "pipeline_nmicros": 1,
+    "zero_stage": 1
+  },
+  "rewrites": {
+    "expand_moe_ops": false,
+    "sum_ce_loss": true,
+    "decouple_row_tp_bias": true
+  },
+  "default_partition": "replicate",
+  "rules": [
+    {
+      "name": "lm_head_vocab_tp4",
+      "fqn_regex": "(^|\\.)lm_head$",
+      "op_regex": "linear",
+      "partition": "vocab_parallel"
+    },
+    {
+      "name": "dsa_indexer_mask_rep",
+      "op_regex": "glm_dsa_index_mask",
+      "partition": "replicate"
+    },
+    {
+      "name": "kda_and_mla_qkv_col_tp4",
+      "fqn_regex": "self_attn\\.(q_proj|k_proj|v_proj|q_b_proj|kv_b_proj|b_proj|g_b_proj|forget_gate\\.f_b_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "kda_conv1d_head_tp4",
+      "op_regex": "glm_causal_conv1d",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "kda_chunk_head_tp4",
+      "op_regex": "glm_chunk_kda",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "mla_sdpa_head_tp4",
+      "op_regex": "scaled_dot_product_attention",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "attn_o_row_tp4",
+      "fqn_regex": "self_attn\\.o_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "dense_and_shared_mlp_col_tp4",
+      "fqn_regex": "mlp\\.(shared_experts\\.)?(gate_proj|up_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "dense_and_shared_mlp_row_tp4",
+      "fqn_regex": "mlp\\.(shared_experts\\.)?down_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "moe_experts_ep4",
+      "op_regex": "glm_moe_grouped_gemm",
+      "partition": "expert_parallel"
+    }
+  ]
+}

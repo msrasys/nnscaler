@@ -1,0 +1,70 @@
+{
+  "name": "glm4_moe_355b_ep8_pp4",
+  "description": "GLM-4.5 / 4.6 (355B-A32B, 46L, 96 heads, 8 KV heads, 128 experts): 32-GPU PP=4 x TP=8 & EP=8",
+  "mesh": {
+    "plan_ngpus": 32,
+    "pipeline_nstages": 4,
+    "pipeline_size": 4,
+    "pipeline_nmicros": 8,
+    "pipeline_scheduler": "1f1b",
+    "zero_stage": 1
+  },
+  "rewrites": {
+    "expand_moe_ops": false,
+    "sum_ce_loss": true,
+    "decouple_row_tp_bias": true
+  },
+  "default_partition": "replicate",
+  "recompute_modules": [
+    "layers\\.\\d+$"
+  ],
+  "stage_splits": [
+    { "layers": "0..11", "stage_id": 0 },
+    { "layers": "12..23", "stage_id": 1 },
+    { "layers": "24..34", "stage_id": 2 },
+    { "layers": "35..45", "stage_id": 3 }
+  ],
+  "rules": [
+    {
+      "name": "lm_head_vocab_tp8",
+      "fqn_regex": "(^|\\.)lm_head$",
+      "op_regex": "linear",
+      "partition": "vocab_parallel"
+    },
+    {
+      "name": "attn_qkv_col_tp8",
+      "fqn_regex": "self_attn\\.(q_proj|k_proj|v_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "attn_sdpa_head_tp8",
+      "op_regex": "scaled_dot_product_attention",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "attn_o_row_tp8",
+      "fqn_regex": "self_attn\\.o_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "dense_and_shared_mlp_col_tp8",
+      "fqn_regex": "mlp\\.(shared_experts\\.)?(gate_proj|up_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "dense_and_shared_mlp_row_tp8",
+      "fqn_regex": "mlp\\.(shared_experts\\.)?down_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "moe_experts_ep8",
+      "op_regex": "glm_moe_grouped_gemm",
+      "partition": "expert_parallel"
+    }
+  ]
+}

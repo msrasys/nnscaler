@@ -1,0 +1,64 @@
+{
+  "name": "glm4_dense_tp4",
+  "description": "GLM-4 Dense (40L, 32 heads, 2 KV heads): 4-GPU GQA Head-TP=4 + Interleaved MLP TP=4 + Vocab-TP=4",
+  "mesh": {
+    "plan_ngpus": 4,
+    "pipeline_nstages": 1,
+    "pipeline_size": 1,
+    "pipeline_nmicros": 1,
+    "zero_stage": 1
+  },
+  "rewrites": {
+    "expand_moe_ops": false,
+    "sum_ce_loss": true,
+    "decouple_row_tp_bias": true
+  },
+  "default_partition": "replicate",
+  "recompute_modules": [
+    "layers\\.\\d+$"
+  ],
+  "rules": [
+    {
+      "name": "lm_head_vocab_tp4",
+      "fqn_regex": "(^|\\.)lm_head$",
+      "op_regex": "linear",
+      "partition": "vocab_parallel"
+    },
+    {
+      "name": "attn_q_col_tp4",
+      "fqn_regex": "self_attn\\.q_proj$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "attn_kv_col_tp4",
+      "fqn_regex": "self_attn\\.(k_proj|v_proj)$",
+      "op_regex": "linear",
+      "partition": "tp_col",
+      "on_indivisible": "fallback_replicate"
+    },
+    {
+      "name": "attn_sdpa_head_tp4",
+      "op_regex": "scaled_dot_product_attention",
+      "partition": "head_parallel"
+    },
+    {
+      "name": "attn_o_row_tp4",
+      "fqn_regex": "self_attn\\.o_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    },
+    {
+      "name": "mlp_gate_up_col_tp4",
+      "fqn_regex": "mlp\\.gate_up_proj$",
+      "op_regex": "linear",
+      "partition": "tp_col"
+    },
+    {
+      "name": "mlp_down_row_tp4",
+      "fqn_regex": "mlp\\.down_proj$",
+      "op_regex": "linear",
+      "partition": "tp_row"
+    }
+  ]
+}
