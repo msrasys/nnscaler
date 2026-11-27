@@ -3,9 +3,11 @@
 
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from itertools import islice
 import logging
 from pathlib import Path
+import threading
 import time
 from typing import List, Any, Dict, Tuple, Optional
 from uuid import uuid4
@@ -27,6 +29,66 @@ def _atomic_torch_save(content: Any, path: Path):
         temp_path.replace(path)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+class _BackgroundSaves(threading.local):
+    def __init__(self):
+        self.pending: Optional[List['_AttrSave']] = None
+
+
+_background_saves = _BackgroundSaves()
+
+
+class _AttrSave:
+    """A whole attribute save running on its own thread."""
+
+    def __init__(self, write, description: str):
+        self.description = description
+        self.error: Optional[BaseException] = None
+        self.thread = threading.Thread(target=self._run, args=(write,), name='nnscaler-attr-save', daemon=False)
+        self.thread.start()
+
+    def _run(self, write):
+        try:
+            write()
+        except BaseException as e:  # re-raised by wait() on the caller's thread
+            self.error = e
+
+    def wait(self):
+        self.thread.join()
+        if self.error is not None:
+            raise RuntimeError(f'Background attribute save failed: {self.description}') from self.error
+
+
+@contextmanager
+def background_attr_saves():
+    """Run `Frame.save_attr_content` calls in this context on background threads.
+
+    Values and chunk assignment are captured when the save is requested; the
+    tensors must not be modified until the context exits. On exit, every save
+    started in the context is joined (also when the body raises) and the first
+    write error is raised. Nested contexts join their own saves.
+    """
+    outer = _background_saves.pending
+    pending = _background_saves.pending = []
+    body_error = None
+    try:
+        yield
+    except BaseException as e:
+        body_error = e
+        raise
+    finally:
+        _background_saves.pending = outer
+        errors = []
+        for save in pending:
+            try:
+                save.wait()
+            except BaseException as e:
+                errors.append(e)
+        if errors:
+            if body_error is None:
+                raise errors[0]
+            _logger.error('Background attribute save failed while handling another error: %s', errors[0])
 
 
 class Frame:
@@ -181,6 +243,8 @@ class Frame:
                 CompileFlag.attr_save_workers (ATTR_SAVE_WORKERS, default 8). Use 1 for serial saves.
 
         CPU tensors are shared by the writer threads and must not be modified during saving.
+        Inside `background_attr_saves()`, the writes run on a background thread and the
+        context joins them; values and chunk assignment are captured before returning.
         Each file is published atomically; the index is published only after all shards succeed.
         On write failure, in-flight writers are joined and no index is left. Completed shards may remain.
 
@@ -211,41 +275,49 @@ class Frame:
         index_path = Path(f'{save_file_stem}.index')
         # An older index must not advertise partially overwritten shards after a failed retry.
         index_path.unlink(missing_ok=True)
-        started = time.perf_counter()
-        _logger.info('Saving %d attribute chunks to %s with %d writer(s)', len(chunks), save_file_stem, max_workers)
 
-        def save_chunk(idx, chunk):
-            chunk_started = time.perf_counter()
-            # Build only the active shard dictionaries; all tensor storage stays shared.
-            _atomic_torch_save({tid: tid2value[tid] for tid in chunk}, Path(f'{save_file_stem}.{idx}'))
-            _logger.info('Saved attribute chunk %d/%d in %.2fs', idx + 1, len(chunks), time.perf_counter() - chunk_started)
+        def write():
+            started = time.perf_counter()
+            _logger.info('Saving %d attribute chunks to %s with %d writer(s)', len(chunks), save_file_stem, max_workers)
 
-        if max_workers == 1:
-            for idx, chunk in enumerate(chunks):
-                save_chunk(idx, chunk)
-        else:
-            chunk_iter = iter(enumerate(chunks))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                pending = set()
-                try:
-                    for idx, chunk in islice(chunk_iter, max_workers):
-                        pending.add(executor.submit(save_chunk, idx, chunk))
-                    while pending:
-                        done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                        # Check every completed write before submitting more work.
-                        for future in done:
-                            future.result()
-                        for idx, chunk in islice(chunk_iter, len(done)):
+            def save_chunk(idx, chunk):
+                chunk_started = time.perf_counter()
+                # Build only the active shard dictionaries; all tensor storage stays shared.
+                _atomic_torch_save({tid: tid2value[tid] for tid in chunk}, Path(f'{save_file_stem}.{idx}'))
+                _logger.info('Saved attribute chunk %d/%d in %.2fs', idx + 1, len(chunks), time.perf_counter() - chunk_started)
+
+            if max_workers == 1:
+                for idx, chunk in enumerate(chunks):
+                    save_chunk(idx, chunk)
+            else:
+                chunk_iter = iter(enumerate(chunks))
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    pending = set()
+                    try:
+                        for idx, chunk in islice(chunk_iter, max_workers):
                             pending.add(executor.submit(save_chunk, idx, chunk))
-                finally:
-                    # Running writes cannot be cancelled; the executor joins them on exit.
-                    for future in pending:
-                        future.cancel()
+                        while pending:
+                            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                            # Check every completed write before submitting more work.
+                            for future in done:
+                                future.result()
+                            for idx, chunk in islice(chunk_iter, len(done)):
+                                pending.add(executor.submit(save_chunk, idx, chunk))
+                    finally:
+                        # Running writes cannot be cancelled; the executor joins them on exit.
+                        for future in pending:
+                            future.cancel()
 
-        # Keep the index separate from the tensor chunks so each rank can find
-        # the chunks it needs without deserializing every full-model tensor.
-        _atomic_torch_save(tid_to_chunk, index_path)
-        _logger.info('Saved attribute content and index to %s in %.2fs', save_file_stem, time.perf_counter() - started)
+            # Keep the index separate from the tensor chunks so each rank can find
+            # the chunks it needs without deserializing every full-model tensor.
+            _atomic_torch_save(tid_to_chunk, index_path)
+            _logger.info('Saved attribute content and index to %s in %.2fs', save_file_stem, time.perf_counter() - started)
+
+        if _background_saves.pending is not None:
+            _logger.info('Saving attribute content to %s in the background', save_file_stem)
+            _background_saves.pending.append(_AttrSave(write, str(save_file_stem)))
+        else:
+            write()
 
     def save_np_buffer_content(self, save_file: str):
         """

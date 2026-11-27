@@ -246,3 +246,154 @@ def test_io_errors_do_not_retry_with_dill(monkeypatch):
     monkeypatch.setattr(dill, 'dump', unexpected_fallback)
     with pytest.raises(OSError, match='disk full'):
         dump_codegen_payload({'data': b'x' * 100_000}, BrokenStream())
+
+
+def _make_closures():
+    # One local function, many closures: what `_reshape_anno` produces per node.
+    def factory(first, second, name):
+        def modifier(kwargs):
+            return first, second, name
+        return modifier
+    states = [(('a', 'b'), ('b', 'a'), 'shape'), (('a', 'b'), ('b', 'a'), 'shape'),
+              (('a', None), ('a',), 'size'), (1, 2, 'x'), (True, 2, 'x'), (1.0, 2, 'x'),
+              (0.0, 2, 'x'), (-0.0, 2, 'x'), ((1, 2), frozenset({3}), 'x'), ((1, True), 2, 'x')]
+    return [factory(*state) for state in states], states
+
+
+def test_callable_dump_cache_is_exact():
+    from nnscaler.codegen import serialization as S
+    import dill, io, pickle
+
+    closures, states = _make_closures()
+    pickler = S._CodegenPickler(io.BytesIO(), {})
+    reduced = [pickler.reducer_override(fn) for fn in closures]
+    for fn, (loader, (data,)) in zip(closures, reduced):
+        assert loader is S._load_dill_callable
+        # Cached bytes equal a fresh dump of this very function.
+        assert data == dill.dumps(fn, protocol=pickle.HIGHEST_PROTOCOL)
+    # Equal state shares one dump; 1/True/1.0 and 0.0/-0.0 stay distinct.
+    assert reduced[0][1][0] is reduced[1][1][0]
+    assert len({id(r[1][0]) for r in reduced}) == len(states) - 1
+    for fn, (loader, (data,)) in zip(closures, reduced):
+        loaded = loader(data)
+        assert loaded({}) == fn({}) and [type(v) for v in loaded({})] == [type(v) for v in fn({})]
+
+
+def test_callable_dump_cache_skips_unkeyable_state():
+    from nnscaler.codegen import serialization as S
+
+    def factory(value):
+        def modifier():
+            return value
+        return modifier
+    fn = factory(object())  # not copyable: the pickler refuses it as before
+    import io, pickle
+    with pytest.raises(pickle.PicklingError):
+        S._CodegenPickler(io.BytesIO(), {}).reducer_override(fn)
+    unpicklable = factory(object.__new__(type('Local', (), {})))
+    assert S._callable_key(unpicklable, S._code_object_ids(unpicklable.__code__)) is None
+
+
+def test_graph_dumps_loads_with_dill_and_falls_back(monkeypatch):
+    import dill, io
+    from nnscaler.codegen import serialization as S
+    from nnscaler.graph.graph import IRGraph
+
+    graph = IRGraph([], [], [], 'empty')
+    data = graph.dumps()
+    ids, loaded = dill.load(io.BytesIO(data))
+    assert isinstance(loaded, IRGraph) and loaded.name == 'empty'
+    calls = []
+    monkeypatch.setattr(S, 'try_dumps_graph', lambda obj, g: calls.append(g) or None)
+    fallback = graph.dumps()
+    assert calls == [graph]
+    assert isinstance(dill.load(io.BytesIO(fallback))[1], IRGraph)
+
+
+def test_callable_dump_cache_on_reshape_modifiers():
+    from nnscaler.codegen import serialization as S
+    from nnscaler.graph.function.function import _reshape_anno
+    import dill, io, pickle
+
+    shapes = [([4, 6], [24], 'shape'), ([4, 6], [24], 'shape'), ([2, 3, 4], [6, 4], 'shape'), ([4, 6], [24], 'size')]
+    modifiers = []
+    for in_shape, ou_shape, name in shapes:
+        _, rules = _reshape_anno(in_shape, ou_shape, name)
+        modifiers += [rule.modifier() for rule in rules if rule.modifier() is not None]
+    assert modifiers and all(fn.__qualname__ == '_reshape_anno.<locals>.modifier' for fn in modifiers)
+    pickler = S._CodegenPickler(io.BytesIO(), {})
+    for fn in modifiers:
+        loader, (data,) = pickler.reducer_override(fn)
+        assert data == dill.dumps(fn, protocol=pickle.HIGHEST_PROTOCOL)
+    assert len(pickler._callable_dumps) < len(modifiers)
+
+
+def _emitted(pickler, fn):
+    from nnscaler.codegen import serialization as S
+    loader, (data,) = pickler.reducer_override(fn)
+    assert loader is S._load_dill_callable
+    return data
+
+
+def _assert_cache_matches_fresh_dumps(closures):
+    """Every emitted dump equals a fresh dill dump, and loading preserves behavior."""
+    from nnscaler.codegen import serialization as S
+    import dill, io, pickle
+
+    pickler = S._CodegenPickler(io.BytesIO(), {})
+    emitted = [_emitted(pickler, fn) for fn in closures]
+    for fn, data in zip(closures, emitted):
+        assert data == dill.dumps(fn, protocol=pickle.HIGHEST_PROTOCOL)
+        assert S._load_dill_callable(data)() == fn()
+    return pickler, emitted
+
+
+def test_callable_dump_cache_keeps_identity_of_captured_objects():
+    # Review case: same tuple captured twice vs two equal tuples.
+    def factory(a, b):
+        def same():
+            return a is b
+        return same
+    shared = (1, 2)
+    text = ''.join(['y'] * 40)
+    closures = [factory(shared, shared), factory((1, 2), tuple([1, 2])), factory(shared, shared),
+                factory(''.join(['x'] * 40), ''.join(['x'] * 40)), factory(text, text)]
+    assert [fn() for fn in closures] == [True, False, True, False, True]
+    pickler, emitted = _assert_cache_matches_fresh_dumps(closures)
+    assert emitted[0] is emitted[2]  # equal state still shares one dump
+    assert emitted[0] != emitted[1] and emitted[3] != emitted[4]
+
+
+def test_callable_dump_cache_keeps_frozenset_iteration_order():
+    # Review case: equal frozensets whose iteration orders differ.
+    first, second = frozenset([0, 8]), frozenset([8, 0])
+    assert first == second
+    if list(first) == list(second):
+        pytest.skip('this Python build iterates both frozensets in the same order')
+
+    def factory(values):
+        def order():
+            return list(values)
+        return order
+    closures = [factory(first), factory(second)]
+    _, emitted = _assert_cache_matches_fresh_dumps(closures)
+    assert emitted[0] != emitted[1]
+
+
+def test_callable_dump_cache_keeps_sharing_with_code_constants():
+    # A captured value may be the code object's own constant (an alias dill
+    # writes as a memo reference) or an equal copy.
+    from nnscaler.codegen import serialization as S
+
+    def factory(name):
+        def check():
+            return name, 'shared-constant-abc'
+        return check
+    literal = factory(None)()[1]
+    copy = ''.join(['shared-constant-', 'abc'])
+    assert copy == literal and copy is not literal
+    closures = [factory(literal), factory(copy), factory(literal)]
+    _, emitted = _assert_cache_matches_fresh_dumps(closures)
+    assert emitted[0] is emitted[2] and emitted[0] != emitted[1]
+    loaded = [S._load_dill_callable(data)() for data in emitted]
+    assert [value[0] is value[1] for value in loaded] == [True, False, True]

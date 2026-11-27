@@ -121,10 +121,80 @@ def _can_copy_closure_cell(function, name: str, value: Any) -> bool:
     )
 
 
+_EMPTY_CELL = 'nnscaler.codegen.serialization:empty-cell'
+
+
+def _code_object_ids(code: types.CodeType) -> dict[int, int]:
+    """Ids of objects reachable from a code object, numbered in a fixed order.
+
+    Closures of one function share these objects, so a captured value that is one
+    of them (e.g. an interned string constant) is an alias dill writes as a memo
+    reference; equal but distinct values are written again.
+    """
+    ids: dict[int, int] = {}
+
+    def add(value):
+        if id(value) in ids:
+            return
+        ids[id(value)] = len(ids)
+        if isinstance(value, types.CodeType):
+            for attr in ('co_consts', 'co_names', 'co_varnames', 'co_freevars', 'co_cellvars',
+                         'co_filename', 'co_name', 'co_qualname', 'co_code', 'co_linetable',
+                         'co_exceptiontable'):
+                if hasattr(value, attr):
+                    add(getattr(value, attr))
+        elif isinstance(value, (tuple, frozenset)):
+            for item in value:
+                add(item)
+
+    add(code)
+    return ids
+
+
+class _StateKeyPickler(pickle.Pickler):
+    """C pickler whose output encodes everything dill writes for a function's state.
+
+    Pickle records types, values, container and frozenset iteration order, and object
+    sharing (memo references). Objects that belong to the shared code object or
+    module become persistent ids, so sharing with them is recorded as well.
+    """
+
+    def __init__(self, stream: BinaryIO, shared_ids: dict[int, int]):
+        super().__init__(stream, protocol=pickle.HIGHEST_PROTOCOL)
+        self._shared_ids = shared_ids
+
+    def persistent_id(self, obj):
+        index = self._shared_ids.get(id(obj))
+        return None if index is None else index
+
+
+def _callable_key(obj: types.FunctionType, shared_ids: dict[int, int]) -> Optional[tuple]:
+    """Key equal only for functions whose dill dumps are identical, or None.
+
+    Functions with the same code and globals objects dump identically when the
+    rest of their state pickles to the same bytes. State that the C pickler
+    cannot write (e.g. module objects) is not cached.
+    """
+    cells = []
+    for cell in obj.__closure__ or ():
+        try:
+            cells.append(cell.cell_contents)
+        except ValueError:
+            cells.append(_EMPTY_CELL)
+    state = (obj.__name__, obj.__qualname__, obj.__module__, obj.__doc__, tuple(cells),
+             obj.__defaults__, obj.__kwdefaults__, obj.__dict__, getattr(obj, '__annotations__', None))
+    stream = io.BytesIO()
+    try:
+        _StateKeyPickler(stream, shared_ids).dump(state)
+    except (pickle.PicklingError, AttributeError, TypeError, RecursionError):
+        return None
+    return id(obj.__code__), id(obj.__globals__), stream.getvalue()
+
+
 class _CodegenPickler(pickle.Pickler):
     """Use C pickle for the graph and dill only for non-importable functions."""
 
-    def __init__(self, stream: BinaryIO, payload: dict[str, Any]):
+    def __init__(self, stream: BinaryIO, payload: dict[str, Any], graph: Any = None):
         super().__init__(stream, protocol=pickle.HIGHEST_PROTOCOL)
         from nnscaler.graph.parser.register import CustomizedOps
 
@@ -133,6 +203,12 @@ class _CodegenPickler(pickle.Pickler):
         self._factory_fallbacks = {}
         self._registered_factories = {}
         self._closure_owners = {}
+        # Many graph nodes carry distinct closures of one local function with
+        # equal state (e.g. 6k `_reshape_anno` modifiers, 5 distinct dumps).
+        # Reuse their dill bytes; the entries keep the code and globals alive
+        # so the ids in the keys stay unique.
+        self._callable_dumps = {}
+        self._shared_ids = {}
         for signature, factory in CustomizedOps.kOpMap.items():
             module_name = _registered_op_module(CustomizedOps.kOpRuntime.get(signature))
             if module_name is not None:
@@ -142,8 +218,9 @@ class _CodegenPickler(pickle.Pickler):
 
         # graph.ckp recreates local factory functions through dill. Their
         # identities differ from kOpMap even though their signatures match.
-        module_codegen = payload.get('module_codegen')
-        graph = getattr(getattr(module_codegen, 'execplan', None), 'graph', None)
+        if graph is None:
+            module_codegen = payload.get('module_codegen')
+            graph = getattr(getattr(module_codegen, 'execplan', None), 'graph', None)
         if graph is not None:
             for node in graph.nodes(flatten=True):
                 factory = getattr(node, '_create_fn', ())
@@ -178,8 +255,39 @@ class _CodegenPickler(pickle.Pickler):
                 state = (*(obj.__defaults__ or ()), *(obj.__kwdefaults__ or {}).values(), *obj.__dict__.values())
                 if not all(_can_copy_callable_state(value) for value in state):
                     raise pickle.PicklingError('codegen callable has mutable defaults or attributes')
-                return _load_dill_callable, (dill.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL),)
+                code = obj.__code__
+                shared = self._shared_ids.get(id(code))
+                if shared is None:
+                    module_name = obj.__globals__.get('__name__')
+                    ids = _code_object_ids(code)
+                    ids.setdefault(id(module_name), len(ids))
+                    shared = self._shared_ids[id(code)] = (code, ids, module_name)
+                key = _callable_key(obj, shared[1])
+                if key is None:
+                    return _load_dill_callable, (dill.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL),)
+                entry = self._callable_dumps.get(key)
+                if entry is None:
+                    entry = self._callable_dumps[key] = (
+                        dill.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL), obj.__code__, obj.__globals__)
+                return _load_dill_callable, (entry[0],)
         return NotImplemented
+
+
+def try_dumps_graph(obj: Any, graph: Any) -> Optional[bytes]:
+    """Pickle `obj` (which contains `graph`) with the C pickler, or return None.
+
+    The result loads with `dill.load`: graph nodes and tensors pickle as with dill,
+    and only non-importable functions are embedded as dill bytes. Callers fall
+    back to `dill.dumps` when this returns None.
+    """
+    stream = io.BytesIO()
+    with codegen_pickle_recursion_limit():
+        try:
+            _CodegenPickler(stream, {}, graph=graph).dump(obj)
+        except (pickle.PicklingError, AttributeError, TypeError, RecursionError) as exc:
+            _logger.info('Fast graph serialization unavailable; falling back to dill: %s', exc)
+            return None
+    return stream.getvalue()
 
 
 def dump_codegen_payload(payload: dict[str, Any], stream: BinaryIO) -> str:
