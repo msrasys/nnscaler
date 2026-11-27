@@ -21,7 +21,7 @@ import ctypes
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -30,6 +30,7 @@ from nnscaler.flags import CompileFlag
 
 
 _PARALLEL_HOST_COPY_BYTES = 4 << 20
+_MIN_BYTES_PER_COPY_THREAD = 1 << 20
 _MADV_HUGEPAGE = 14
 _HUGE_PAGE_BYTES = 2 << 20
 _madvise = None
@@ -58,53 +59,64 @@ def _advise_huge_pages(tensor: torch.Tensor) -> None:
     end = (tensor.data_ptr() + tensor.untyped_storage().nbytes()) & ~(_HUGE_PAGE_BYTES - 1)
     if end > start:
         _madvise(start, end - start, _MADV_HUGEPAGE)  # failure only loses the speedup
-_MIN_BYTES_PER_COPY_THREAD = 1 << 20
+
+
+_copy_pool: Optional[ThreadPoolExecutor] = None
+_copy_pool_lock = threading.Lock()
+
+
+def _host_copy(dst: torch.Tensor, src: torch.Tensor, threads: int):
+    dst, src = dst.numpy(), src.numpy()
+    nbytes = src.shape[0]
+    parts = min(max(1, threads), nbytes // _MIN_BYTES_PER_COPY_THREAD)
+    if nbytes < _PARALLEL_HOST_COPY_BYTES or parts < 2:
+        np.copyto(dst, src)
+        return
+    global _copy_pool
+    with _copy_pool_lock:
+        if _copy_pool is None:
+            _copy_pool = ThreadPoolExecutor(max(1, threads), thread_name_prefix='nnscaler-staged-copy')
+    step = -(-nbytes // parts)
+    # numpy releases the GIL while copying.
+    for future in [_copy_pool.submit(np.copyto, dst[o:o + step], src[o:o + step])
+                   for o in range(0, nbytes, step)]:
+        future.result()
+
+
+def _byte_view(tensor: torch.Tensor) -> torch.Tensor:
+    # Contiguous tensors (any strides on size-1 dims) store their elements in
+    # one dense span in logical order.
+    return tensor.detach().reshape(-1).view(torch.uint8)
 
 
 class _Stager:
-    def __init__(self, chunk_bytes: int, copy_threads: int):
+    """Two pinned buffers and their events for transfers with one CUDA device."""
+
+    def __init__(self, device: torch.device, chunk_bytes: int, copy_threads: int):
+        self.device = device
         self.chunk_bytes = chunk_bytes
-        self.copy_threads = max(1, copy_threads)
+        self.copy_threads = copy_threads
         self.lock = threading.Lock()
-        self.buffers = None
-        self.events = None
-        self.pool = None
-
-    def _host_copy(self, dst: torch.Tensor, src: torch.Tensor):
-        dst, src = dst.numpy(), src.numpy()
-        nbytes = src.shape[0]
-        parts = min(self.copy_threads, nbytes // _MIN_BYTES_PER_COPY_THREAD)
-        if nbytes < _PARALLEL_HOST_COPY_BYTES or parts < 2:
-            np.copyto(dst, src)
-            return
-        if self.pool is None:
-            self.pool = ThreadPoolExecutor(self.copy_threads, thread_name_prefix='nnscaler-staged-copy')
-        step = -(-nbytes // parts)
-        # numpy releases the GIL while copying.
-        for future in [self.pool.submit(np.copyto, dst[o:o + step], src[o:o + step])
-                       for o in range(0, nbytes, step)]:
-            future.result()
-
-    def _ensure(self):
-        if self.buffers is None:
-            self.buffers = [torch.empty(self.chunk_bytes, dtype=torch.uint8, pin_memory=True) for _ in range(2)]
+        # Explicit device: a `torch.device('cuda')` context must not redirect host buffers.
+        self.buffers = [torch.empty(chunk_bytes, dtype=torch.uint8, device='cpu', pin_memory=True)
+                        for _ in range(2)]
+        with torch.cuda.device(device):
             self.events = [torch.cuda.Event() for _ in range(2)]
 
     def to_host(self, src: torch.Tensor) -> torch.Tensor:
-        out = torch.empty(src.shape, dtype=src.dtype)
+        # Same strides as `Tensor.to` keeps for dense tensors (size-1 dims included).
+        out = torch.empty_strided(src.size(), src.stride(), dtype=src.dtype, device='cpu')
         _advise_huge_pages(out)
-        src_bytes = src.detach().reshape(-1).view(torch.uint8)
-        dst_bytes = out.reshape(-1).view(torch.uint8)
+        src_bytes, dst_bytes = _byte_view(src), _byte_view(out)
         total = src_bytes.numel()
         with self.lock:
-            self._ensure()
-            stream = torch.cuda.current_stream(src.device)
+            stream = torch.cuda.current_stream(self.device)
             pending = [None, None]
 
             def drain(k):
                 self.events[k].synchronize()
                 offset, length = pending[k]
-                self._host_copy(dst_bytes[offset:offset + length], self.buffers[k][:length])
+                _host_copy(dst_bytes[offset:offset + length], self.buffers[k][:length], self.copy_threads)
                 pending[k] = None
 
             for i, offset in enumerate(range(0, total, self.chunk_bytes)):
@@ -120,20 +132,18 @@ class _Stager:
                 drain(k)
         return out
 
-    def to_device(self, src: torch.Tensor, device: torch.device) -> torch.Tensor:
-        out = torch.empty(src.shape, dtype=src.dtype, device=device)
-        src_bytes = src.detach().reshape(-1).view(torch.uint8)
-        dst_bytes = out.reshape(-1).view(torch.uint8)
+    def to_device(self, src: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_strided(src.size(), src.stride(), dtype=src.dtype, device=self.device)
+        src_bytes, dst_bytes = _byte_view(src), _byte_view(out)
         total = src_bytes.numel()
         with self.lock:
-            self._ensure()
-            stream = torch.cuda.current_stream(device)
+            stream = torch.cuda.current_stream(self.device)
             for i, offset in enumerate(range(0, total, self.chunk_bytes)):
                 k = i & 1
                 if i >= 2:
                     self.events[k].synchronize()
                 length = min(self.chunk_bytes, total - offset)
-                self._host_copy(self.buffers[k][:length], src_bytes[offset:offset + length])
+                _host_copy(self.buffers[k][:length], src_bytes[offset:offset + length], self.copy_threads)
                 with torch.cuda.stream(stream):
                     dst_bytes[offset:offset + length].copy_(self.buffers[k][:length], non_blocking=True)
                 self.events[k].record(stream)
@@ -142,15 +152,22 @@ class _Stager:
         return out
 
 
-_stager: Optional[_Stager] = None
+# One stager per CUDA device: CUDA events cannot be recorded on another device's stream.
+_stagers: Dict[int, _Stager] = {}
+_stagers_lock = threading.Lock()
 
 
-def _get_stager() -> _Stager:
-    global _stager
-    if _stager is None:
-        _stager = _Stager(max(1, CompileFlag.trace_staged_copy_chunk_mb) << 20,
-                          CompileFlag.trace_staged_copy_threads)
-    return _stager
+def _get_stager(device: torch.device) -> _Stager:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    with _stagers_lock:
+        stager = _stagers.get(index)
+        if stager is None:
+            stager = _stagers[index] = _Stager(
+                torch.device('cuda', index),
+                max(1, CompileFlag.trace_staged_copy_chunk_mb) << 20,
+                CompileFlag.trace_staged_copy_threads,
+            )
+    return stager
 
 
 class _StagedCopy(torch.autograd.Function):
@@ -158,8 +175,8 @@ class _StagedCopy(torch.autograd.Function):
     def forward(ctx, src: torch.Tensor, device: torch.device):
         ctx.src_device = src.device
         if device.type == 'cpu':
-            return _get_stager().to_host(src)
-        return _get_stager().to_device(src, device)
+            return _get_stager(src.device).to_host(src)
+        return _get_stager(device).to_device(src)
 
     @staticmethod
     def backward(ctx, grad):

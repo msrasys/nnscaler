@@ -121,50 +121,74 @@ def _can_copy_closure_cell(function, name: str, value: Any) -> bool:
     )
 
 
-_EMPTY_CELL = object()
+_EMPTY_CELL = 'nnscaler.codegen.serialization:empty-cell'
 
 
-def _exact_key(value: Any) -> Any:
-    """A hashable key equal only for values dill serializes identically.
+def _code_object_ids(code: types.CodeType) -> dict[int, int]:
+    """Ids of objects reachable from a code object, numbered in a fixed order.
 
-    Tags every value with its type (1, 1.0 and True compare equal) and spells
-    floats with repr (-0.0 == 0.0). Only state accepted by the copy checks
-    reaches this: immutable scalars, tuples/frozensets of them, read-only lists
-    of strings, modules, importable functions and types (by identity).
+    Closures of one function share these objects, so a captured value that is one
+    of them (e.g. an interned string constant) is an alias dill writes as a memo
+    reference; equal but distinct values are written again.
     """
-    kind = type(value)
-    if kind in (list, tuple):
-        return kind, tuple(_exact_key(item) for item in value)
-    if kind is frozenset:
-        return kind, frozenset(_exact_key(item) for item in value)
-    if kind in (float, complex):
-        return kind, repr(value)
-    if kind in (type(None), bool, int, str, bytes):
-        return kind, value
-    if isinstance(value, (types.ModuleType, types.FunctionType, type)):
-        return kind, id(value)
-    raise TypeError(f'no exact key for {kind.__name__}')
+    ids: dict[int, int] = {}
+
+    def add(value):
+        if id(value) in ids:
+            return
+        ids[id(value)] = len(ids)
+        if isinstance(value, types.CodeType):
+            for attr in ('co_consts', 'co_names', 'co_varnames', 'co_freevars', 'co_cellvars',
+                         'co_filename', 'co_name', 'co_qualname', 'co_code', 'co_linetable',
+                         'co_exceptiontable'):
+                if hasattr(value, attr):
+                    add(getattr(value, attr))
+        elif isinstance(value, (tuple, frozenset)):
+            for item in value:
+                add(item)
+
+    add(code)
+    return ids
 
 
-def _callable_key(obj: types.FunctionType) -> Optional[tuple]:
-    """Key of everything dill writes for a function, or None if not exact."""
+class _StateKeyPickler(pickle.Pickler):
+    """C pickler whose output encodes everything dill writes for a function's state.
+
+    Pickle records types, values, container and frozenset iteration order, and object
+    sharing (memo references). Objects that belong to the shared code object or
+    module become persistent ids, so sharing with them is recorded as well.
+    """
+
+    def __init__(self, stream: BinaryIO, shared_ids: dict[int, int]):
+        super().__init__(stream, protocol=pickle.HIGHEST_PROTOCOL)
+        self._shared_ids = shared_ids
+
+    def persistent_id(self, obj):
+        index = self._shared_ids.get(id(obj))
+        return None if index is None else index
+
+
+def _callable_key(obj: types.FunctionType, shared_ids: dict[int, int]) -> Optional[tuple]:
+    """Key equal only for functions whose dill dumps are identical, or None.
+
+    Functions with the same code and globals objects dump identically when the
+    rest of their state pickles to the same bytes. State that the C pickler
+    cannot write (e.g. module objects) is not cached.
+    """
+    cells = []
+    for cell in obj.__closure__ or ():
+        try:
+            cells.append(cell.cell_contents)
+        except ValueError:
+            cells.append(_EMPTY_CELL)
+    state = (obj.__name__, obj.__qualname__, obj.__module__, obj.__doc__, tuple(cells),
+             obj.__defaults__, obj.__kwdefaults__, obj.__dict__, getattr(obj, '__annotations__', None))
+    stream = io.BytesIO()
     try:
-        cells = []
-        for cell in obj.__closure__ or ():
-            try:
-                cells.append(_exact_key(cell.cell_contents))
-            except ValueError:  # empty cell
-                cells.append(_EMPTY_CELL)
-        return (
-            id(obj.__code__), id(obj.__globals__), obj.__module__, obj.__name__, obj.__qualname__,
-            _exact_key(obj.__doc__), tuple(cells),
-            _exact_key(tuple(obj.__defaults__ or ())),
-            _exact_key(tuple((obj.__kwdefaults__ or {}).items())),
-            _exact_key(tuple(obj.__dict__.items())),
-            _exact_key(tuple(getattr(obj, '__annotations__', {}).items())),
-        )
-    except TypeError:
+        _StateKeyPickler(stream, shared_ids).dump(state)
+    except (pickle.PicklingError, AttributeError, TypeError, RecursionError):
         return None
+    return id(obj.__code__), id(obj.__globals__), stream.getvalue()
 
 
 class _CodegenPickler(pickle.Pickler):
@@ -181,9 +205,10 @@ class _CodegenPickler(pickle.Pickler):
         self._closure_owners = {}
         # Many graph nodes carry distinct closures of one local function with
         # equal state (e.g. 6k `_reshape_anno` modifiers, 5 distinct dumps).
-        # Reuse their dill bytes; the entry keeps the code and globals alive
-        # so their ids in the key stay unique.
+        # Reuse their dill bytes; the entries keep the code and globals alive
+        # so the ids in the keys stay unique.
         self._callable_dumps = {}
+        self._shared_ids = {}
         for signature, factory in CustomizedOps.kOpMap.items():
             module_name = _registered_op_module(CustomizedOps.kOpRuntime.get(signature))
             if module_name is not None:
@@ -230,7 +255,14 @@ class _CodegenPickler(pickle.Pickler):
                 state = (*(obj.__defaults__ or ()), *(obj.__kwdefaults__ or {}).values(), *obj.__dict__.values())
                 if not all(_can_copy_callable_state(value) for value in state):
                     raise pickle.PicklingError('codegen callable has mutable defaults or attributes')
-                key = _callable_key(obj)
+                code = obj.__code__
+                shared = self._shared_ids.get(id(code))
+                if shared is None:
+                    module_name = obj.__globals__.get('__name__')
+                    ids = _code_object_ids(code)
+                    ids.setdefault(id(module_name), len(ids))
+                    shared = self._shared_ids[id(code)] = (code, ids, module_name)
+                key = _callable_key(obj, shared[1])
                 if key is None:
                     return _load_dill_callable, (dill.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL),)
                 entry = self._callable_dumps.get(key)

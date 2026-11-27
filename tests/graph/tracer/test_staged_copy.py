@@ -15,7 +15,8 @@ def small_stager(monkeypatch):
     monkeypatch.setattr(CompileFlag, 'trace_staged_copy', True)
     monkeypatch.setattr(CompileFlag, 'trace_staged_copy_min_mb', 0)
     monkeypatch.setattr(CompileFlag, 'trace_staged_copy_chunk_mb', 1)
-    monkeypatch.setattr(staged_copy, '_stager', None)
+    monkeypatch.setattr(staged_copy, '_stagers', {})
+    monkeypatch.setattr(staged_copy, '_copy_pool', None)
     calls = []
     original = staged_copy._StagedCopy.apply
     monkeypatch.setattr(staged_copy._StagedCopy, 'apply',
@@ -160,3 +161,53 @@ def test_threaded_host_copy_in_large_chunks(small_stager, monkeypatch, threads):
     y = torch.randn((20 << 20) + 5, dtype=torch.bfloat16)
     assert_same_as_to(staged_copy.to_device(y, 'cuda'), y.to('cuda'))
     assert len(small_stager) == 2
+
+
+@pytest.mark.parametrize('make_input', [
+    # Review case: contiguous, but size-1 dims keep their own strides under `Tensor.to`.
+    lambda device: torch.randn(1024, 1024, device=device).as_strided((1, 1024, 1024), (0, 1024, 1)),
+    lambda device: torch.randn(4 * 3 * 512, device=device).as_strided((4, 1, 3, 512), (1536, 7, 512, 1)),
+    lambda device: torch.randn(1, 1, 2 << 20, device=device).as_strided((1, 1, 2 << 20), (5, 3, 1)),
+])
+@pytest.mark.parametrize('source', ['cuda', 'cpu'])
+def test_size_one_dim_strides_match_to(small_stager, make_input, source):
+    x = make_input(source)
+    assert x.is_contiguous()
+    target = 'cpu' if source == 'cuda' else 'cuda'
+    result = staged_copy.to_device(x, target)
+    assert small_stager
+    assert_same_as_to(result, x.to(target))
+
+
+def test_default_cuda_device_context(small_stager):
+    # Review case: host buffers and outputs must not follow `torch.device('cuda')`.
+    x = torch.randn(3 << 18, device='cuda')
+    y = torch.randn(3 << 18)
+    with torch.device('cuda'):
+        host = staged_copy.to_device(x, 'cpu')
+        device = staged_copy.to_device(y, 'cuda')
+    assert len(small_stager) == 2
+    assert_same_as_to(host, x.to('cpu'))
+    assert_same_as_to(device, y.to('cuda'))
+    assert all(buffer.device.type == 'cpu' and buffer.is_pinned()
+               for stager in staged_copy._stagers.values() for buffer in stager.buffers)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason='needs two CUDA devices')
+def test_switching_current_device(small_stager):
+    # Review case: events recorded for one device must not be reused on another.
+    x = torch.randn(1 << 20)
+    previous = torch.cuda.current_device()
+    try:
+        torch.cuda.set_device(0)
+        on_first = staged_copy.to_device(x, 'cuda')
+        torch.cuda.set_device(1)
+        on_second = staged_copy.to_device(x, 'cuda')
+        back_from_first = staged_copy.to_device(on_first, 'cpu')
+        back_from_second = staged_copy.to_device(on_second, 'cpu')
+    finally:
+        torch.cuda.set_device(previous)
+    assert on_first.device == torch.device('cuda', 0) and on_second.device == torch.device('cuda', 1)
+    assert len(small_stager) == 4 and set(staged_copy._stagers) == {0, 1}
+    for result in (on_first, on_second, back_from_first, back_from_second):
+        assert torch.equal(bits(result), bits(x))
