@@ -27,13 +27,15 @@ can be
     3) gradient of parameters
 """
 
-from typing import List, Optional, Set, Union, Tuple, NewType, Dict, Any
+from typing import List, Optional, Set, Union, Tuple, Dict, Any
 import torch
 
 from nnscaler.ir.cten import IRTensor, ValueTrack
 
-StartEnd = NewType('[start:end)', Tuple[int, int])
-IdxChunk = NewType('(index, chunks)', Tuple[int, int])
+# Represents a start and end index for a dimension range
+StartEnd = Tuple[int, int]
+# Represents an index chunk with (index, number of chunks)
+IdxChunk = Tuple[int, int]
 
 
 class IndexMap:
