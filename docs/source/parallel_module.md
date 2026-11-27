@@ -418,7 +418,7 @@ class Model(torch.nn.Module):
         return x @ self.weight
 ```
 
-The hook must follow three rules:
+The hook must follow four rules:
 
 1. **Return exactly the requested tensors.** Yield each `(name, tensor)` once,
    with real data of `meta.sub_shape` and `meta.dtype`. Yield values **before**
@@ -432,6 +432,14 @@ The hook must follow three rules:
    use stable per-attribute seeds and global element coordinates, not one random
    stream consumed in map order or Python's randomized `hash()`. Replicas and
    overlapping slices must agree; values need not match the eager constructor.
+4. **Match generator and factory devices.** `__shard__init__` runs inside
+   `torch.device("cuda")` (including lazy iteration), so tensor factories without
+   an explicit `device` allocate on CUDA, while `torch.Generator()` still creates
+   a CPU generator. Passing a CPU generator to a CUDA-default factory raises a
+   device-mismatch error. Use `torch.Generator(device="cuda")` to generate
+   directly on GPU, or pass `device="cpu"` to both the factory and generator when
+   preserving a CPU random sequence (for example, regenerating random
+   non-persistent buffers while resuming a checkpoint created with CPU RNG).
 
 ### Seeds and replica checking
 
