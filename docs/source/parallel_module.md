@@ -678,6 +678,66 @@ the generated code in outdir will be removed EVEN IF the code generation fails i
 
 5. For `broadcast_strategy`, please note that the broadcast will only be done in `torchrun` environment, and will throw an error if `torch.distributed` is not initialized and `broadcast_strategy` is not `NONE`.
 
+6. A submodule can run on only the first plan ranks,
+for example a vision encoder that feeds the first pipeline stage of a language model.
+Keep `compute_config.plan_ngpus` equal to the full plan size shared by the other modules,
+and let the policy place all operators on plan ranks `0..k-1`.
+A policy does this by planning with a reduced copy of the config,
+and returning the planned graph:
+
+```python
+from dataclasses import replace
+from nnscaler.policies import fn, get_pas_ops, OpPlan
+
+def replicate(graph, cfg):
+    return (OpPlan(node) for node in get_pas_ops(graph))
+
+def on_first_ranks(graph, cfg, k, plans):
+    # shrink the plan to k ranks, but keep the number of scale units
+    return fn(graph, replace(cfg, plan_ngpus=k, runtime_ngpus=cfg.num_scale_units * k), plans)
+
+def first_rank_only(graph, cfg):
+    # place every operator on plan rank 0 only
+    return on_first_ranks(graph, cfg, 1, replicate)
+
+# plan rank 0 of each scale unit (global ranks 0 and 2) runs the encoder
+encoder = parallelize(Encoder(), dummy_args, first_rank_only, ComputeConfig(2, 4), ...)
+```
+
+Scale `runtime_ngpus` together with `plan_ngpus` in the reduced config.
+Then it describes the same replicas as the full config,
+so policies and checks that depend on the number of scale units or on ZeRO groups see the right values,
+and the reduced config stays valid when `k` does not divide `runtime_ngpus`.
+The inner policy can also partition operators across the first `k` plan ranks,
+e.g. `on_first_ranks(graph, cfg, 2, tp_plans)` in a plan of 3 ranks.
+Only the call to `fn` uses the reduced config;
+the `ComputeConfig` passed to `parallelize` must keep the full plan size,
+because replica offsets and communication groups follow it.
+On the other plan ranks the module has no parameters and `is_inactive_rank` is `True`.
+Still create it and pass it to `build_optimizer` on every rank,
+because gradient norm, checkpoint and communication-group setup are collective;
+only skip its forward:
+
+```python
+features = None if encoder.is_inactive_rank else encoder(pixels)
+```
+
+Each rank still needs at least one trainable parameter to build an optimizer.
+`build_optimizer` raises an error only on the ranks without one,
+while the other ranks go on and wait in their next collective call.
+`torchrun` stops those ranks once a rank fails;
+with other launchers, make sure a failed rank stops the whole job,
+otherwise the job only reports a collective timeout.
+Inactive ranks are not supported when `use_end2end` is `True`,
+so the inner policy cannot assign pipeline stages either.
+Customized operators whose `emit_fn` builds its own process group from the scale unit or all ranks
+assume every plan rank runs them,
+e.g. ring attention partitioned along the sequence dimension,
+or the wrapped BatchNorm partitioned along the batch dimension.
+Such an operator must not be partitioned across ranks in a module with inactive ranks:
+its group would include inactive ranks that never run it, and the run hangs.
+Running it unpartitioned, or on a single plan rank, is fine.
+
 
 ## Optimizer Creation
 
@@ -703,6 +763,14 @@ It has the following parameters:
     A function that maps original full-qualified parameter names to their class IDs.
     Required when using a hybrid optimizer; the return value must be a `tuple[int, int]` of `(optimizer_index, param_group_index)`.
 - `**kwargs`: the kwargs will be passed to `optimizer_fn`.
+
+Note on frozen parameters:
+freeze parameters in the original module before `parallelize` when you can;
+they are then not parameters of the generated module and need no special handling.
+After `parallelize`, a `ParallelModule` must be frozen as a whole
+(e.g. `parallel_module.requires_grad_(False)`) or not at all, before calling `build_optimizer`.
+Freezing only some of its parameters at that point is not supported:
+the merged checkpoint (`merge_state_dicts`) would store optimizer states under the wrong parameters.
 
 To support distributed training, in the function we need to hook 4 places (which we have done for you in `build_optimizer`. That's why you should use `build_optimizer` to create optimizer):
 

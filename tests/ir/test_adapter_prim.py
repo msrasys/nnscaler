@@ -75,6 +75,7 @@ def test_all_to_all_keeps_independent_layouts_through_dispatch_and_scaling(primi
     adapter.prims = [prim]
     generator = object.__new__(ModuleCodeGen)
     generator.devices = (0, 1, 2, 3)
+    generator.plan_ndevs = 4
     generator.runtime_ndevs = 8
     generator.enable_dp = True
     scaled = generator.scale(adapter, 4).prims[0]
@@ -141,6 +142,7 @@ def test_split_allgather_fusion_preserves_backward_volume():
 
     generator = object.__new__(ModuleCodeGen)
     generator.devices = (0, 1, 2, 3)
+    generator.plan_ndevs = 4
     generator.runtime_ndevs = 8
     generator.enable_dp = True
     for rank in ranks:

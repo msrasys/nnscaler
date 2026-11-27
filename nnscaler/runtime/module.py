@@ -1240,6 +1240,10 @@ class ParallelModule(CubeModule):
 
     # the rank of the module, will be assigned in the generated subclasses
     rank: int
+    # True when the policy places no operator on this rank's plan position.
+    # Such a module holds no parameters and must not be called,
+    # but it still joins collective calls such as gradient norm and checkpointing.
+    is_inactive_rank: bool = False
     # the world size to run this module, will be assigned in the generated subclasses
     world_size: int
     # the runtime version of the module when it is generated, will be assigned in the generated subclasses
@@ -2251,17 +2255,23 @@ class ParallelModule(CubeModule):
         _logger.info(f'Rank {self.rank}: Gathering model state dict for parallel module {self.__class__.__name__}')
 
         state_dict: dict[str, torch.Tensor] = self.state_dict()
+        # Names of the original module's state dict, which are the same on every rank.
+        persistent_names = set(self.origin_module_metadata.origin_state_dict_names)
         merged_state_dict = {}
         for key, pas in attr_pas.items():
             metas = [pa[1] if pa else None for pa in pas]
 
-            # None means the parameter is not in this rank (pipeline parallelism)
-            local_attr_name = pas[self.rank][0] if pas[self.rank] else None
             # Skip non-persistent buffers (e.g. rope_cos_sin_cache) that appear in
             # attr_meta_map but are not included in state_dict.
-            if local_attr_name and local_attr_name not in state_dict:
-                _logger.debug(f'Rank {self.rank}: Skipping attribute {key} (local name {local_attr_name}) — not in state_dict (likely a non-persistent buffer).')
+            # Decide on every rank alike: a rank without this tensor
+            # (pipeline parallelism, or a module inactive on this rank) cannot see that it is non-persistent,
+            # and would wait alone in the collective below.
+            if key not in persistent_names:
+                _logger.debug(f'Rank {self.rank}: Skipping attribute {key} — not in the original state dict (likely a non-persistent buffer).')
                 continue
+
+            # None means the parameter is not in this rank (pipeline parallelism, or an inactive rank)
+            local_attr_name = pas[self.rank][0] if pas[self.rank] else None
 
             full_tensor = DTensor(
                 self.rank,

@@ -55,6 +55,68 @@ class FcRelu_4_4(FcRelu):
         return super().forward(x + self.buffer)
 
 
+class Relu2(nn.Module):
+    """A module without parameters or persistent buffers."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return torch.relu(x) * 2
+
+
+class UnusedRelu2(Relu2):
+    """A module whose only parameters are unused, so the parallel module holds none of them."""
+
+    def __init__(self):
+        super().__init__()
+        self.unused = nn.Linear(4, 4)
+
+
+def _empty_optimizer_shards_worker(tmp_path):
+    init_distributed()
+    block = parallelize(FcRelu_4_4, {'x': torch.ones(2, 4)}, 'dp',
+                        ComputeConfig(1, 1), gen_savedir=tmp_path)
+    act = parallelize(Relu2, {'x': torch.ones(2, 4)}, 'dp',
+                      ComputeConfig(1, 1), gen_savedir=tmp_path)
+    unused = parallelize(UnusedRelu2, {'x': torch.ones(2, 4)}, 'dp',
+                         ComputeConfig(1, 1), gen_savedir=tmp_path)
+    # The two leading modules save no tensors, so merging has no state for them,
+    # but the trainable block after them must still find its states after reloading.
+    model = nn.Sequential(act(), unused(), block(), block(), block())
+    model[3:].requires_grad_(False)
+    opt = build_optimizer(model, torch.optim.Adam)
+    model(torch.ones(2, 4)).sum().backward()
+    opt.step()
+    local = opt.state_dict()
+    weights, merged = merge_state_dicts([model.state_dict()], [local])
+    # Every module occupies its original parameters in the merged state,
+    # including unused parameters and the frozen trailing blocks,
+    # even though they occupy no slot in the local optimizer.
+    assert len(merged['param_groups'][0]['params']) == \
+        sum(len(m.origin_module_metadata.origin_param_names) for m in model)
+    assert len(merged['state']) == len(local['state']) > 0
+    load_merged_state_dict(model, weights, opt, merged)
+    assert_equal(clone_to_cpu_recursively(opt.state_dict()['state']), clone_to_cpu_recursively(local['state']))
+    assert_equal(opt.state_dict()['param_groups'], local['param_groups'])
+
+    # When no parallel module saves tensors, the states of other trainable layers must still be merged.
+    model = nn.Sequential(nn.Linear(4, 4), act())
+    opt = build_optimizer(model, torch.optim.Adam)
+    model(torch.ones(2, 4)).sum().backward()
+    opt.step()
+    local = opt.state_dict()
+    weights, merged = merge_state_dicts([model.state_dict()], [local])
+    assert len(merged['state']) == len(local['state']) == 2
+    load_merged_state_dict(model, weights, opt, merged)
+    assert_equal(clone_to_cpu_recursively(opt.state_dict()['state']), clone_to_cpu_recursively(local['state']))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_consecutive_empty_optimizer_shards(tmp_path):
+    launch_torchrun(1, _empty_optimizer_shards_worker, tmp_path)
+
+
 def test_merge_sparse_optimizer_state():
     fullmap = {
         f'p{index}_{index}': AttrMeta(

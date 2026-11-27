@@ -12,6 +12,7 @@ boundary gradient that ``Executor.backward`` retains on the first stage,
 shares it with the other stage ranks and resumes the vision backward.
 """
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,7 @@ from nnscaler.cli.scale_unit_parallelism import (
 )
 from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import TrainerArgs
-from nnscaler.policies import OpPlan, get_pas_ops
+from nnscaler.policies import OpPlan, fn, get_pas_ops
 from nnscaler.runtime.device import DeviceGroup
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import assert_close
@@ -81,6 +82,12 @@ def replicate_policy(graph, compute_config):
     # the scale-unit DP helpers split the data; every op stays replicated
     for node in get_pas_ops(graph):
         yield OpPlan(node)
+
+
+def first_stage_policy(graph, compute_config):
+    # Shrink the plan to the first rank but keep the number of scale units.
+    return fn(graph, replace(compute_config, plan_ngpus=1, runtime_ngpus=compute_config.num_scale_units),
+              replicate_policy)
 
 
 def init_scale_unit_groups(trainer: Trainer):
@@ -188,6 +195,18 @@ class NestedEnd2EndVLModel(VLModel):
         return self.language.infer_step(batches)
 
 
+class FirstStageVisionModel(NestedEnd2EndVLModel):
+    def _pipeline_batches(self, samples):
+        if not self.vision.is_inactive_rank:
+            return super()._pipeline_batches(samples)
+        # The second stage never reads the vision input and has no vision backward.
+        return [(_language_data(s), torch.empty_like(s['pixels'])) for s in samples], []
+
+    def _boundary_grad(self, feature):
+        assert feature.grad is not None
+        return feature.grad
+
+
 _train_losses = []
 
 
@@ -196,7 +215,7 @@ def record_train_loss(trainer: Trainer, aggregated_outputs, loss):
 
 
 def nested_end2end_worker(run_dir, nested: bool, use_fbw: bool = False, vision_dp: bool = False,
-                          multi_stream: bool = False):
+                          multi_stream: bool = False, extra_args=()):
     _train_losses.clear()
     run_dir = Path(run_dir)
     config_path = str(Path(__file__).with_name('trainer_args_nested_end2end.yaml').resolve())
@@ -229,8 +248,12 @@ def nested_end2end_worker(run_dir, nested: bool, use_fbw: bool = False, vision_d
             '--model.parallel_modules.1.pas_policy', 'tp',
             '--model.parallel_modules.1.compute_config.use_end2end', 'false',
         ]
-    trainer = Trainer(args)
+    trainer = Trainer([*args, *extra_args])
     trainer.run()
+    if isinstance(trainer.model, FirstStageVisionModel):
+        vision = trainer.model.vision
+        assert vision.is_inactive_rank == (trainer.rank % 2 == 1)
+        assert bool(list(vision.parameters())) != vision.is_inactive_rank
     if multi_stream:
         assert trainer.model.language.cuda_sync_required
     if vision_dp:
@@ -247,6 +270,31 @@ def nested_end2end_worker(run_dir, nested: bool, use_fbw: bool = False, vision_d
         )
     dist.barrier()
     return list(_train_losses)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires 4 GPUs')
+def test_cli_first_stage_vision(tmp_path):
+    # Keep the language pipeline, optimizer and batches identical; change only vision placement.
+    def run(run_dir, *overrides):
+        return launch_torchrun(4, nested_end2end_worker, run_dir, True, False, False, False,
+                               ['--optimizer.clip_gnorm', '0.001', *overrides])
+
+    ref_dir, run_dir = tmp_path / 'tp', tmp_path / 'first_stage'
+    ref_losses = run(ref_dir)
+    first_stage = [
+        '--model.type', f'{__name__}.FirstStageVisionModel',
+        '--model.parallel_modules.0.pas_policy', f'{__name__}.first_stage_policy',
+    ]
+    # Resume from a merged checkpoint midway to cover optimizer state with an inactive rank.
+    first = run(run_dir, *first_stage, '--max_train_steps', '1')
+    second = run(run_dir, *first_stage, '--checkpoint.resume_from.checkpoint', str(run_dir / 'merged.pt'))
+    losses = {rank: first[rank] + second[rank] for rank in first}
+    ref, actual = (torch.load(d / 'merged.pt', weights_only=False) for d in (ref_dir, run_dir))
+    for rank in range(4):
+        assert len(losses[rank]) == 2
+        assert losses[rank] == pytest.approx(ref_losses[rank], abs=1e-5)
+    assert_close(actual['model'], ref['model'], atol=1e-5, rtol=1e-5)
+    assert_close(actual['optimizer']['state'], ref['optimizer']['state'], atol=1e-8, rtol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
