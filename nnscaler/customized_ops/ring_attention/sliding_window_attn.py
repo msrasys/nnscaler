@@ -16,7 +16,7 @@ from .core.sliding_window_attn_implementation import (
     prepare_sliding_window_metadata,
     sliding_window_attn_func,
 )
-from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno, get_arg_by_name
+from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno, get_arg_by_name, fake_attention_fn
 from .varlen_utils import select_sequence_group_cu_seqlens
 
 try:
@@ -290,4 +290,4 @@ def input_gen_fn(node: IRDimops):
     return tuple(inputs)
 
 
-register_op(flash_attention_anno, emit_fn=emit_ring, input_gen_fn=input_gen_fn)(wrap_sliding_window_attn_func)
+register_op(flash_attention_anno, emit_fn=emit_ring, input_gen_fn=input_gen_fn, fake_fn=fake_attention_fn(wrap_sliding_window_attn_func))(wrap_sliding_window_attn_func)

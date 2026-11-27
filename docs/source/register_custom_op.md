@@ -136,6 +136,9 @@ When registering a custom operator, nnscaler needs to **trace** (execute) the fu
 
 - Functions that use distributed communication (e.g., `torch.distributed.all_reduce`)
 - Functions that intentionally raise errors outside their `torchrun` runtime environment
+- Functions that read tensor values (`.item()`, `nonzero`, data-dependent branches) or lack a meta kernel
+  (e.g., numpy code or custom CUDA kernels) when `trace_strategy='meta'`. The `fake_fn` fixes the output
+  shapes, matching nnScaler's requirement that the traced graph is static.
 
 In these cases, you can provide a `fake_fn` — a lightweight stand-in that produces the correct output **shapes, types and `requires_grad` flags** without performing the real computation.
 
@@ -210,6 +213,53 @@ If your function can run normally during tracing (e.g., it only uses standard Py
 def my_matmul(x: torch.Tensor, w: torch.Tensor):
     return torch.matmul(x, w)
 ```
+
+## Call-Site Fake Results (`trace_fake`)
+
+`fake_fn` replaces the execution of every call of a registered operator. `nnscaler.trace_fake` does the
+same for a single call site of any operator the tracer records as a node: while tracing, the operator is
+not executed and the given fake stands in for its result. It is meant for operators that read tensor
+values (`torch.nonzero`, `.item()`, `torch.where(mask)`, a `bool()` condition), which cannot run under
+`trace_strategy='meta'` and raise an error naming the operator; for example the per-expert
+`torch.where(expert_mask[i])` of a Mixture-of-Experts router.
+
+```python
+import nnscaler
+
+# before
+idx, top_x = torch.where(expert_mask[expert_idx])
+# after: the fake has the shapes, dtypes and requires_grad of the real result
+idx, top_x = nnscaler.trace_fake(
+    torch.where, (torch.zeros(n, dtype=torch.long), torch.zeros(n, dtype=torch.long)),
+    expert_mask[expert_idx])
+```
+
+- The fake must have the **same shapes, dtypes and `requires_grad` flags** as the real result, for every
+  output of a multi-output operator: it is what the rest of the trace, and so the generated program, is
+  shaped by. A fake with the wrong shape, dtype or `requires_grad` is not detected during tracing and
+  surfaces as a runtime mismatch.
+- The graph still records `torch.where` with the original arguments; the generated code calls the real
+  operator and `trace_fake` never appears in it.
+- The fake is the trace value under every strategy, exactly like `fake_fn`. Outside of tracing the
+  operator runs and the fake is ignored.
+- The fake must carry data: cpu or cuda tensors, Python values for `.item()` / `.tolist()`, or tuples of
+  them for multi-output operators. Tensor methods are passed unbound, `trace_fake(torch.Tensor.item, 3, x)`;
+  conditions as `trace_fake(bool, True, mask.any())`. In-place operators are not supported.
+- A callable fake is called with the same arguments as `fn` and its return value is used, which lets the
+  fake follow the input shapes:
+  `nnscaler.trace_fake(torch.nonzero, lambda mask: torch.zeros(mask.numel(), 1, dtype=torch.long), mask)`.
+  It sees the arguments as the trace does (meta tensors under the meta strategy), so it may use shapes and
+  dtypes but not values, and must allocate on cpu.
+- `fn` must be an operator the tracer records as a node: a torch function, a tensor method, a builtin, a
+  registered operator or the `apply` of an `autograd.Function` (`trace_fake(MyFn.apply, fake, x)`). A plain
+  Python helper is rejected, since it would become one opaque node instead of being traced into; put
+  `trace_fake` on the data-dependent operator inside the helper.
+- The body of a registered operator or of an `autograd.Function` is not traced, so a `trace_fake` inside
+  it simply runs the operator. Give the whole operator its stand-in instead: `fake_fn` for a registered
+  operator, `trace_fake(MyFn.apply, ...)` for an autograd function.
+
+Prefer `update_op(fn, fake_fn=...)` when every call of `fn` can share one stand-in, and
+`register_op(..., fake_fn=...)` when a whole helper function should become one operator.
 
 ## `torch.autograd.Function`
 

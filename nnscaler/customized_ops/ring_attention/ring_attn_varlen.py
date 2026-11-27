@@ -14,7 +14,7 @@ from nnscaler.ir import IRTensor
 from nnscaler.runtime.device import DeviceGroup
 from flash_attn import flash_attn_varlen_func
 from .core.ring_attn_varlen_implementation import llama3_flash_attn_prepare_cu_seqlens, llama3_flash_attn_varlen_func
-from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno, get_arg_by_name
+from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno, get_arg_by_name, fake_attention_fn
 from .varlen_utils import (
     select_sequence_group_cu_seqlens,
     shuffle_varlen,
@@ -449,4 +449,4 @@ def input_gen_fn(node: IRDimops):
     return tuple(inputs)
 
 
-register_op(flash_attention_anno, emit_fn=emit_ring, input_gen_fn=input_gen_fn)(wrap_ring_attn_varlen_func)
+register_op(flash_attention_anno, emit_fn=emit_ring, input_gen_fn=input_gen_fn, fake_fn=fake_attention_fn(wrap_ring_attn_varlen_func))(wrap_ring_attn_varlen_func)

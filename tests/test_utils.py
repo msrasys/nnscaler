@@ -16,6 +16,13 @@ from nnscaler.utils import (
 from tests.utils import replace_all_device_with
 
 
+def test_replace_devices_keeps_dtype_only_to():
+    with replace_all_device_with('cpu', force=True):
+        x = torch.zeros(2)
+        assert x.to(device=None, dtype=torch.float16).dtype == torch.float16
+        assert x.to(dtype=torch.float16, device='cuda').device.type == 'cpu'
+
+
 @pytest.mark.parametrize('fail', [False, True])
 def test_replace_devices_context_rng_and_restore(fail):
     originals = {
