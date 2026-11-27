@@ -1,4 +1,6 @@
+import gc
 import time
+import weakref
 
 import pytest
 import torch
@@ -6,10 +8,13 @@ import torch
 from nnscaler.runtime import device
 from nnscaler.runtime.cpu_offloading import (
     CPUOffloadContext,
+    _get_offload_stream,
     _get_prefetch_stream,
     _ModuleTensorRef,
     _OffloadBatch,
+    _OffloadedStorage,
     _OffloadedTensor,
+    _OFFLOAD_STREAM_NAME,
     _PREFETCH_STREAM_NAME,
 )
 from nnscaler.runtime.module import _ModuleTensorRegistry, ParallelModule
@@ -42,7 +47,7 @@ def _cpu_offload_context(
     return CPUOffloadContext(module, prefetch_level=prefetch_level)
 
 
-def _offloaded_handles(context: CPUOffloadContext) -> list[_OffloadedTensor]:
+def _offloaded_handles(context: CPUOffloadContext) -> list[_OffloadedStorage]:
     return context.batch.handles
 
 
@@ -80,9 +85,22 @@ def test_cpu_offload_rejects_non_integer_prefetch_level(value):
         CPUOffloadContext(_TestParallelModule(), prefetch_level=value)
 
 
+def test_cpu_offload_preserves_cpu_tensors():
+    tensor = torch.randn(8, requires_grad=True)
+    context = _cpu_offload_context(_TestParallelModule())
+    with context:
+        output = tensor.square()
+    output.sum().backward()
+    assert torch.equal(tensor.grad, tensor.detach() * 2)
+    assert not _offloaded_handles(context)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_cpu_offload_uses_runtime_prefetch_stream():
     assert _get_prefetch_stream() is device.DeviceGroup().get_stream(_PREFETCH_STREAM_NAME)
+    assert _get_offload_stream() is device.DeviceGroup().get_stream(_OFFLOAD_STREAM_NAME)
+    assert _get_offload_stream() != _get_prefetch_stream()
+    assert _get_offload_stream() != torch.cuda.current_stream()
 
 
 @pytest.mark.skipif(
@@ -328,7 +346,7 @@ def test_cpu_offload_prefetch_level(prefetch_level, expected_order):
         contexts.append(context)
         handles_by_batch.append(handles)
         for handle_idx, handle in enumerate(handles):
-            original_prefetch = handle.prefetch
+            original_prefetch = handle.storage.prefetch
 
             def record_prefetch(
                 batch_idx=batch_idx,
@@ -336,11 +354,11 @@ def test_cpu_offload_prefetch_level(prefetch_level, expected_order):
                 handle=handle,
                 original_prefetch=original_prefetch,
             ):
-                if handle.device_tensor is None:
+                if handle.storage.device_tensor is None:
                     prefetch_order.append((batch_idx, handle_idx))
                 return original_prefetch()
 
-            handle.prefetch = record_prefetch
+            handle.storage.prefetch = record_prefetch
 
     contexts[2]._unpack(handles_by_batch[2][1])
 
@@ -364,7 +382,7 @@ def test_tensor_prefetch_advances_from_demanded_tensor():
         contexts.append(context)
         handles_by_batch.append(handles)
         for handle_idx, handle in enumerate(handles):
-            original_prefetch = handle.prefetch
+            original_prefetch = handle.storage.prefetch
 
             def record_prefetch(
                 batch_idx=batch_idx,
@@ -372,11 +390,11 @@ def test_tensor_prefetch_advances_from_demanded_tensor():
                 handle=handle,
                 original_prefetch=original_prefetch,
             ):
-                if handle.device_tensor is None:
+                if handle.storage.device_tensor is None:
                     prefetch_order.append((batch_idx, handle_idx))
                 return original_prefetch()
 
-            handle.prefetch = record_prefetch
+            handle.storage.prefetch = record_prefetch
 
     contexts[1]._unpack(handles_by_batch[1][2])
     contexts[1]._unpack(handles_by_batch[1][1])
@@ -402,7 +420,7 @@ def test_batch_prefetch_advances_one_batch_per_backward():
         contexts.append(context)
         handles_by_batch.append(handles)
         for handle_idx, handle in enumerate(handles):
-            original_prefetch = handle.prefetch
+            original_prefetch = handle.storage.prefetch
 
             def record_prefetch(
                 batch_idx=batch_idx,
@@ -410,16 +428,16 @@ def test_batch_prefetch_advances_one_batch_per_backward():
                 handle=handle,
                 original_prefetch=original_prefetch,
             ):
-                if handle.device_tensor is None:
+                if handle.storage.device_tensor is None:
                     prefetch_order.append((batch_idx, handle_idx))
                 return original_prefetch()
 
-            handle.prefetch = record_prefetch
+            handle.storage.prefetch = record_prefetch
 
     contexts[2]._unpack(handles_by_batch[2][0])
 
     assert prefetch_order == [(2, 0), (2, 1), (1, 1), (1, 0)]
-    assert all(handle.device_tensor is None for handle in handles_by_batch[0])
+    assert all(handle.storage.device_tensor is None for handle in handles_by_batch[0])
 
     contexts[1]._unpack(handles_by_batch[1][0])
 
@@ -442,7 +460,7 @@ def test_triggered_batch_stops_prefetch_at_segment_boundary():
     contexts[1].batch.triggered = True
     contexts[2]._unpack(handles[2])
 
-    assert handles[0].device_tensor is None
+    assert handles[0].storage.device_tensor is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
@@ -456,10 +474,10 @@ def test_cpu_offload_preserves_non_contiguous_layout():
     with context:
         output = tensor.square()
     expected_output = expected.square()
-    handle = _offloaded_handles(context)[0]
+    packed = context._pack(tensor)
 
-    assert handle.host_tensor.stride() == tensor.stride()
-    assert handle.unpack().stride() == tensor.stride()
+    assert packed.storage.host_tensor.numel() == tensor.untyped_storage().nbytes()
+    assert packed.unpack().stride() == tensor.stride()
 
     output.sum().backward()
     expected_output.sum().backward()
@@ -522,7 +540,7 @@ def test_repeated_unpack_does_not_advance_filo_stack():
     with context1:
         output1 = tensor.sin()
 
-    target = _offloaded_handles(context0)[0]
+    target = context0._pack(tensor)
     context0._unpack(target)
     prefetched_before = tuple(
         handle.device_tensor for handle in _offloaded_handles(context1)
@@ -536,3 +554,165 @@ def test_repeated_unpack_does_not_advance_filo_stack():
     assert not context1.batch.triggered
     assert all(device_tensor is None for device_tensor in prefetched_after)
     assert output0 is not None and output1 is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_cpu_offload_copies_storage_once_on_dedicated_stream(monkeypatch):
+    producer = torch.cuda.Stream()
+    context = _cpu_offload_context(_TestParallelModule())
+    copy_streams = []
+    original_copy = torch.Tensor.copy_
+
+    def record_copy(target, source, *args, **kwargs):
+        if target.device.type == 'cpu' and source.device.type == 'cuda':
+            copy_streams.append(torch.cuda.current_stream(source.device))
+        return original_copy(target, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, 'copy_', record_copy)
+    with torch.cuda.stream(producer), context:
+        tensor = torch.randn(8, 8, device='cuda')
+        first = context._pack(tensor[1:, ::2])
+        second = context._pack(tensor.T)
+        assert torch.cuda.current_stream() == producer
+
+    assert copy_streams == [context.offload_stream]
+    assert context.offload_stream != producer
+    assert first.storage is second.storage
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_cpu_offload_shares_storage_across_views():
+    tensor = torch.randn(8, 16, device='cuda', requires_grad=True)
+    expected = tensor.detach().clone().requires_grad_()
+    context = _cpu_offload_context(_TestParallelModule())
+    with context:
+        # Save a narrow view first: later views still need the entire storage.
+        output = tensor[1:3, 2::3].square().sum() + tensor.T.sin().sum()
+        packed = [
+            context._pack(view)
+            for view in (tensor, tensor.T, tensor[2:, 1::2], tensor[:0], tensor.view(torch.uint8))
+        ]
+    expected_output = expected[1:3, 2::3].square().sum() + expected.T.sin().sum()
+
+    assert len(_offloaded_handles(context)) == 1
+    assert all(value.storage is packed[0].storage for value in packed)
+    assert packed[0].storage.host_tensor.numel() == tensor.untyped_storage().nbytes()
+    restored = [value.unpack() for value in packed]
+    for source, value in zip(
+        (tensor, tensor.T, tensor[2:, 1::2], tensor[:0], tensor.view(torch.uint8)),
+        restored,
+    ):
+        assert value.dtype == source.dtype
+        assert value.shape == source.shape
+        assert value.stride() == source.stride()
+        assert value.storage_offset() == source.storage_offset()
+        assert value.untyped_storage() == restored[0].untyped_storage()
+        assert torch.equal(value, source)
+
+    output.backward(retain_graph=True)
+    expected_output.backward()
+    assert torch.equal(tensor.grad, expected.grad)
+    tensor.grad = None
+    output.backward()
+    assert torch.equal(tensor.grad, expected.grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+@pytest.mark.parametrize(
+    'mutation',
+    ['tensor', 'view', 'base', 'leaf', 'after_prefetch', 'independent_alias'],
+)
+def test_cpu_offload_detects_inplace_activation_mutation(mutation):
+    tensor = torch.randn(8, device='cuda', requires_grad=True)
+    activation = tensor if mutation == 'leaf' else tensor * 1
+    context = _cpu_offload_context(_TestParallelModule())
+    with context:
+        if mutation == 'independent_alias':
+            output = activation.square().sum()
+            activation = torch.empty(0, device=activation.device).set_(
+                activation.untyped_storage(), 0, activation.shape, activation.stride(),
+            ).requires_grad_()
+        saved = activation[::2] if mutation == 'base' else activation
+        output = saved.square().sum()
+    if mutation == 'after_prefetch':
+        _offloaded_handles(context)[0].prefetch()
+    target = activation[::2] if mutation == 'view' else activation
+    with torch.no_grad():
+        target.add_(1)
+    del saved
+
+    with pytest.raises(RuntimeError, match='modified by an inplace operation'):
+        output.backward()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_cpu_offload_resnapshots_storage_saved_after_inplace_update():
+    tensor = torch.randn(8, device='cuda', requires_grad=True)
+    expected = tensor.detach().clone().requires_grad_()
+    activation = tensor * 1
+    expected_activation = expected * 1
+    context = _cpu_offload_context(_TestParallelModule())
+    with context:
+        stale = activation.square().sum()
+        activation.add_(1)
+        output = activation.sin().sum()
+    expected_activation.add_(1)
+    expected_activation.sin().sum().backward()
+
+    # The mutated storage is offloaded twice; the earlier save stays rejected.
+    assert len(_offloaded_handles(context)) == 2
+    output.backward()
+    assert torch.equal(tensor.grad, expected.grad)
+    with pytest.raises(RuntimeError, match='modified by an inplace operation'):
+        stale.backward()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_cpu_offload_allows_inplace_before_save():
+    tensor = torch.randn(8, device='cuda', requires_grad=True)
+    expected = tensor.detach().clone().requires_grad_()
+    with _cpu_offload_context(_TestParallelModule()):
+        output = (tensor * 1).relu_().sum()
+    output.backward()
+    (expected * 1).relu_().sum().backward()
+    assert torch.equal(tensor.grad, expected.grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_cpu_offload_releases_source_storage_and_waits_for_streams():
+    producer = torch.cuda.Stream()
+    consumer = torch.cuda.Stream()
+    context = _cpu_offload_context(_TestParallelModule())
+    with torch.cuda.stream(producer), context:
+        torch.cuda._sleep(10_000_000)
+        tensor = torch.arange(128, device='cuda', dtype=torch.float32)
+        tensor_ref = weakref.ref(tensor)
+        packed = context._pack(tensor[1::3])
+    del tensor
+    gc.collect()
+
+    assert tensor_ref() is None
+    assert next(iter(context._storages)).expired()
+    assert packed.version.tensor.untyped_storage().nbytes() == 0
+    assert packed.storage.version.tensor.untyped_storage().nbytes() == 0
+    with torch.cuda.stream(consumer):
+        restored = context._unpack(packed).clone()
+        expected = torch.arange(128, device='cuda', dtype=torch.float32)[1::3]
+        assert torch.equal(restored, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_cpu_offload_preserves_special_views_and_empty_storage():
+    tensor = torch.randn(8, device='cuda', dtype=torch.complex64)
+    context = _cpu_offload_context(_TestParallelModule())
+    views = (tensor, tensor.conj(), torch._neg_view(tensor), tensor.real)
+    with context:
+        packed = [context._pack(view) for view in views]
+        empty = context._pack(torch.empty(0, device='cuda'))
+    assert len(_offloaded_handles(context)) == 2
+    for source, value in zip(views, packed):
+        restored = value.unpack()
+        assert restored.is_conj() == source.is_conj()
+        assert restored.is_neg() == source.is_neg()
+        assert torch.equal(restored, source)
+    assert empty.unpack().numel() == 0
