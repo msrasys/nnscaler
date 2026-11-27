@@ -3,6 +3,8 @@
 
 import builtins
 import importlib
+import io
+import pickle
 from contextlib import contextmanager
 from functools import wraps, cache
 from typing import (
@@ -892,6 +894,56 @@ def refill_tensors(skeleton: Dict[str, Any], tensors: List[torch.Tensor]) -> Dic
     return state_dict
 
 
+class _TensorExtractingPickler(pickle.Pickler):
+    """Pickle data with every tensor replaced by a `_TensorIndex` into `self.tensors`.
+
+    This is `extract_tensors` + pickling in one C-level pass. `reducer_override`
+    is not called for exact builtin containers and scalars, so large tensor-free
+    structures (e.g. per-rank data loader states merged from thousands of ranks)
+    cost no Python call per element, unlike `transform_recursively`.
+    Tensors are deduplicated with the same key as `extract_tensors`.
+    """
+
+    def __init__(self, file):
+        super().__init__(file, protocol=pickle.HIGHEST_PROTOCOL)
+        self.tensors: list[torch.Tensor] = []
+        self._tensor_ids: dict[tuple[int, tuple[int, ...], tuple[int, ...]], int] = {}
+
+    def reducer_override(self, obj):
+        if isinstance(obj, torch.Tensor):
+            key = (obj.data_ptr(), obj.shape, obj.stride())
+            index = self._tensor_ids.get(key)
+            if index is None:
+                index = self._tensor_ids[key] = len(self.tensors)
+                self.tensors.append(obj)
+            return _TensorIndex, (index,)
+        return NotImplemented
+
+
+class _TensorRefillingUnpickler(pickle.Unpickler):
+    """Inverse of `_TensorExtractingPickler`: `_TensorIndex(i)` loads as `tensors[i]`."""
+
+    def __init__(self, file, tensors: List[torch.Tensor]):
+        super().__init__(file)
+        self._tensors = tensors
+
+    def find_class(self, module, name):
+        if module == _TensorIndex.__module__ and name == _TensorIndex.__qualname__:
+            return self._tensors.__getitem__
+        return super().find_class(module, name)
+
+
+def _pickle_extract_tensors(data: Any) -> Tuple[bytes, List[torch.Tensor]]:
+    buffer = io.BytesIO()
+    pickler = _TensorExtractingPickler(buffer)
+    pickler.dump(data)
+    return buffer.getvalue(), pickler.tensors
+
+
+def _unpickle_refill_tensors(payload: bytes, tensors: List[torch.Tensor]) -> Any:
+    return _TensorRefillingUnpickler(io.BytesIO(payload), tensors).load()
+
+
 def broadcast_mixed_data(
     data: Optional[dict] = None,
     *,
@@ -929,17 +981,19 @@ def broadcast_mixed_data(
     if rank == src_rank:
         if data is None:
             raise ValueError("data must not be None in src_rank")
-        skeleton, tensors = extract_tensors(data)
+        payload, tensors = _pickle_extract_tensors(data)
+        original_tensors = list(tensors)
         meta_tensors = [t.to('meta') for t in tensors]
-        sent = [(skeleton, meta_tensors)]
+        sent = [(payload, meta_tensors)]
     else:
         if data is not None:
             raise ValueError("data must be None in non-src ranks")
-        skeleton, tensors, meta_tensors = None, None, None
+        payload, tensors, meta_tensors = None, None, None
         sent = [None]
 
     torch.distributed.broadcast_object_list(sent, src=src_rank, group=group)
-    skeleton, meta_tensors = sent[0]
+    payload, meta_tensors = sent[0]
+    sent = None
     if rank != src_rank:
         tensors = [None] * len(meta_tensors)
 
@@ -963,8 +1017,11 @@ def broadcast_mixed_data(
                 tensors[i] = tensors[i].to(device, non_blocking=True)
 
     torch.cuda.synchronize()
+    if rank == src_rank and all(t is o for t, o in zip(tensors, original_tensors)):
+        # every tensor is already on `device`: rebuilding would only copy the containers
+        return data
     # refill tensors
-    return refill_tensors(skeleton, tensors)
+    return _unpickle_refill_tensors(payload, tensors)
 
 
 def gather_mixed_data(
