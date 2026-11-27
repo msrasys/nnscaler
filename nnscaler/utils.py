@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 import builtins
+import copyreg
 import importlib
 import pickle
 import types
@@ -915,15 +916,23 @@ _PROBE_SAFE_TYPES = frozenset([
 ])
 
 
+def _is_library_reducer(reducer: Any) -> bool:
+    """Whether a `copyreg` reducer is one that Python or numpy registers itself
+    (e.g. for `complex`, and for numpy dtype classes, which every numpy array
+    pickles), rather than one registered by an application."""
+    module = getattr(reducer, '__module__', None) or ''
+    return module == 'copyreg' or module.partition('.')[0] == 'numpy'
+
+
 class _TensorProbePickler(pickle.Pickler):
     """Pickles into nothing and stops at the first object that may hold a tensor.
 
     It stops at a tensor, and also at every object whose pickling could run
-    user code (`__reduce__`, `__getstate__`, ...) before calling that code:
-    such code may hide tensors from the probe (e.g. a list subclass that
-    pickles its items converted), and it may have side effects that must happen
-    only once, in the real broadcast (e.g. a `__reduce__` that consumes an
-    iterator).
+    user code (`__reduce__`, `__getstate__`, a reducer registered with
+    `copyreg.pickle`, ...) before calling that code: such code may hide tensors
+    from the probe (e.g. a list subclass that pickles its items converted), and
+    it may have side effects that must happen only once, in the real broadcast
+    (e.g. a `__reduce__` that consumes an iterator).
     """
 
     class _Discard:
@@ -935,6 +944,11 @@ class _TensorProbePickler(pickle.Pickler):
 
     def reducer_override(self, obj):
         t = type(obj)
+        # `copyreg` registrations take effect for any type, including the safe
+        # ones below (`return NotImplemented` makes pickle look them up next).
+        reducer = copyreg.dispatch_table.get(t)
+        if reducer is not None and not _is_library_reducer(reducer):
+            raise _StopProbe
         if (
             t in _PROBE_SAFE_TYPES
             or isinstance(obj, (type, np.dtype))

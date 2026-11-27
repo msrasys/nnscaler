@@ -1,8 +1,10 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import copyreg
 import pickle
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
@@ -123,6 +125,33 @@ def test_extract_tensor_subtrees_runs_reduce_once():
     assert list(out['cursor'].pending) == [1, 2] and list(out['nested'][0].pending) == [3]
 
 
+@contextmanager
+def _counting_array_reducer(values):
+    """Registers a `copyreg` reducer for `np.ndarray` that returns the next of `values`."""
+    remaining = iter(values)
+    calls = []
+
+    def reduce_array(array):
+        calls.append(1)
+        return np.array, ([next(remaining)],)
+
+    copyreg.pickle(np.ndarray, reduce_array)
+    try:
+        yield calls
+    finally:
+        copyreg.dispatch_table.pop(np.ndarray, None)
+
+
+def test_extract_tensor_subtrees_runs_copyreg_reducer_once():
+    with _counting_array_reducer([11, 22]) as calls:
+        assert _may_contain_tensor({'state': np.zeros(1)}) and not calls
+        _, skeleton, tensors = _split({'state': np.zeros(1), 't': torch.ones(1)})
+        out = _refill_tensor_subtrees(pickle.loads(pickle.dumps(skeleton)), tensors)
+        assert len(calls) == 1 and out['state'].tolist() == [11]
+    # numpy's own reducers (for dtype classes) do not stop the probe
+    assert not _may_contain_tensor({'state': np.zeros(1)})
+
+
 def _broadcast_worker():
     torch.distributed.init_process_group('nccl')
     rank = torch.distributed.get_rank()
@@ -177,6 +206,15 @@ def _broadcast_worker():
     # dict subclasses keep the old path (and their type when nothing is extracted)
     out = broadcast_mixed_data(OrderedDict(a=[1]) if rank == 0 else None, src_rank=0)
     assert type(out) is OrderedDict and out == OrderedDict(a=[1])
+
+    # a `copyreg` reducer with a side effect runs only in the real pickling
+    with _counting_array_reducer([11, 22]) as calls:
+        data = {'state': np.zeros(1), 't': torch.ones(1)} if rank == 0 else None
+        out = broadcast_mixed_data(data, src_rank=0)
+        if rank == 0:
+            assert len(calls) == 1
+        else:
+            assert out['state'].tolist() == [11]
     torch.distributed.destroy_process_group()
 
 
