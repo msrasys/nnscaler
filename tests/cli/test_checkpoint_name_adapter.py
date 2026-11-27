@@ -12,6 +12,7 @@ import pytest
 import torch
 from torch import nn
 
+from nnscaler import ComputeConfig
 from nnscaler.cli.trainer import Trainer
 from nnscaler.policies import OpPartition, OpPlan, get_pas_ops
 from nnscaler.runtime.module import ExtraState, ParallelModule
@@ -196,3 +197,18 @@ def test_retraced_checkpoint_survives_process_restart(tmp_path, plan_ngpus, use_
                               precision='float32', tf32=False, seed=0,
                               atol=0.0, rtol=0.0, **errors)), flush=True)
 
+
+
+def test_rank_resume_collects_metadata_when_only_the_data_topology_changes():
+    from types import SimpleNamespace
+
+    # This switch leaves the model's shards and physical world size unchanged.
+    # llm-train requires the global metadata convention to validate its data reset.
+    trainer = SimpleNamespace(
+        world_size=2, model=torch.nn.Linear(2, 1), optimizer=None,
+        train_args=SimpleNamespace(compute_config=ComputeConfig(1, 2),
+                                   dataloader=SimpleNamespace(train_args={'dp_sharded': True})))
+    checkpoint = {'model': trainer.model.state_dict(), 'parallel_topology': {'dp_sharded': False}}
+    assert Trainer._align_rank_file(trainer, checkpoint) is None
+    checkpoint['parallel_topology']['dp_sharded'] = True
+    assert Trainer._align_rank_file(trainer, checkpoint).keys() == checkpoint['model'].keys()

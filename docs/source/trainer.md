@@ -794,16 +794,27 @@ Where `ResumeOptions` and `SerializerOptions` are:
     `Callable[[Dict[str, Any]], Dict[str, Any]]`. Only applied when
     `checkpoint` is a file.
   - `with_merged` (`Optional[bool]`): Whether to merge the checkpoint
-    files when loading. `True` means will load the merged checkpoint
-    (without saving). `False` means will load the sharded checkpoint
-    files. `None` means will load sharded if world size is unchanged,
-    and merged otherwise. Only used when `checkpoint` is a directory.
+    files when loading. `True` merges all rank files into a full state
+    dict and then trims and broadcasts it. `False` or `None` lets each
+    rank load its own file; when the world size changed or the file's
+    parallel layout no longer matches the model, every rank instead reads
+    all rank files and assembles only
+    its own shard, without merging or broadcasting (`save_memory` and
+    `slow_fs` do not apply then). Only used when `checkpoint` is a directory.
     When comparing model configurations across checkpoint ranks, only
     `model.args.model_args.vision_encoder_path` is ignored, allowing the same
     Vision weights to be staged at different node-local paths. Other model
     fields and learning-rate scheduler state must still match. This comparison
     does not rewrite checkpoint metadata; the merged result retains the first
     input checkpoint's model configuration.
+    On the VL branch, pass a split checkpoint directory to llm-train with
+    `--resume_path <step-directory>` and omit `--with_merged`. A retrace that
+    only renames generated parameters can reuse the local file. If the layout
+    changes, the trainer reads the source rank files and builds the target
+    shards in memory. PyTorch ZIP checkpoint tensors are memory-mapped on CPU
+    with PyTorch 2.1 or later. Each target process still reads source metadata,
+    so a large source world size can put pressure on the shared filesystem.
+    An llm-train sampler topology change requires `--reset_dataloader`.
   - `save_memory` (`bool`): If the memory is limited, only load merged
     state dict in GPU 0 of each node and broadcast trimmed state dict to
     other ranks. Although slower, this saves memory. Only used when
