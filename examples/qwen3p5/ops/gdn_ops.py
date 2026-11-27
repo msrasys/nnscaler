@@ -72,7 +72,12 @@ def qwen3_5_causal_conv1d_fake(
     bias: Optional[torch.Tensor] = None,
     activation: Optional[str] = "silu",
 ) -> torch.Tensor:
-    return torch.empty_like(x)
+    return torch.empty_like(
+        x,
+        requires_grad=torch.is_grad_enabled() and any(
+            tensor is not None and tensor.requires_grad for tensor in (x, weight, bias)
+        ),
+    )
 
 
 def causal_conv1d_anno(*args: Any, **kwargs: Any) -> str:
@@ -195,7 +200,9 @@ def qwen3_5_chunk_gated_delta_rule_fake(
     scale: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = True,
 ) -> torch.Tensor:
-    return torch.empty_like(v)
+    return torch.empty_like(
+        v, requires_grad=torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (q, k, v, g, beta)),
+    )
 
 
 def chunk_gated_delta_rule_anno(*args: Any, **kwargs: Any) -> str:

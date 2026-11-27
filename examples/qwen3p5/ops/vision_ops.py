@@ -46,7 +46,9 @@ def qwen3_5_vision_varlen_attn_fake(
     cu_seqlens: torch.Tensor,
     scaling: float = 0.125,
 ) -> torch.Tensor:
-    return torch.empty_like(q)
+    return torch.empty_like(
+        q, requires_grad=torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (q, k, v)),
+    )
 
 
 def vision_varlen_attn_anno(*args: Any, **kwargs: Any) -> str:
@@ -75,7 +77,10 @@ def qwen3_5_masked_scatter_fake(
     mask: torch.Tensor,
     features: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.empty_like(inputs_embeds)
+    return torch.empty_like(
+        inputs_embeds,
+        requires_grad=torch.is_grad_enabled() and (inputs_embeds.requires_grad or features.requires_grad),
+    )
 
 
 def masked_scatter_anno(*args: Any, **kwargs: Any) -> str:

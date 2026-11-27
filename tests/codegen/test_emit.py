@@ -4,9 +4,10 @@
 import torch
 import pytest
 from nnscaler.codegen.emit import CodeEmission, IRValue
-from nnscaler.ir.cten import IRObject
+from nnscaler.ir.cten import IRCell, IRObject
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.graph.function import Dropout
+from nnscaler.ir.operator import IRBpOperation, IRFwOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.runtime.device import _group_batches
 from nnscaler.ir.adapter import IRAdapter
@@ -40,6 +41,37 @@ def test_emit_module_attr():
     code = FuncEmission().emit_fnode(dropout, runtime_devid=0, plan_ndevs=1, runtime_ndevs=1)
     print(code)
     assert 'training=self.training' in code[0]
+
+
+@pytest.mark.parametrize('unmatched_side', [None, 'input', 'output'])
+def test_backward_callsite_io_tensors(unmatched_side):
+    tensors = [IRFullTensor([4], name=name, requires_grad=True).tosub()
+               for name in ('input', 'output1', 'output2', 'internal')]
+    for tensor in tensors:
+        tensor.grad = tensor.parent.grad.tosub()
+    input_tensor, output1, output2, internal = tensors
+    forward = IRFwOperation('test_forward', 'test_forward', [input_tensor], 2)
+    forward.set_output(0, output1)
+    forward.set_output(1, output2)
+    input_grads = [input_tensor.grad]
+    output_grads = [output2.grad, output1.grad]
+    if unmatched_side == 'input':
+        input_grads.append(internal.grad)
+    elif unmatched_side == 'output':
+        output_grads.append(internal.grad)
+    backward = IRBpOperation(output_grads, input_grads)
+    IRCell.make_pair(forward, backward)
+    emission = FuncEmission()
+
+    if unmatched_side is not None:
+        with pytest.raises(ValueError, match='Invalid backward interface for test_forward') as exc:
+            emission.get_backward_callsite_io_tensors(backward)
+        assert emission.tensor_name(internal.grad) in str(exc.value)
+        assert 'requires_grad' in str(exc.value)
+    else:
+        assert emission.get_backward_callsite_io_tensors(backward) == (
+            [input_tensor], [output2, output1], output_grads, input_grads,
+        )
 
 
 def test_group_batches_tp_pp():

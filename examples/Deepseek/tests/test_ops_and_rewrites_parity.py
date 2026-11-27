@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import sys
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -42,6 +43,129 @@ from examples.Deepseek.rewrites.model_rewrites import (
     RewriteConfig,
     apply_deepseek_rewrites,
 )
+
+
+@pytest.mark.parametrize('device', ['cpu', 'meta'])
+@pytest.mark.parametrize('grad_enabled', [True, False])
+@pytest.mark.parametrize('input_grads', [(False, False), (True, False), (False, True), (True, True)])
+def test_mla_fake_metadata(device, grad_enabled, input_grads):
+    from examples.Deepseek.ops.mla_ops import deepseek_mla_concat_kv_fake
+
+    k_nope = torch.empty(1, 2, 3, 4, device=device, requires_grad=input_grads[0])
+    k_rot = torch.empty(1, 1, 3, 2, device=device, requires_grad=input_grads[1])
+    with torch.set_grad_enabled(grad_enabled):
+        expected = deepseek_mla_concat_kv(k_nope, k_rot)
+        actual = deepseek_mla_concat_kv_fake(k_nope, k_rot)
+    assert (actual.shape, actual.dtype, actual.device, actual.requires_grad) == (
+        expected.shape, expected.dtype, expected.device, expected.requires_grad,
+    )
+
+
+@pytest.mark.parametrize('grad_enabled', [True, False])
+@pytest.mark.parametrize('op_name', [
+    'v2_moe_route', 'v3_moe_route', 'moe_grouped_gemm', 'moe_permute',
+    'grouped_linear', 'moe_unpermute', 'v32_dsa_index_mask',
+])
+def test_fake_output_metadata(op_name, grad_enabled):
+    from nnscaler.graph.parser.register import CustomizedOps
+    from examples.Deepseek.ops.moe_ops import deepseek_v2_moe_route, deepseek_v3_moe_route
+    from examples.Deepseek.ops.mla_ops import deepseek_v32_dsa_index_mask
+
+    register_all_deepseek_ops()
+    hidden = torch.randn(4, 3)
+    probabilities = torch.rand(4, 1)
+    selected = torch.arange(4).view(4, 1)
+    cases = {
+        'v2_moe_route': (deepseek_v2_moe_route, [hidden, torch.randn(4, 3)], {'top_k': 2}),
+        'v3_moe_route': (deepseek_v3_moe_route, [hidden, torch.randn(4, 3), torch.randn(4)],
+            {'top_k': 2, 'n_group': 2, 'topk_group': 1}),
+        'moe_grouped_gemm': (deepseek_moe_grouped_gemm,
+            [hidden, probabilities, selected, torch.randn(4, 4, 3), torch.randn(4, 3, 2)], {'local_expert_end': 4}),
+        'moe_permute': (deepseek_moe_permute, [hidden, probabilities, selected], {'num_experts': 4}),
+        'grouped_linear': (deepseek_grouped_linear,
+            [hidden, torch.randn(4, 2, 3), torch.ones(4, dtype=torch.long)], {'local_expert_end': 4}),
+        'moe_unpermute': (deepseek_moe_unpermute, [hidden, torch.arange(4), probabilities], {'num_tokens': 4}),
+        'v32_dsa_index_mask': (deepseek_v32_dsa_index_mask,
+            [torch.randn(1, 2, 3), torch.randn(1, 2, 2), torch.randn(1, 2, 2), torch.randn(1, 2, 2),
+             torch.ones(1, 2, 2, dtype=torch.bool), torch.randn(4, 2), torch.randn(2, 3),
+             torch.randn(2), torch.randn(2), torch.randn(2, 3)],
+            {'n_heads': 2, 'head_dim': 2, 'qk_rope_head_dim': 2, 'index_topk': 1}),
+    }
+    runtime_fn, args, kwargs = cases[op_name]
+    fake_fn = CustomizedOps.kOpFakeRuntime[f'{runtime_fn.__module__}.{runtime_fn.__name__}']
+    for grad_index in [None, -1, *range(len(args))]:
+        inputs = [tensor.detach().requires_grad_(
+            tensor.is_floating_point() and (grad_index is None or grad_index == index)
+        ) for index, tensor in enumerate(args)]
+        with torch.set_grad_enabled(grad_enabled):
+            expected = runtime_fn(*inputs, **kwargs)
+        expected = expected if isinstance(expected, tuple) else (expected,)
+        for device in ['cpu', 'meta']:
+            fake_inputs = [tensor.detach().to(device).requires_grad_(tensor.requires_grad) for tensor in inputs]
+            with torch.set_grad_enabled(grad_enabled):
+                actual = fake_fn(*fake_inputs, **kwargs)
+            actual = actual if isinstance(actual, tuple) else (actual,)
+            assert len(actual) == len(expected)
+            for output, reference in zip(actual, expected):
+                assert (output.shape, output.dtype, output.requires_grad) == (
+                    reference.shape, reference.dtype, reference.requires_grad,
+                ), (op_name, grad_enabled, grad_index, device)
+                assert output.device.type == device
+
+
+@pytest.mark.parametrize('counts', [(0, 2, 0, 2), (0, 0, 0, 0)])
+def test_grouped_linear_empty_experts(counts):
+    from collections import Counter
+
+    structures = []
+    for expert in range(4):
+        inputs = torch.randn(sum(counts), 3, requires_grad=True)
+        weight = torch.randn(1, 2, 3, requires_grad=True)
+        output = deepseek_grouped_linear(inputs, weight, torch.tensor(counts), expert, expert + 1)
+        nodes, pending = set(), [output.grad_fn]
+        while pending:
+            node = pending.pop()
+            if node is None or node in nodes:
+                continue
+            nodes.add(node)
+            pending.extend(parent for parent, _ in node.next_functions)
+        structures.append(Counter(type(node).__name__ for node in nodes))
+        output.sum().backward()
+        assert inputs.grad is not None and weight.grad is not None
+        if counts[expert] == 0:
+            torch.testing.assert_close(output, torch.zeros_like(output))
+            torch.testing.assert_close(inputs.grad, torch.zeros_like(inputs))
+            torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
+    assert all(structure == structures[0] for structure in structures)
+
+
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize('fused', [True, False])
+def test_moe_kernel_dtype_dispatch(monkeypatch, dtype, fused):
+    from examples.Deepseek.ops import moe_ops
+
+    calls = []
+
+    def kernel(inputs, weights, counts, trans_b):
+        assert trans_b and inputs.dtype == weights.dtype == torch.bfloat16
+        calls.append(True)
+        return F.linear(inputs, weights[0])
+
+    monkeypatch.setattr(moe_ops, '_cutlass_gmm', kernel)
+    monkeypatch.setattr(torch.Tensor, 'is_cuda', property(lambda tensor: True))
+    inputs = torch.randn(4, 3, dtype=dtype, requires_grad=True)
+    weights = torch.randn(1, 4, 3, dtype=dtype, requires_grad=True)
+    if fused:
+        down = torch.randn(1, 3, 2, dtype=dtype, requires_grad=True)
+        output = moe_ops.deepseek_moe_grouped_gemm(
+            inputs, torch.ones(4, 1, dtype=dtype), torch.zeros(4, 1, dtype=torch.long),
+            weights, down, local_expert_end=1,
+        )
+    else:
+        output = moe_ops.deepseek_grouped_linear(inputs, weights, torch.tensor([4]), local_expert_end=1)
+    output.sum().backward()
+    assert inputs.grad is not None and weights.grad is not None
+    assert len(calls) == ((2 if fused else 1) if dtype == torch.bfloat16 else 0)
 
 
 def _init_nontrivial_weights(model: torch.nn.Module, seed: int = 1234) -> None:

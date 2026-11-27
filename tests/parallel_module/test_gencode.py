@@ -7,6 +7,7 @@ import re
 from contextlib import nullcontext
 from typing import Union
 from functools import partial
+from types import MethodType
 
 import torch
 import torch.nn.functional as F
@@ -2375,6 +2376,89 @@ def test_zero3_multi_inout(tmp_path):
 
 def fake_add_xy(x: torch.Tensor, y: torch.Tensor):
     return x
+
+
+def scale2_fake(x: torch.Tensor):
+    return torch.empty_like(x, requires_grad=torch.is_grad_enabled() and x.requires_grad)
+
+
+def scale2_fake_without_grad(x: torch.Tensor):
+    return torch.empty_like(x)
+
+
+@nnscaler.register_op('a b -> a b', fake_fn=scale2_fake)
+def scale2(x: torch.Tensor):
+    return x * 2.0
+
+
+class FakeFnGradModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin1 = torch.nn.Linear(8, 8)
+        self.lin2 = torch.nn.Linear(8, 8)
+
+    def forward(self, x):
+        return self.lin2(scale2(self.lin1(x))).sum()
+
+
+@pytest.mark.parametrize('fake_mode', ['correct', 'missing', 'real'])
+@pytest.mark.parametrize('upstream_trainable', [True, False])
+def test_fake_fn_end2end_grad(tmp_path, monkeypatch, fake_mode, upstream_trainable):
+    fake_fn = {'correct': scale2_fake, 'missing': scale2_fake_without_grad, 'real': None}[fake_mode]
+    monkeypatch.setitem(CustomizedOps.kOpFakeRuntime, f'{scale2.__module__}.{scale2.__name__}', fake_fn)
+    model = FakeFnGradModel()
+    model.lin1.requires_grad_(upstream_trainable)
+    inputs = torch.randn(4, 8)
+    instance_name = f'fake_grad_{fake_mode}_{upstream_trainable}'
+    invalid_fake = fake_mode == 'missing' and upstream_trainable
+    context = raises_with_cause(ValueError, match='Invalid backward interface.*requires_grad') \
+        if invalid_fake else nullcontext()
+    with context:
+        parallelize(
+            model, {'x': inputs}, 'dp',
+            ComputeConfig(1, 1, use_end2end=True, trace_strategy='cpu'),
+            gen_savedir=tmp_path, instance_name=instance_name,
+            load_module=False, reuse='override', broadcast_strategy='none',
+        )
+    if invalid_fake:
+        for generated_file in tmp_path.rglob('gencode*.py'):
+            assert 'def _train_step' not in generated_file.read_text()
+        return
+
+    generated_class = _load_parallel_module_class(
+        FakeFnGradModel, gen_savedir=tmp_path, instance_name=instance_name, rank=0,
+    )
+    generated_model = torch.nn.Module()
+    attr_map = generated_class.get_attr_meta_map(0)
+    for name, metadata in attr_map.items():
+        parameter = model.get_parameter(metadata.orig_name)
+        generated_model.register_parameter(
+            name, torch.nn.Parameter(parameter.detach().clone(), requires_grad=parameter.requires_grad),
+        )
+    for name, method in vars(generated_class).items():
+        if name.startswith('segment'):
+            setattr(generated_model, name, MethodType(method, generated_model))
+
+    reference_optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    generated_optimizer = torch.optim.SGD(generated_model.parameters(), lr=0.01)
+    for _ in range(2):
+        model.zero_grad()
+        expected_loss = model(inputs)
+        expected_loss.backward()
+        actual_loss = generated_class._train_step(generated_model, iter([inputs]))
+        torch.testing.assert_close(actual_loss, expected_loss)
+        for name, metadata in attr_map.items():
+            expected_grad = model.get_parameter(metadata.orig_name).grad
+            actual_grad = generated_model.get_parameter(name).grad
+            if model.get_parameter(metadata.orig_name).requires_grad:
+                assert expected_grad is not None and actual_grad is not None
+                torch.testing.assert_close(actual_grad, expected_grad)
+            else:
+                assert expected_grad is None and actual_grad is None
+        reference_optimizer.step()
+        generated_optimizer.step()
+        for name, metadata in attr_map.items():
+            torch.testing.assert_close(generated_model.get_parameter(name), model.get_parameter(metadata.orig_name))
 
 
 @nnscaler.register_op('*, * -> *', fake_fn=fake_add_xy)

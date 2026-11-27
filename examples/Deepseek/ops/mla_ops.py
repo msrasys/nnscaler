@@ -62,7 +62,10 @@ def deepseek_mla_concat_kv(k_nope: torch.Tensor, k_rot: torch.Tensor) -> torch.T
 
 def deepseek_mla_concat_kv_fake(k_nope: torch.Tensor, k_rot: torch.Tensor) -> torch.Tensor:
     out_dim = k_nope.shape[-1] + k_rot.shape[-1]
-    return k_nope.new_empty((*k_nope.shape[:-1], out_dim))
+    return k_nope.new_empty(
+        (*k_nope.shape[:-1], out_dim),
+        requires_grad=torch.is_grad_enabled() and (k_nope.requires_grad or k_rot.requires_grad),
+    )
 
 
 def mla_concat_kv_anno(*args: Any, **kwargs: Any) -> str:

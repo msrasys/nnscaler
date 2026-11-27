@@ -91,7 +91,10 @@ def deepseek_v2_moe_route_fake(
     routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens = hidden_states.shape[0]
-    weights = hidden_states.new_empty((num_tokens, top_k), dtype=torch.float32)
+    weights = hidden_states.new_empty(
+        (num_tokens, top_k), dtype=torch.float32,
+        requires_grad=torch.is_grad_enabled() and (hidden_states.requires_grad or router_weight.requires_grad),
+    )
     indices = hidden_states.new_empty((num_tokens, top_k), dtype=torch.long)
     return weights, indices
 
@@ -157,7 +160,10 @@ def deepseek_v3_moe_route_fake(
     routed_scaling_factor: float = 2.5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens = hidden_states.shape[0]
-    weights = hidden_states.new_empty((num_tokens, top_k), dtype=torch.float32)
+    weights = hidden_states.new_empty(
+        (num_tokens, top_k), dtype=torch.float32,
+        requires_grad=torch.is_grad_enabled() and (hidden_states.requires_grad or router_weight.requires_grad),
+    )
     indices = hidden_states.new_empty((num_tokens, top_k), dtype=torch.long)
     return weights, indices
 
@@ -205,7 +211,10 @@ def deepseek_moe_grouped_gemm(
             f"for [{local_expert_start}, {local_expert_end}), got {gate_up_proj.shape[0]} and {down_proj.shape[0]}"
         )
 
-    if hidden_states.is_cuda and _cutlass_gmm is not None:
+    if (
+        hidden_states.is_cuda and _cutlass_gmm is not None
+        and hidden_states.dtype == gate_up_proj.dtype == down_proj.dtype == torch.bfloat16
+    ):
         local_mask = (selected_experts >= local_expert_start) & (selected_experts < local_expert_end)
         if not local_mask.any():
             return hidden_states.new_zeros(hidden_states.shape)
@@ -254,7 +263,12 @@ def deepseek_moe_grouped_gemm_fake(
     local_expert_start: int = 0,
     local_expert_end: int = 256,
 ) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
+    return torch.empty_like(
+        hidden_states,
+        requires_grad=torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (hidden_states, routing_weights, gate_up_proj, down_proj)
+        ),
+    )
 
 
 def moe_grouped_gemm_anno(*args: Any, **kwargs: Any) -> str:
@@ -329,10 +343,15 @@ def deepseek_moe_permute_fake(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     capacity = hidden_states.shape[0] * selected_experts.shape[1]
     return (
-        hidden_states.new_empty((capacity, hidden_states.shape[1])),
+        hidden_states.new_empty(
+            (capacity, hidden_states.shape[1]),
+            requires_grad=torch.is_grad_enabled() and hidden_states.requires_grad,
+        ),
         hidden_states.new_empty((num_experts,), dtype=torch.long),
         hidden_states.new_empty((capacity,), dtype=torch.long),
-        routing_weights.new_empty((capacity, 1)),
+        routing_weights.new_empty(
+            (capacity, 1), requires_grad=torch.is_grad_enabled() and routing_weights.requires_grad,
+        ),
     )
 
 
@@ -364,31 +383,25 @@ def deepseek_grouped_linear(
     if (
         permuted_x.is_cuda
         and _cutlass_gmm is not None
+        and permuted_x.dtype == expert_weight.dtype == torch.bfloat16
         and local_expert_start == 0
         and local_expert_end == len(counts_list)
     ):
         return _cutlass_gmm(permuted_x, expert_weight, expert_counts.cpu().to(torch.long), trans_b=True)
 
     zero_anchor = (expert_weight.sum() * 0.0).to(permuted_x.dtype)
-    chunks: list[torch.Tensor] = []
     prefix_before = sum(counts_list[:local_expert_start])
-    if prefix_before > 0:
-        chunks.append(permuted_x.new_zeros((prefix_before, out_features)) + zero_anchor)
+    chunks = [permuted_x.new_zeros((prefix_before, out_features)) + zero_anchor]
 
     offset = prefix_before
     for local_idx in range(num_local):
         cnt = counts_list[local_expert_start + local_idx]
-        if cnt > 0:
-            seg = permuted_x[offset : offset + cnt]
-            chunks.append(F.linear(seg, expert_weight[local_idx]))
-            offset += cnt
+        seg = permuted_x[offset : offset + cnt]
+        chunks.append(F.linear(seg, expert_weight[local_idx]))
+        offset += cnt
 
     suffix_after = capacity - offset
-    if suffix_after > 0:
-        chunks.append(permuted_x.new_zeros((suffix_after, out_features)) + zero_anchor)
-
-    if not chunks:
-        return permuted_x.new_zeros((capacity, out_features)) + zero_anchor
+    chunks.append(permuted_x.new_zeros((suffix_after, out_features)) + zero_anchor)
     return torch.cat(chunks, dim=0)
 
 
@@ -399,7 +412,10 @@ def deepseek_grouped_linear_fake(
     local_expert_start: int = 0,
     local_expert_end: int = 256,
 ) -> torch.Tensor:
-    return permuted_x.new_empty((permuted_x.shape[0], expert_weight.shape[1]))
+    return permuted_x.new_empty(
+        (permuted_x.shape[0], expert_weight.shape[1]),
+        requires_grad=torch.is_grad_enabled() and (permuted_x.requires_grad or expert_weight.requires_grad),
+    )
 
 
 def grouped_linear_anno(*args: Any, **kwargs: Any) -> str:
@@ -442,7 +458,10 @@ def deepseek_moe_unpermute_fake(
     sorted_probs: torch.Tensor,
     num_tokens: int = 1,
 ) -> torch.Tensor:
-    return expert_outs.new_empty((num_tokens, expert_outs.shape[1]))
+    return expert_outs.new_empty(
+        (num_tokens, expert_outs.shape[1]),
+        requires_grad=torch.is_grad_enabled() and (expert_outs.requires_grad or sorted_probs.requires_grad),
+    )
 
 
 def moe_unpermute_anno(*args: Any, **kwargs: Any) -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -30,6 +31,114 @@ from examples.qwen3p5.rewrites.model_rewrites import (
     build_dummy_samples,
     build_qwen3_5_model,
 )
+
+
+@pytest.mark.parametrize('grad_enabled', [True, False])
+@pytest.mark.parametrize('op_name', [
+    'moe_route', 'moe_grouped_gemm', 'moe_permute', 'grouped_linear', 'moe_unpermute',
+    'causal_conv1d', 'chunk_gated_delta_rule', 'vision_varlen_attn', 'masked_scatter',
+])
+def test_fake_output_metadata(op_name, grad_enabled):
+    from nnscaler.graph.parser.register import CustomizedOps
+
+    register_all_qwen3_5_ops()
+    hidden = torch.randn(4, 3)
+    probabilities = torch.rand(4, 1)
+    selected = torch.arange(4).view(4, 1)
+    cases = {
+        'moe_route': (qwen3_5_moe_route, [hidden, torch.randn(4, 3)], {'top_k': 2}),
+        'moe_grouped_gemm': (qwen3_5_moe_grouped_gemm,
+            [hidden, probabilities, selected, torch.randn(4, 4, 3), torch.randn(4, 3, 2)], {'local_expert_end': 4}),
+        'moe_permute': (qwen3_5_moe_permute, [hidden, probabilities, selected], {'num_experts': 4}),
+        'grouped_linear': (qwen3_5_grouped_linear,
+            [hidden, torch.randn(4, 2, 3), torch.ones(4, dtype=torch.long)], {'local_expert_end': 4}),
+        'moe_unpermute': (qwen3_5_moe_unpermute, [hidden, torch.arange(4), probabilities], {'num_tokens': 4}),
+        'causal_conv1d': (qwen3_5_causal_conv1d,
+            [torch.randn(1, 2, 3), torch.randn(2, 1, 2), torch.randn(2)], {}),
+        'chunk_gated_delta_rule': (qwen3_5_chunk_gated_delta_rule,
+            [torch.randn(1, 3, 1, 2), torch.randn(1, 3, 1, 2), torch.randn(1, 3, 2, 2),
+             -torch.rand(1, 3, 2), torch.rand(1, 3, 2)], {}),
+        'vision_varlen_attn': (qwen3_5_vision_varlen_attn,
+            [torch.randn(4, 2, 3), torch.randn(4, 2, 3), torch.randn(4, 2, 3),
+             torch.tensor([0, 2, 4], dtype=torch.int32)], {}),
+        'masked_scatter': (qwen3_5_masked_scatter,
+            [torch.randn(1, 2, 3), torch.tensor([[[True], [False]]]), torch.randn(1, 3)], {}),
+    }
+    runtime_fn, args, kwargs = cases[op_name]
+    fake_fn = CustomizedOps.kOpFakeRuntime[f'{runtime_fn.__module__}.{runtime_fn.__name__}']
+    for grad_index in [None, -1, *range(len(args))]:
+        inputs = [tensor.detach().requires_grad_(
+            tensor.is_floating_point() and (grad_index is None or grad_index == index)
+        ) for index, tensor in enumerate(args)]
+        with torch.set_grad_enabled(grad_enabled):
+            expected = runtime_fn(*inputs, **kwargs)
+        expected = expected if isinstance(expected, tuple) else (expected,)
+        for device in ['cpu', 'meta']:
+            fake_inputs = [tensor.detach().to(device).requires_grad_(tensor.requires_grad) for tensor in inputs]
+            with torch.set_grad_enabled(grad_enabled):
+                actual = fake_fn(*fake_inputs, **kwargs)
+            actual = actual if isinstance(actual, tuple) else (actual,)
+            assert len(actual) == len(expected)
+            for output, reference in zip(actual, expected):
+                assert (output.shape, output.dtype, output.requires_grad) == (
+                    reference.shape, reference.dtype, reference.requires_grad,
+                ), (op_name, grad_enabled, grad_index, device)
+                assert output.device.type == device
+
+
+@pytest.mark.parametrize('counts', [(0, 2, 0, 2), (0, 0, 0, 0)])
+def test_grouped_linear_empty_experts(counts):
+    from collections import Counter
+
+    structures = []
+    for expert in range(4):
+        inputs = torch.randn(sum(counts), 3, requires_grad=True)
+        weight = torch.randn(1, 2, 3, requires_grad=True)
+        output = qwen3_5_grouped_linear(inputs, weight, torch.tensor(counts), expert, expert + 1)
+        nodes, pending = set(), [output.grad_fn]
+        while pending:
+            node = pending.pop()
+            if node is None or node in nodes:
+                continue
+            nodes.add(node)
+            pending.extend(parent for parent, _ in node.next_functions)
+        structures.append(Counter(type(node).__name__ for node in nodes))
+        output.sum().backward()
+        assert inputs.grad is not None and weight.grad is not None
+        if counts[expert] == 0:
+            torch.testing.assert_close(output, torch.zeros_like(output))
+            torch.testing.assert_close(inputs.grad, torch.zeros_like(inputs))
+            torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
+    assert all(structure == structures[0] for structure in structures)
+
+
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize('fused', [True, False])
+def test_moe_kernel_dtype_dispatch(monkeypatch, dtype, fused):
+    from examples.qwen3p5.ops import moe_ops
+
+    calls = []
+
+    def kernel(inputs, weights, counts, trans_b):
+        assert trans_b and inputs.dtype == weights.dtype == torch.bfloat16
+        calls.append(True)
+        return F.linear(inputs, weights[0])
+
+    monkeypatch.setattr(moe_ops, '_cutlass_gmm', kernel)
+    monkeypatch.setattr(torch.Tensor, 'is_cuda', property(lambda tensor: True))
+    inputs = torch.randn(4, 3, dtype=dtype, requires_grad=True)
+    weights = torch.randn(1, 4, 3, dtype=dtype, requires_grad=True)
+    if fused:
+        down = torch.randn(1, 3, 2, dtype=dtype, requires_grad=True)
+        output = moe_ops.qwen3_5_moe_grouped_gemm(
+            inputs, torch.ones(4, 1, dtype=dtype), torch.zeros(4, 1, dtype=torch.long),
+            weights, down, local_expert_end=1,
+        )
+    else:
+        output = moe_ops.qwen3_5_grouped_linear(inputs, weights, torch.tensor([4]), local_expert_end=1)
+    output.sum().backward()
+    assert inputs.grad is not None and weights.grad is not None
+    assert len(calls) == ((2 if fused else 1) if dtype == torch.bfloat16 else 0)
 
 
 def test_gdn_ops_tp_split_forward_backward_parity() -> None:

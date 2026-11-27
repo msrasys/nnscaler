@@ -147,6 +147,29 @@ In these cases, you can provide a `fake_fn` — a lightweight stand-in that prod
 4. `fake_fn` should be **simple and fast** — it only runs during tracing, not during training
 5. `fake_fn` is **not supported** for `torch.autograd.Function`
 
+Factories such as `torch.empty_like(x)` and `x.new_empty(...)` do not inherit
+`x.requires_grad`. If you use them to avoid computation, set the output gradient
+flags explicitly. For example, for a runtime function that returns `x * 2.0`:
+
+```python
+def scale2_fake(x: torch.Tensor):
+    return torch.empty_like(
+        x, requires_grad=torch.is_grad_enabled() and x.requires_grad,
+    )
+```
+
+Determine this separately for each output from the runtime function's actual
+dependencies and grad mode. Include differentiable weight inputs where relevant;
+do not mark integer indices or intentionally detached outputs as requiring gradients.
+The rule above is specific to `x * 2.0`, not a general inference rule for custom operators.
+
+Incorrect flags can remove backward communication and lose parameter gradients.
+They can also produce an invalid backward interface, which code generation rejects
+when a gradient has no matching forward input or output tensor. This check does not
+validate the full `fake_fn` contract: test its output metadata against the runtime
+function and compare training gradients. Bypassing the generated training step
+does not repair missing backward communication.
+
 
 ### Example: Distributed Communication Op
 

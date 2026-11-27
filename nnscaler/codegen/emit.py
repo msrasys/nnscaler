@@ -425,7 +425,16 @@ class FuncEmission(CodeEmission):
 
         input_grads = [t for t in bwop.outputs() if isinstance(t, IRSubTensor)]
         output_grads = [t for t in bwop.inputs() if isinstance(t, IRSubTensor)]
-        input_tensors = [grad2tensor[g] for g in input_grads if g in grad2tensor]
-        output_tensors = [grad2tensor[g] for g in output_grads if g in grad2tensor]
+        unmatched_grads = [grad for grad in input_grads + output_grads if grad not in grad2tensor]
+        if unmatched_grads:
+            grad_names = ', '.join(self.tensor_name(grad) for grad in unmatched_grads)
+            raise ValueError(
+                f'Invalid backward interface for {self.node_name(fwop)}: '
+                f'gradients [{grad_names}] have no matching forward input or output tensor. '
+                'Check the gradient dependencies in the graph. For custom operators using fake_fn, '
+                'its output requires_grad flags must match the runtime function.'
+            )
+        input_tensors = [grad2tensor[grad] for grad in input_grads]
+        output_tensors = [grad2tensor[grad] for grad in output_grads]
 
         return input_tensors, output_tensors, output_grads, input_grads

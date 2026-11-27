@@ -57,7 +57,7 @@ When registering novel operators with `nnscaler.graph.parser.register.register_o
    - Mark contracted/summed dimensions with `+` (`E+` for expert parallelism, `k+` for Row-TP) and non-splittable dimensions with `^`.
    - Use `TransformRule(itransform, otransform, modifier)` when partitioning an axis must also update scalar kwargs (e.g., updating `local_expert_start` and `local_expert_end` when sharding `[E, ...]` across EP ranks; see `examples/qwen3p5/ops/moe_ops.py:build_fused_ep_transform_rule`).
 3. **Provide both a `fake_fn` and a differentiable CPU fallback**:
-   - `fake_fn` must allocate zero-compute output shells (`torch.empty_like(x)` / `x.new_empty(...)`) so `meta` and `cpu` tracing succeed in milliseconds.
+   - `fake_fn` must return output shells with the runtime function's exact shapes, dtypes, and per-output `requires_grad` flags. `torch.empty_like(x)` / `x.new_empty(...)` do not inherit gradient flags: set them explicitly from the output's differentiable input/weight dependencies and `torch.is_grad_enabled()`. Keep integer indices, boolean masks, and intentionally detached outputs non-differentiable. Validate metadata against the CPU fallback with all inputs frozen, each differentiable input enabled separately, and under `torch.no_grad()`; test fake outputs on both CPU and meta.
    - Inside the runtime function, dispatch to optimized CUDA/Triton/CUTLASS kernels when `x.is_cuda`, and fall back to a pure-PyTorch differentiable reference on CPU so backward numerical parity tests run anywhere.
 4. **Default to Fused Mega-Ops for MoE (`expand_moe_ops: false`)**:
    - Provide a fused routed-MLP op (`qwen3_5_moe_route` + `qwen3_5_moe_grouped_gemm`) as the default to avoid dynamic token-histogram graph breaks, and expose decomposed atomic ops (`permute` -> `grouped_linear` -> `unpermute`) behind an opt-in `"expand_moe_ops": true` config flag when fine-grained `ETP` or `EP × ETP` exploration is required.
@@ -114,6 +114,7 @@ Before launching any multi-GPU job, compile both micro and full frontier presets
 4. **Exact Architectural Rule Hit Counts**: Verify `policy_report["rule_hit_counts"]` matches the exact layer counts of the target architecture (e.g., `60` MoE layers, `45` linear-attn + `15` full-attn layers, `1` vocab-parallel `lm_head`).
 5. **100% Rank Codegen & AST Collective Audit**:
    - `found_gencode_files == plan_ngpus` and every `gencode*.py` parses cleanly via `ast.parse`.
+   - Syntax parsing alone is insufficient: verify `_train_step` has no undefined gradient references and every backward-call tensor/gradient pair matches. Check that custom-op boundaries requiring gradients use differentiable communication. Execute generated micro-model training steps and compare parameter gradients with the CPU reference before claiming training correctness.
    - Inspect per-rank AST collective counts (`all_reduce`, `all_gather`, `reduce_scatter`, P2P `send`/`recv`) in `03_adapters.json` to detect unintended `AllGather` explosions or unsharded weights before allocating GPU cluster time.
 
 ---

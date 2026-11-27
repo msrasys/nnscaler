@@ -85,8 +85,8 @@ class CustomizedOps:
             input_gen_fn (Callable): input generator function for profiler, will use default input generator function
                                      if input_gen_fn is None. kwargs are same as that in the input node.
             fake_fn (Callable): a lightweight substitute for runtime_fn during tracing.
-                It must have the same signature (inputs and outputs) as runtime_fn so that
-                the two are interchangeable.
+                It must have the same input signature and output shapes, types, and requires_grad
+                flags as runtime_fn so that the two are interchangeable.
                 If fake_fn is None, runtime_fn will be used,
                 which may cause errors if runtime_fn contains operations
                 that cannot run during tracing (e.g., distributed communication ops).
@@ -182,8 +182,8 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             are real examples. To handle this scenario, user can provide the customized `input_gen_fn`.
             Default: None.
         fake_fn (Callable): a lightweight substitute for runtime_fn during tracing.
-            It must have the same signature (inputs and outputs) as runtime_fn so that
-            the two are interchangeable.
+            It must have the same input signature and output shapes, types, and requires_grad
+            flags as runtime_fn so that the two are interchangeable.
             If fake_fn is None, runtime_fn will be used directly,
             which may cause errors if runtime_fn contains operations
             that cannot run during tracing (e.g., distributed communication ops).
