@@ -22,6 +22,9 @@ import psutil
 from tqdm import tqdm
 
 import nnscaler
+from nnscaler.parallel import align_state_dict_names
+from nnscaler.runtime.checkpoint import _reshard_state_dicts
+from nnscaler.runtime.module import ParallelModule
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.utils import broadcast_mixed_data, is_running_distributed, run_on_rank0
 
@@ -285,7 +288,15 @@ class Trainer:
         *,
         model_only: bool = False,
         checkpointer: Optional[Checkpointer] = None,
+        collect_only: bool = False,
     ):
+        """
+        Combine the per-rank checkpoint files into one state dict.
+
+        With `collect_only=True` the model and optimizer state dicts are kept as per-rank
+        lists until the target rank's shard is assembled. Only the
+        non-tensor entries are combined.
+        """
         checkpointer = checkpointer or Checkpointer()
         state_dicts = []
         for f in checkpoint_files:
@@ -305,13 +316,23 @@ class Trainer:
             if state_dicts[i].get('lr_scheduler', None) != state_dicts[0].get('lr_scheduler', None):
                 raise ValueError(f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
 
-        module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
-            [s['model'] for s in state_dicts],
-            [s['optimizer'] for s in state_dicts] if not model_only else None,
-        )
+        if collect_only:
+            module_state_dict = [s['model'] for s in state_dicts]
+            opt_state_dict = [s.get('optimizer') for s in state_dicts]
+            if all(state is None for state in opt_state_dict):
+                opt_state_dict = None
+            elif any(state is None for state in opt_state_dict):
+                raise ValueError("Optimizer checkpoint missing on a subset of source ranks")
+        else:
+            module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
+                [s['model'] for s in state_dicts],
+                [s['optimizer'] for s in state_dicts] if not model_only else None,
+            )
         if model_only:
             return {'model': module_state_dict}
         train_args = copy.deepcopy(state_dicts[0]['train_args'])
+        # As with trimmed broadcast, hooks see the global training metadata and
+        # a regular target-rank model/optimizer dict after the conversion below.
         train_args['checkpoint']['save_type'] = 'merged'
 
         global_keys = {
@@ -339,6 +360,55 @@ class Trainer:
             **extra_keys,
         }
         return merged_state_dict
+
+    def _align_rank_file(
+        self, checkpoint: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return this rank's model state dict with names aligned to the current model when it can
+        be loaded directly, else None. Loadable means the checkpoint holds exactly the model's
+        ParallelModules and `align_state_dict_names` accepts the model and optimizer state dicts
+        (generated names and tensor IDs may differ). The aligned dict makes the alignment inside
+        `load_sharded_state_dict` / `load_deduped_state_dict` an identity mapping.
+        """
+        # llm-train also records the sampler topology. A data-lane change can
+        # leave every parameter in place. Its resume hook still needs the global
+        # metadata convention in order to validate (and require) a data reset.
+        config = self.train_args.compute_config
+        data_args = self.train_args.dataloader.train_args or {}
+        cp_size = config.user_config.get('cp_size')
+        ep_size = config.user_config.get('ep_size')
+        saved_topology = checkpoint.get('parallel_topology')
+        if isinstance(saved_topology, dict):
+            runtime_fields = {**config.user_config, **data_args,
+                              'runtime_ngpus': self.world_size, 'plan_ngpus': config.plan_ngpus}
+            topology_fields = ('runtime_ngpus', 'plan_ngpus', 'cp_size', 'ep_size', 'data_lane_size', 'dp_sharded')
+            if any(k in saved_topology and k in runtime_fields and saved_topology[k] != runtime_fields[k]
+                   for k in topology_fields):
+                logger.info("Checkpoint data topology changed; collecting per-rank training metadata.")
+                return None
+        elif (isinstance(cp_size, int) and isinstance(ep_size, int)
+              and cp_size < ep_size and not data_args.get('dp_sharded', False)):
+            # Legacy llm-train checkpoints have no fingerprint to validate for CP < EP.
+            logger.info("Checkpoint has no data topology for the current CP < EP layout.")
+            return None
+
+        module_state_dict = checkpoint['model']
+        suffix = ParallelModule.EXTRA_STATE_KEY
+        saved = {key[:-len(suffix)] for key in module_state_dict if key.rsplit('.', 1)[-1] == suffix}
+        current = {
+            f'{prefix}.' if prefix else ''
+            for prefix, m in self.model.named_modules(remove_duplicate=False) if isinstance(m, ParallelModule)
+        }
+        if saved != current:
+            logger.warning(f"Parallel modules in the checkpoint {sorted(saved)} differ from the model's {sorted(current)}.")
+            return None
+        try:
+            return align_state_dict_names(self.model, module_state_dict, optimizer=self.optimizer,
+                                          optimizer_state_dict=checkpoint.get('optimizer'))
+        except ValueError as e:
+            logger.warning(f"This rank's checkpoint file cannot be loaded directly: {e}")
+            return None
 
     def _broadcast_merged_state_dict(
         self,
@@ -405,6 +475,8 @@ class Trainer:
         logger.info(f"Resuming from {resume_from}")
         trimmed_broadcast_required = False
         load_from_merged = False
+        resharded = False
+        optimizer_conversion_error = None
 
         slow_fs = self.train_args.checkpoint.resume_from.slow_fs
         save_memory = self.train_args.checkpoint.resume_from.save_memory
@@ -502,13 +574,9 @@ class Trainer:
                 lambda: [path.name for path in self.checkpointer.list_checkpoints(resume_from)])
             ckpt_files = [resume_from / name for name in filenames]
             rank_ckpt_files = {int(f.stem): f for f in ckpt_files if f.stem.isdigit()}
-            if set(rank_ckpt_files.keys()) != set(range(len(rank_ckpt_files))):
+            if not rank_ckpt_files or set(rank_ckpt_files) != set(range(len(rank_ckpt_files))):
                 raise ValueError(f"Checkpoint files in {resume_from} are not complete: {rank_ckpt_files.keys()}")
-            if len(rank_ckpt_files) != self.world_size \
-                and self.train_args.checkpoint.resume_from.with_merged is False:
-                raise ValueError(f"World size is different with original one: {len(rank_ckpt_files)} != {self.world_size}")
-
-            if len(rank_ckpt_files) != self.world_size or self.train_args.checkpoint.resume_from.with_merged:
+            if self.train_args.checkpoint.resume_from.with_merged:
                 # merge the checkpoint files from all ranks and broadcast to all ranks
                 torch.distributed.barrier()
                 # normally each node's local rank 0 reads and merges the checkpoint files.
@@ -524,12 +592,39 @@ class Trainer:
                 trimmed_broadcast_required = save_memory
                 state_dict = _broadcast_before_trimmed_broadcast(state_dict, True)
             else:
-                state_dict = self.checkpointer.load_for_rank(resume_from, self.rank)
-                if state_dict['train_args']['compute_config'] != asdict(self.train_args.compute_config):
-                    logger.warning(
-                        f"compute_config is changed, and loading checkpoint may fail. "
-                        f"If it fails, please try with merged checkpoint."
-                    )
+                # each rank loads its own file; fall back to assembling its shard from all files
+                # when the files no longer match this run's layout
+                state_dict = None
+                if len(rank_ckpt_files) != self.world_size:
+                    logger.warning(f"World size changed from {len(rank_ckpt_files)} to {self.world_size}.")
+                else:
+                    # `_align_rank_file` checks everything that makes the file loadable (parallel
+                    # layout, ZeRO buckets, parameter order); other compute_config changes are fine.
+                    state_dict = self.checkpointer.load_for_rank(resume_from, self.rank)
+                    state_dict['model'] = self._align_rank_file(state_dict)
+                    # A change may affect just one pipeline stage. All ranks must
+                    # choose the same loader before entering its collectives.
+                    device = 'cuda' if torch.distributed.get_backend() == 'nccl' else 'cpu'
+                    reshard = torch.tensor(state_dict['model'] is None, dtype=torch.int32, device=device)
+                    torch.distributed.all_reduce(reshard, op=torch.distributed.ReduceOp.MAX)
+                    if reshard.item():
+                        state_dict = None
+                if state_dict is None:
+                    logger.info(f"Loading from all rank files in {resume_from}; each rank assembles its own shard.")
+                    state_dict = self._merge_checkpoint(
+                        list(rank_ckpt_files.values()), checkpointer=self.checkpointer, collect_only=True)
+                    try:
+                        state_dict['model'], state_dict['optimizer'] = _reshard_state_dicts(
+                            self.model, state_dict['model'], self.optimizer, state_dict['optimizer'])
+                    except ValueError as error:
+                        # A resume hook may intentionally discard an incompatible optimizer
+                        # (e.g. llm-train --reset_optimizer). Validate the model independently
+                        # and keep the original failure unless the hook explicitly drops it.
+                        optimizer_conversion_error = str(error)
+                    if optimizer_conversion_error is not None:
+                        state_dict['model'], _ = _reshard_state_dicts(self.model, state_dict['model'], None, None)
+                        state_dict['optimizer'] = state_dict['optimizer'][0]
+                    resharded = load_from_merged = True
 
         if trimmed_broadcast_required:
             logger.info("Broadcasting trimmed checkpoint to all ranks.")
@@ -554,6 +649,8 @@ class Trainer:
 
             # trimmed checkpoint is sharded
             ckpt_save_type = 'sharded'
+        elif resharded:
+            ckpt_save_type = 'sharded'
         else:
             # if it is not a well-formed state_dict (from third party)
             # we will treat it as a merged state_dict
@@ -562,6 +659,8 @@ class Trainer:
                 .get('save_type', 'merged')
 
         self.hook.on_load_checkpoint(self, state_dict)
+        if optimizer_conversion_error is not None and state_dict['optimizer'] is not None:
+            raise ValueError(optimizer_conversion_error)
 
         if ckpt_save_type == 'merged': # it is a merged state dict
             nnscaler.load_merged_state_dict(
@@ -610,7 +709,11 @@ class Trainer:
             self.train_status = TrainStatus(**state_dict['train_status'])
 
         # we don't resume rng states when loading merged checkpoint,
-        if not load_from_merged:
+        if resharded and len(rank_ckpt_files) == self.world_size:
+            # Rank-to-rank RNG state is still available after a same-world re-layout.
+            if state_dict.get('rng_states') is not None:
+                self.rng_states_from_resume = state_dict['rng_states'][self.rank]
+        elif not load_from_merged:
             self.rng_states_from_resume = state_dict.get('rng_states')  # resumed in _global_batch_iterator()
         else:
             logger.warning("RNG states are not resumed when loading merged checkpoint.")

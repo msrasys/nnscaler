@@ -55,6 +55,17 @@ class _ParallelModuleStub(ParallelModule, skip_init=True):
         module._add_extra_state(state_dict, prefix)
 
 
+def test_retrace_aligns_every_prefix_of_a_shared_parallel_module():
+    source = nn.Module()
+    source.left = source.right = _ParallelModuleStub(10)
+    target = nn.Module()
+    target.left = target.right = _ParallelModuleStub(100)
+    state = nnscaler.align_state_dict_names(target, source.state_dict())
+    assert state.keys() == target.state_dict().keys()
+    for prefix in ('left', 'right'):
+        assert state[f'{prefix}.weight_100'].data_ptr() == source.left.weight_10.data_ptr()
+
+
 @pytest.mark.parametrize('with_buffer_shard', [False, True])
 def test_rename_parameters_and_buffers_without_copying_tensors(with_buffer_shard):
     old = _ParallelModuleStub(10, buffer_shards=with_buffer_shard)

@@ -193,7 +193,9 @@ class TrainHook:
         your chance to restore this.
 
         Args:
-            checkpoint: the checkpoint loaded
+            checkpoint: the checkpoint loaded. For directory resharding and trimmed
+                broadcast, training metadata uses the merged convention (rank-ordered
+                extra fields), and model and optimizer contain the target rank's shard.
         """
 
     def after_load_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:

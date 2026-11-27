@@ -2,6 +2,11 @@
 #  Licensed under the MIT License.
 
 from typing import Any, TypedDict
+from contextlib import contextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import os
+import zipfile
 import pickle
 import base64
 import copy
@@ -27,6 +32,40 @@ class _Index:
         return f"_Index({self.index})"
 
 
+def torch_load(f, **kwargs) -> Any:
+    """
+    `torch.load` that memory-maps the file so tensors are paged in on demand and the
+    page cache is shared across processes on the same host. mmap needs PyTorch >= 2.1
+    (2.0 is still supported), a file path, and the zipfile format; legacy checkpoints
+    saved with `_use_new_zipfile_serialization=False` are loaded without mmap.
+
+    The returned tensors alias the file: truncating it in place while they are alive raises
+    SIGBUS. Checkpoint overwrites therefore replace the directory entry.
+    """
+    if torch.__version__ >= (2, 1) and isinstance(f, (str, os.PathLike)) and zipfile.is_zipfile(f):
+        kwargs.setdefault('mmap', True)
+    return torch.load(f, **kwargs)
+
+
+@contextmanager
+def _checkpoint_destination(f):
+    """Keep existing mmaps valid and retain the old checkpoint if an overwrite fails."""
+    if not isinstance(f, (str, os.PathLike)) or not os.path.lexists(f):
+        # New step directories are the common path. Avoid a remote rename/copy.
+        yield f
+        return
+    path = Path(f)
+    with TemporaryDirectory(dir=path.parent, prefix=f'.{path.name}-') as directory:
+        staged = Path(directory) / path.name
+        yield staged
+        os.replace(staged, path)
+
+
+def torch_save(obj: Any, f, **kwargs) -> None:
+    with _checkpoint_destination(f) as destination:
+        torch.save(obj, destination, **kwargs)
+
+
 def save(obj: Any, f, *, format="safetensors") -> None:
     """
     Saves an object containing tensors into a safetensors file.
@@ -40,7 +79,7 @@ def save(obj: Any, f, *, format="safetensors") -> None:
             The format to save the object. Currently `"safetensors"` and `"pt"` is supported.
     """
     if format == 'pt':
-        torch.save(obj, f)
+        torch_save(obj, f)
         return
 
     if format != 'safetensors':
@@ -72,10 +111,11 @@ def save(obj: Any, f, *, format="safetensors") -> None:
             return idx
         return o
     metadata = transform_recursively(obj, transform_fn, target_types=(torch.Tensor,))
-    save_file(tensors, f, metadata={
-        'obj': base64.b64encode(pickle.dumps(metadata)).decode('utf-8'),
-        'nnscaler': __version__
-    })
+    with _checkpoint_destination(f) as destination:
+        save_file(tensors, destination, metadata={
+            'obj': base64.b64encode(pickle.dumps(metadata)).decode('utf-8'),
+            'nnscaler': __version__
+        })
 
 
 class _LazyContainer:
@@ -208,7 +248,7 @@ def load(f, *, device="cpu", format="safetensors", lazy=False) -> LazyLoader | A
             loaded into memory.
     """
     if format == 'pt':
-        return torch.load(f, map_location=device, weights_only=False)
+        return torch_load(f, map_location=device, weights_only=False)
     if format != 'safetensors':
         raise ValueError(f"Unsupported format: {format}")
 

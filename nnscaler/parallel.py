@@ -4,7 +4,7 @@
 from enum import Enum
 from functools import partial
 import types
-from typing import Callable, Any, Dict, Iterable, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
+from typing import Callable, Any, Dict, Iterable, Mapping, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
 from pathlib import Path
 import inspect
 import itertools
@@ -54,6 +54,7 @@ from nnscaler.ir.unique import IDGenerator
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamZeroConfig
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.checkpoint_broadcast import broadcast_checkpoint_tensors
+from nnscaler.runtime.checkpoint import LazyTensor, load_from_rank_state_dicts, slice_tensor
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import (
     AttrMeta,
@@ -1685,9 +1686,15 @@ class OptimizerExtraState:
         non_parallel parameters will become a virtual ParallelModule,
         and its information will also be saved in `parallel_module_locs` and `parallel_module_configs`
 
-        non_parallel_extra_state: the extra state for non-parallel modules
-            (equivalent to the data saved as key `ParallelModule.EXTRA_STATE_KEY` in state dict)
-        non_parallel_param_locs: the parameter locations for non-parallel parameters.
+        non_parallel_extra_state: extra state of the virtual ParallelModule that wraps the
+            trainable non-parallel parameters when ZeRO is applied to them (an `ExtraState`,
+            the same content a ParallelModule stores under `ParallelModule.EXTRA_STATE_KEY`).
+        non_parallel_param_locs: indices of the trainable non-parallel parameters in
+            `module.parameters()` order, i.e. their positions in the merged (non-ZeRO) optimizer state.
+
+        Both are None unless ZeRO is applied to non-parallel parameters, which requires
+        `compute_config.use_zero`, `plan_ngpus != runtime_ngpus`, and at least one non-empty
+        non-parallel parameter. Non-parallel parameters only use ZeRO-1.
     """
     rank: int
     name: str
@@ -1835,7 +1842,9 @@ def hybrid(
     ...
 hybrid.is_hybrid = True  # mark this function as hybrid optimizer factory
 
-
+# Attribute names used for zero information for non-parallel modules
+# None if there are no non-parallel modules or zero is not used for them.
+# It is also the key of `OptimizerExtraState.parallel_module_locs` for non-parallel modules.
 _NON_PARALLEL_MODULE_ATTR_NAME = '_nnscaler_non_parallel_module_'
 _SYNC_GRAD_REQUIRED_ATTR = '_nnscaler_sync_grad_required'
 # Keep optional identity metadata outside the strict OptimizerExtraState
@@ -2333,7 +2342,8 @@ def _get_parallel_module_state_dict_info(
                     continue
             module_prefix = k[:-1]
             if module_prefix in pm_extra_states:
-                pm_extra_state = ExtraState(**pk_model_state_dict[module_prefix + (ParallelModule.EXTRA_STATE_KEY,)])
+                rank = pk_model_state_dict[module_prefix + (ParallelModule.EXTRA_STATE_KEY,)]['rank']
+                pm_extra_state = pm_extra_states[module_prefix][rank]
                 module_dedup_group_size = pm_extra_state.compute_config.module_dedup_group_size
                 if module_prefix not in pm_state_dicts:
                     pm_state_dicts[module_prefix] = [dict() for _ in range(module_dedup_group_size)]
@@ -2372,6 +2382,31 @@ def _get_optimizer_state_dict_info(
     Dict[str, Any]
 ]:
     """
+    Split per-rank optimizer state dicts into the pieces needed for merging.
+
+    Args:
+        optimizer_state_dicts: optimizer state dicts of all ranks, each produced by
+            `optimizer.state_dict()` of an optimizer built with `build_optimizer`, so each
+            contains `ParallelModule.EXTRA_STATE_KEY` with an `OptimizerExtraState`.
+
+    Returns:
+        opt_extra_states: `OptimizerExtraState` of every rank, indexed by rank.
+        opt_state_dicts: optimizer states of each parallel module, split by module.
+            key: module prefix as in `OptimizerExtraState.parallel_module_locs`
+                (including `_NON_PARALLEL_MODULE_ATTR_NAME` when ZeRO is applied to
+                non-parallel parameters).
+            value: a list indexed by rank with `optimizer_dedup_group_size` items of that module;
+                only ranks inside the dedup group are filled, the rest stay empty.
+                Each item is `{'state': {...}, 'param_groups': [...]}` where `state` maps the
+                parameter index *within the module* (global index minus `loc.offset`) to its
+                optimizer state, and only parameters with a state are present. `param_groups` is a
+                deep copy of the rank's param_groups kept to satisfy the merge helpers; its
+                `params` list is not meaningful.
+        ret_opt_state_dict: skeleton of the merged optimizer state dict: `{'state': {}}` plus deep
+            copies of all other top-level keys (e.g. `param_groups`) from the input state dicts,
+            assumed identical across ranks. Non-parallel parameters' states are not collected here;
+            callers read them from the input state dicts by index.
+
     An example of optimizer state dict:
     {
         'state': {
@@ -2445,6 +2480,25 @@ def _get_optimizer_state_dict_info(
     return opt_extra_states, opt_state_dicts, ret_opt_state_dict
 
 
+def _get_state_dict_rank(state_dict: Dict[str, Any]) -> int:
+    for k in state_dict:
+        if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY:
+            return state_dict[k]['rank']
+    raise ValueError("Invalid state dict: no rank found.")
+
+
+def _sort_state_dicts(state_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sorted_state_dicts = [None] * len(state_dicts)
+    for state_dict in state_dicts:
+        rank = _get_state_dict_rank(state_dict)
+        if not 0 <= rank < len(state_dicts):
+            raise ValueError(f"Invalid rank {rank} in state_dicts with length {len(state_dicts)}.")
+        if sorted_state_dicts[rank] is not None:
+            raise ValueError(f"Duplicate rank {rank} in state_dicts.")
+        sorted_state_dicts[rank] = state_dict
+    return sorted_state_dicts
+
+
 @torch.no_grad()
 def merge_state_dicts(
     module_state_dicts: List[Dict[str, Any]],
@@ -2478,23 +2532,6 @@ def merge_state_dicts(
     """
     if not module_state_dicts:
         raise ValueError("model_state_dicts should not be empty.")
-
-    def _get_state_dict_rank(state_dict: Dict[str, Any]) -> int:
-        for k in state_dict:
-            if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY:
-                return state_dict[k]['rank']
-        raise ValueError("Invalid state dict: no rank found.")
-
-    def _sort_state_dicts(state_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        sorted_state_dicts =[None] * len(state_dicts)
-        for state_dict in state_dicts:
-            rank = _get_state_dict_rank(state_dict)
-            if rank >= len(state_dicts):
-                raise ValueError(f"Invalid rank {rank} in state_dicts with length {len(state_dicts)}.")
-            if sorted_state_dicts[rank] is not None:
-                raise ValueError(f"Duplicate rank {rank} in state_dicts.")
-            sorted_state_dicts[rank] = state_dict
-        return sorted_state_dicts
 
     # sort state dicts by rank
     module_state_dicts = _sort_state_dicts(module_state_dicts)
@@ -2912,17 +2949,21 @@ def _opt_load_merged_state_dict(module: ParallelModule, states: Dict[int, Dict[s
         if not orig_param_dict:
             return {}
 
-        if module.compute_config.use_zero == 1:
-            return _construct_optim_state_zero(module, orig_param_dict)
-        elif module.compute_config.use_zero > 1:
-            return _construct_optim_state_zero3(module, orig_param_dict)
-        else:
-            return _construct_optim_state_nonzero(module, orig_param_dict)
+        return _construct_optim_state(module, orig_param_dict)
+
+
+def _construct_optim_state(module: ParallelModule, orig_param_dict: Mapping[str, Dict[str, Any]]):
+    if module.compute_config.use_zero == 1:
+        return _construct_optim_state_zero(module, orig_param_dict)
+    elif module.compute_config.use_zero > 1:
+        return _construct_optim_state_zero3(module, orig_param_dict)
+    else:
+        return _construct_optim_state_nonzero(module, orig_param_dict)
 
 
 def _construct_optim_state_zero3(
         module: ParallelModule,
-        orig_param_dict: Dict[str, Dict[str, Any]]
+        orig_param_dict: Mapping[str, Dict[str, Any]]
 ):
     # state for each parameter in the parallel module
     new_states = _construct_optim_state_nonzero(module, orig_param_dict)
@@ -3026,7 +3067,7 @@ def _copy_optim_state_slice(destination: torch.Tensor, source: torch.Tensor,
 
 def _construct_optim_state_zero(
         module: ParallelModule,
-        orig_param_dict: Dict[str, Dict[str, Any]],
+        orig_param_dict: Mapping[str, Dict[str, Any]],
 ):
     """
     Construct the optimizer state for a ParallelModule with ZeRO optimization.
@@ -3072,7 +3113,7 @@ def _construct_optim_state_zero(
                     step = source_state.get('step')
                     for key in state_keys:
                         # Match true division's dtype, including integer states.
-                        dtype = torch.result_type(source_state[key], 1.0)
+                        dtype = torch.result_type(torch.empty((), dtype=source_state[key].dtype), 1.0)
                         opt_states[key] = torch.zeros(chunk_size, dtype=dtype, device='cpu')
 
                 param_start = reducer.get_param_info(param).bucket_param_buffer_start
@@ -3083,9 +3124,15 @@ def _construct_optim_state_zero(
                 if start >= end:
                     continue
                 for key in state_keys:
-                    source = source_state[key][meta.slicers]
                     destination = opt_states[key][start - chunk_start:end - chunk_start]
-                    _copy_optim_state_slice(destination, source, start - param_start, meta.val_chunks)
+                    value = source_state[key]
+                    offset = start - param_start
+                    if isinstance(value, LazyTensor):
+                        source = value.slice_tensor(meta.slicers, (offset, end - param_start))
+                        offset = 0
+                    else:
+                        source = value[meta.slicers]
+                    _copy_optim_state_slice(destination, source, offset, meta.val_chunks)
 
             # Preserve the original field order as well as its values.
             if step is not None:
@@ -3106,7 +3153,7 @@ def _construct_optim_state_zero(
 
 def _construct_optim_state_nonzero(
         module: ParallelModule,
-        orig_param_dict: Dict[str, Dict[str, Any]]
+        orig_param_dict: Mapping[str, Dict[str, Any]]
 ):
     dist_param_map = module.dist_param_map  # name in parallel module (without tid suffix) -> name in origin module
     param_area_map = module.fullmap         # str -> AttrMeta
@@ -3132,7 +3179,7 @@ def _construct_optim_state_nonzero(
 
 def _extract_new_state(
         local_name: str,
-        orig_param_dict: Dict[str, Dict[str, Any]],
+        orig_param_dict: Mapping[str, Dict[str, Any]],
         dist_param_map: Dict[str, str],
         param_area_map: Dict[str, AttrMeta],
         zero3_info: Optional[Zero3AttrMeta] = None
@@ -3143,14 +3190,14 @@ def _extract_new_state(
     new_val = orig_param_dict.get(dist_param_map[name])
     if not new_val:
         return None
+    flat = (zero3_info.start, zero3_info.end) if zero3_info is not None else None
     sliced_new_val = {}
     for key in new_val:
         if key in ('step',):
             sliced_new_val[key] = new_val[key]
         else:
-            sliced_new_val[key] = new_val[key][attr_meta.slicers] / attr_meta.val_chunks
+            sliced_new_val[key] = slice_tensor(new_val[key], attr_meta.slicers, flat) / attr_meta.val_chunks
             if zero3_info is not None:
-                sliced_new_val[key] = sliced_new_val[key].view(-1)[zero3_info.start:zero3_info.end]
                 if sliced_new_val[key].numel() < zero3_info.chunk_size:
                     # padding if needed
                     sliced_new_val[key] = torch.nn.functional.pad(
@@ -3706,7 +3753,7 @@ def align_state_dict_names(
 
     key_map: Dict[str, str] = {}
     extra_states: Dict[str, Any] = {}
-    for prefix, pm in module.named_modules():
+    for prefix, pm in module.named_modules(remove_duplicate=False):
         if not isinstance(pm, ParallelModule):
             continue
         prefix = f'{prefix}.' if prefix else ''

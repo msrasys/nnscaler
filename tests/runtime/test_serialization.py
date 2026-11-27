@@ -73,3 +73,19 @@ def test_bad_shared_params(tmp_path):
     model = Model()
     with pytest.raises(RuntimeError):
         save(model.state_dict(), tmp_path / "model.safetensors")
+
+
+def test_replacing_mapped_checkpoint_keeps_old_storage_and_failed_overwrite(tmp_path):
+    from nnscaler.runtime.serialization import torch_load, torch_save
+
+    path = tmp_path / 'rank.ckpt'
+    torch_save(torch.tensor([3]), path)
+    original = torch_load(path)
+    torch_save(torch.tensor([7]), path)
+    assert original.item() == 3
+    with pytest.raises((AttributeError, TypeError)):
+        torch_save(lambda: None, path)
+    assert torch_load(path).item() == 7
+
+    torch.save(torch.tensor([9]), path, _use_new_zipfile_serialization=False)
+    assert torch_load(path).item() == 9
