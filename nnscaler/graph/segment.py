@@ -233,6 +233,12 @@ class IRSegment(IRCell):
         Get node index. The dispatched node (e.g., IRAdapter, IRSegment)
         will return the index to its un-dispatched node
 
+        Membership is checked in O(1) through `_node_set`,
+        but locating the position is still an O(N) `list.index` scan,
+        at this level and in each enclosing sub-segment.
+        Positions are not cached because every insert / remove shifts the following nodes.
+        Use `multi_index` to locate many nodes in a single traversal.
+
         @param node IRCell: the queried node
 
         @return index int: the index
