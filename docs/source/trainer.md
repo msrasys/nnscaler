@@ -810,6 +810,17 @@ Where `ResumeOptions` and `SerializerOptions` are:
 
 Please note
 
+Trainer constructs generated modules in a CUDA context, including cached FILE
+code generated before explicit CUDA allocations. New generated code also
+explicitly allocates parameters and buffers on the current CUDA device.
+Automatic SHARD initialization allows meta capture and materializes real weights
+on CUDA. These rules apply to both fresh training and checkpoint resume.
+See [device placement during construction](parallel_module.md#device-placement-during-construction)
+for the CPU tracing/FULL source defaults and the device rules for each path.
+Its **Important boundaries** section explains explicit-device overrides, device
+changes to supplied model instances during tracing, and bare legacy FILE classes.
+Models with only selected parallel submodules are also covered there.
+
 1.  If only generated parameter/buffer names change after re-tracing, sharded
     and deduped loading automatically aligns names using checkpoint metadata.
     Original model names, module prefixes, shard layouts and optimizer

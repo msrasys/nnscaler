@@ -3,6 +3,8 @@
 
 from pathlib import Path
 import shutil
+import sys
+from subprocess import check_call
 
 import torch
 import pytest
@@ -154,12 +156,13 @@ def trainer_worker(save_dir, use_zero):
 
     torch.distributed.barrier()
 
-    from subprocess import check_call as _call
-    from functools import partial
-    call = partial(_call, shell=True)
-
     if torch.distributed.get_rank() == 0:
-        call(f"python -m nnscaler.cli.checkpoint distribute {ckpt1_savedir}/last {ckpt1_savedir}/sharded {' '.join(trainer_config)} --compute_config.runtime_ngpus {torch.distributed.get_world_size()}")
+        check_call([
+            sys.executable, '-m', 'nnscaler.cli.checkpoint', 'distribute',
+            str(ckpt1_savedir / 'last'), str(ckpt1_savedir / 'sharded'),
+            *trainer_config,
+            '--compute_config.runtime_ngpus', str(torch.distributed.get_world_size()),
+        ])
 
     torch.distributed.barrier()
 

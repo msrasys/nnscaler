@@ -44,24 +44,24 @@ def test_buffer():
         dummy_input = {'x': torch.rand(1, 100, 128), 'position_ids': torch.arange(0, 100, dtype=torch.int64).reshape(1, 100)}
         parallelize(model, dummy_input, 'dp', ComputeConfig(1, 1), gen_savedir=tempdir, load_module=False)
         # code will look like:
-        # self.register_buffer('test_module_rotary_emb_inv_freq_94', torch.empty((64,), dtype=torch.float32), persistent=False)
-        # self.register_buffer('buffer_module_sub_buffer0_u_114', torch.empty((), dtype=torch.float32), persistent=False)
-        # self.register_buffer('buffer_module_sub_buffer0_p_116', torch.empty((1,), dtype=torch.float32), persistent=True)
-        # self.register_buffer('root_buffer0_u_118', torch.empty((1,), dtype=torch.float32), persistent=False)
-        # self.register_buffer('root_buffer0_p_120', torch.empty((), dtype=torch.float32), persistent=True)
+        # self.register_buffer('test_module_rotary_emb_inv_freq_94', torch.empty((64,), dtype=torch.float32, device='cuda'), persistent=False)
+        # self.register_buffer('buffer_module_sub_buffer0_u_114', torch.empty((), dtype=torch.float32, device='cuda'), persistent=False)
+        # self.register_buffer('buffer_module_sub_buffer0_p_116', torch.empty((1,), dtype=torch.float32, device='cuda'), persistent=True)
+        # self.register_buffer('root_buffer0_u_118', torch.empty((1,), dtype=torch.float32, device='cuda'), persistent=False)
+        # self.register_buffer('root_buffer0_p_120', torch.empty((), dtype=torch.float32, device='cuda'), persistent=True)
 
         assert _gencode_contains(tempdir, BufferModule, 0,
-            r'self.register_buffer\(\'test_module_rotary_emb_inv_freq_\d+\', torch.empty\(\(64,\), dtype=torch.float32\), persistent=False\)'
+            r'self.register_buffer\(\'test_module_rotary_emb_inv_freq_\d+\', torch.empty\(\(64,\), dtype=torch.float32, device=\'cuda\'\), persistent=False\)'
         )
         assert _gencode_contains(tempdir, BufferModule, 0,
-            r'self.register_buffer\(\'buffer_module_sub_buffer0_u_\d+\', torch.empty\(\(\), dtype=torch.float32\), persistent=False\)'
+            r'self.register_buffer\(\'buffer_module_sub_buffer0_u_\d+\', torch.empty\(\(\), dtype=torch.float32, device=\'cuda\'\), persistent=False\)'
         )
         assert _gencode_contains(tempdir, BufferModule, 0,
-            r'self.register_buffer\(\'buffer_module_sub_buffer0_p_\d+\', torch.empty\(\(1,\), dtype=torch.float32\), persistent=True\)'
+            r'self.register_buffer\(\'buffer_module_sub_buffer0_p_\d+\', torch.empty\(\(1,\), dtype=torch.float32, device=\'cuda\'\), persistent=True\)'
         )
         assert _gencode_contains(tempdir, BufferModule, 0,
-            r'self.register_buffer\(\'root_buffer0_u_\d+\', torch.empty\(\(1,\), dtype=torch.float32\), persistent=False\)'
+            r'self.register_buffer\(\'root_buffer0_u_\d+\', torch.empty\(\(1,\), dtype=torch.float32, device=\'cuda\'\), persistent=False\)'
         )
         assert _gencode_contains(tempdir, BufferModule, 0,
-            r'self.register_buffer\(\'root_buffer0_p_\d+\', torch.empty\(\(\), dtype=torch.float32\), persistent=True\)'
+            r'self.register_buffer\(\'root_buffer0_p_\d+\', torch.empty\(\(\), dtype=torch.float32, device=\'cuda\'\), persistent=True\)'
         )
