@@ -103,6 +103,66 @@ class OpPlan:
 *   **`pre_hook` / `post_hook`**:
     *   You can attach custom Python functions to be executed before or after the operator. See source code for signature details.
 
+### Pipeline auxiliary outputs
+
+With an end-to-end pipeline function policy, only the first output (the loss) seeds
+backward. Any other output is auxiliary: it is returned to the caller but does not
+contribute to training. Auxiliary outputs are returned as detached tensors
+(`requires_grad=False`), so the caller cannot backpropagate through them.
+Inference-only graphs are left unchanged.
+
+Instead of feeding zero gradients to backward, the policy detaches auxiliary values
+in the compute graph while keeping every loss-dependent use differentiable:
+
+- A returned activation is replaced by a detached view in the outputs only.
+- An activation that a later stage consumes only for an auxiliary computation crosses
+  that stage boundary as a detached view, and stays differentiable through its last
+  loss-dependent stage. Returning the result through `.data` or `.detach()` is not
+  enough, because the consuming stage would still declare an input gradient that its
+  loss never produces.
+- A shared parameter is not detached automatically. By default later stages receive
+  a shared parameter as an activation, so using it only for an auxiliary value in a
+  stage other than its first consumer stage is rejected at compile time: that stage
+  would declare a gradient the loss never produces. Detach it at the use site
+  instead, for example `F.linear(x, self.weight.detach())`.
+
+For example, with `layers[i]` assigned to stage `i`:
+
+```python
+def forward(self, x):
+    first = self.layers[0](x)       # stage 0
+    hidden = self.layers[1](first)  # stage 1
+    hidden = self.layers[2](hidden) # stage 2
+    loss = hidden.square().sum()    # stage 2
+    aux = self.aux(first)           # stage 2, not used by the loss
+    return loss, aux.data
+```
+
+Stage 2 receives `first` from stage 0, and both `first` and `aux` require grad in the
+traced graph, so stage 2 declares a gradient for `first` as part of its backward
+interface. The loss never produces that gradient, and the training step would fail
+with a missing gradient. The policy therefore detaches `first` after stage 1, where
+its last loss-dependent use (`layers[1]`) ends, and feeds the detached view to
+`self.aux`. The effect is the same as writing `aux = self.aux(first.detach())`.
+BTW, if `aux` is returned without `.data`, the policy would additionally replace it by a detached view (equivalent to `return loss, aux.detach()`).
+
+Inserted detaches follow the partition of their inputs and the recompute/offload
+region at their position. Partitioned auxiliary values are returned as complete tensors.
+
+Limitations:
+
+- Custom (opaque) operators are handled conservatively: if any output reaches the
+  loss, all of their input gradients are kept.
+- Graph inputs (data samples) that require grad are not detached.
+- Returning a parameter that no operator consumes raises an error at compile time,
+  because its pipeline stage cannot be determined.
+- A stage whose outputs are all auxiliary is not supported.
+
+In eager PyTorch, a parameter used only by an auxiliary branch gets `grad=None`.
+With the default `reducer_none_grad=False`, reducers materialize zero gradients
+instead, so weight decay still updates such parameters. Set `reducer_none_grad=True`
+and keep used and unused parameters in separate buckets to preserve the eager behavior.
+
 ### Pipeline configuration
 
 For a policy that yields `OpPlan` objects, `fn` derives the logical stage count

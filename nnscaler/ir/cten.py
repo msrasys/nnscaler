@@ -78,6 +78,7 @@ class IRCell:
         self._comment: Optional[str] = None
         # the module stack that preserves the hierarchy information
         self._module_stack: Optional[OrderedDict[str, Any]] = None
+        self._module_call_stack: Optional[OrderedDict[str, int]] = None
         # the original call expression
         # Note:
         # 1. some cells may not have call expression if the cell is not from function call (e.g., __getitem__)
@@ -423,6 +424,15 @@ class IRCell:
         Set the module stack
         """
         self._module_stack = stack
+
+    @property
+    def module_call_stack(self) -> Optional[OrderedDict[str, int]]:
+        """Per-trace invocation IDs keyed by the FQNs in ``module_stack``."""
+        return getattr(self, '_module_call_stack', None)
+
+    @module_call_stack.setter
+    def module_call_stack(self, stack: Optional[OrderedDict[str, int]]):
+        self._module_call_stack = stack
 
     @property
     def module_class_chain(self) -> list[type[torch.nn.Module]]:
@@ -1249,19 +1259,23 @@ class IR:
         return cls.modify_objects(val, _copy_and_set)
 
     @classmethod
-    def index_with_same_parent(cls, tensor: IRObject, tensors: List[IRObject]) -> Optional[int]:
+    def index_with_same_parent(cls, tensor: IRObject, tensors: List[Any]) -> Optional[int]:
         """
         Find the index of a tensor in a list of tensors that shares the same parent.
 
         Args:
             tensor (IRObject): The tensor to find.
-            tensors (List[IRObject]): The list of tensors to search.
+            tensors (List[Any]): The list to search, e.g. the inputs of an op. Entries
+                that are not IRObject (plain python values such as the key of
+                `dict.get(obj, 'key', default)`) have no parent and are skipped.
 
         Returns:
             Optional[int]: The index of the tensor with the same parent, or None if not found.
         """
         tensor_index_in_seg_output = None
         for idx, seg_output in enumerate(tensors):
+            if not isinstance(seg_output, IRObject):
+                continue
             if seg_output.parent == tensor.parent:
                 tensor_index_in_seg_output = idx
                 break

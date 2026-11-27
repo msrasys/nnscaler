@@ -3,7 +3,7 @@
 
 import functools
 import pickle
-from contextlib import closing
+from contextlib import closing, contextmanager
 from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union, ClassVar, Generator
 from typing_extensions import Self
 import logging
@@ -53,7 +53,7 @@ class AttrMeta:
     orig_name: str
     # shape of the full tensor
     shape: Tuple[int, ...]
-    # list of slicers to index the full tensor
+    # Per-dimension slices; an empty tuple indexes a scalar tensor.
     slicers: Tuple[slice, ...]
     # the number of the partitioned values, usually 1
     # (i.e., no partition on value -> no need to sum up)
@@ -63,6 +63,16 @@ class AttrMeta:
     # shape of the sub tensor
     # it should be the shape of full_tensor[slicers]
     sub_shape: Tuple[int, ...]
+
+    def __post_init__(self):
+        # Older generated modules use Ellipsis; their metadata files use '...'.
+        if not self.shape:
+            self.slicers = ()
+
+    def __setstate__(self, state):
+        # Legacy CubeModule checkpoints pickle AttrMeta instances directly.
+        self.__dict__.update(state)
+        self.__post_init__()
 
     def get_local_numel(self):
         return math.prod(self.sub_shape)
@@ -93,6 +103,20 @@ class Zero3AttrMeta:
     end: int
     # chunk size of the sub tensor, can be bigger than end - start due to padding
     chunk_size: int
+
+    @classmethod
+    def normalize_mapping(
+        cls,
+        metadata: Optional[Dict[str, Union[dict, 'Zero3AttrMeta', None]]],
+    ) -> Optional[Dict[str, 'Zero3AttrMeta']]:
+        if metadata is None:
+            return None
+        # Old checkpoints contain dictionaries and None entries for non-ZeRO3 parameters.
+        return {
+            name: cls(**meta) if isinstance(meta, dict) else meta
+            for name, meta in metadata.items()
+            if meta is not None
+        }
 
 
 def dedup_attrs(rank2attr_area_map: Dict[int, Dict[str, Dict[str, AttrMeta]]]) -> Dict[int, Dict[str, Dict[str, AttrMeta]]]:
@@ -217,8 +241,16 @@ class CubeModule(torch.nn.Module):
         super().__init__()
         self._reducers: List[Reducer] = list()
         # self._fullmap is mapping from the name of local attribute tensor
-        # to its corresponding fulltensor meta
-        # please note there can be multiple entries with same tid
+        # to its corresponding fulltensor meta.
+        # A trainable parameter has at most one entry per full tensor on a rank,
+        # which is enforced by IRAdapterGener.gen_weight. Attributes without gradient
+        # (frozen parameters and buffers) are not checked there, so they may still have
+        # multiple entries with the same tid when consumed with different partitions.
+
+        # Entries are inserted in attribute registration order, so the `is_param` entries
+        # follow the order of `self.parameters()`. Checkpoint merging counts them to recover
+        # the model parameter index (the keys of `ZeroMetadata.model_idx2opt_idx`), which
+        # `_get_zero_metadata` asserts.
         self._fullmap : Dict[str, AttrMeta] = dict()
 
     def get_non_persistent_buffers(self) -> Dict[str, torch.Tensor]:
@@ -472,6 +504,9 @@ class CubeModule(torch.nn.Module):
             raise TypeError("Expected ranks to be List[int]")
         DeviceGroup().get_group(ranks)
 
+    def init_groups(self, ranks: List[List[int]]):
+        return DeviceGroup().get_groups(ranks)
+
     def get_checkpoint(self, optimizer: torch.optim.Optimizer = None):
         state_dict = super().state_dict()
         # backward compatibility
@@ -552,7 +587,10 @@ class CubeModule(torch.nn.Module):
         #  value: Dict[ tuple(start, step, stop) , filled chunk]
         #  used to track how many elements have been filled for each zero3 parameter
         zero3_current_filled: Dict[str, Dict[Tuple[Tuple[int, int, int], ...], List[Tuple[int, int]]]] = {}
-        zero3_param_metadatas = [info[-1] for info in zero_idx_maps] if zero_idx_maps is not None else [None] * len(state_dicts)
+        zero3_param_metadatas = [
+            Zero3AttrMeta.normalize_mapping(info[-1])
+            for info in zero_idx_maps
+        ] if zero_idx_maps is not None else [None] * len(state_dicts)
         # gather param/buffer full tensor
         for rank, (model_state_dict, local_fullmap, zero3_param_metadata) in enumerate(zip(state_dicts, fullmaps, zero3_param_metadatas)):
             for local_name, meta in local_fullmap.items():
@@ -587,7 +625,7 @@ class CubeModule(torch.nn.Module):
                             raise ValueError("Invalid tensor as a ZeRO3 parameter, expected a 1D tensor.")
                         curr_filled = zero3_current_filled.setdefault(meta.orig_name, {}).setdefault(state_dict_merge_track_id, [])
                         curr_z3_info = zero3_param_metadata[local_name]
-                        curr_start, curr_end = curr_z3_info['start'], curr_z3_info['end']
+                        curr_start, curr_end = curr_z3_info.start, curr_z3_info.end
                         fill_len = curr_end - curr_start
                         if (curr_start, curr_end) in curr_filled:
                             # already filled, let's check consistency
@@ -1099,9 +1137,11 @@ class OriginModuleMetadata:
 
 @dataclass
 class ZeroMetadata:
-    # a mapping from the index of the parameter in the model
-    # to (optimizer_index, the start and end in the bucket, the shape of the parameter)
-    model_idx2opt_idx: Optional[Dict] = None
+    # a mapping from the index of the parameter in the model (`self.parameters()` order) to
+    #   - (optimizer_index, start and end offsets in the bucket, shape of the parameter)
+    #     if the parameter is in a reducer bucket
+    #   - optimizer_index if the parameter is not in any bucket
+    model_idx2opt_idx: Optional[Dict[int, Union[int, Tuple[int, int, int, torch.Size]]]] = None
     # a mapping from optimizer_index to the related bucket information (sub_ranks, bucket_size)
     opt_idx2ranks: Optional[Dict] = None
     # the level of zero optimization
@@ -1109,7 +1149,14 @@ class ZeroMetadata:
     # 1: zero1
     # > 1: zero3
     zero: int = 0
-    zero3_param_metadata: Optional[Dict[str, Dict]] = None
+    zero3_param_metadata: Optional[Dict[str, Zero3AttrMeta]] = None
+
+    def __post_init__(self):
+        self.zero3_param_metadata = Zero3AttrMeta.normalize_mapping(self.zero3_param_metadata)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__post_init__()
 
 
 @dataclass
@@ -1135,7 +1182,9 @@ class ParallelModuleConfig:
 
 @dataclass
 class ExtraState(ZeroMetadata, OriginModuleMetadata, ParallelModuleConfig):
-    pass
+    def __post_init__(self):
+        ParallelModuleConfig.__post_init__(self)
+        ZeroMetadata.__post_init__(self)
 
 
 class _ModuleTensorRegistry:
@@ -1478,13 +1527,16 @@ class ParallelModule(CubeModule):
                 attr_name = model_params[param]
                 param_attr = self._fullmap[attr_name]
                 zero3_info = reducer.get_z3_info(param)
+                if zero3_info is None:
+                    # not a ZeRO-3 parameter, keep the mapping free of None entries
+                    continue
                 self._zero3_param_metadata[attr_name] = Zero3AttrMeta(
                     attr_name=attr_name,
                     orig_name=param_attr.orig_name,
-                    start = zero3_info.start,
-                    end = zero3_info.end,
+                    start=zero3_info.start,
+                    end=zero3_info.end,
                     chunk_size=zero3_info.numel_with_padding(),
-                ) if zero3_info is not None else None
+                )
 
         self._zero_metadata = self._get_zero_metadata()
         # all parameters and buffers are ready now
@@ -1682,6 +1734,23 @@ class ParallelModule(CubeModule):
             for reducer in self._reducers:
                 reducer.sync_grads()
 
+    @contextmanager
+    def _cuda_sync_fence(self):
+        """Fence a generated multi-stream step against the caller's stream.
+
+        The generated code orders work between its own named streams but not
+        against the caller's current stream: inputs produced before the step
+        (eager activations feeding a nested module) and results read after it
+        (outputs, retained boundary gradients) would otherwise race.
+        """
+        if getattr(self, 'cuda_sync_required', False):
+            torch.cuda.synchronize()
+        try:
+            yield
+        finally:
+            if getattr(self, 'cuda_sync_required', False):
+                torch.cuda.synchronize()
+
     def _train_step(self, dataloader) -> Union[List[Any], Any]:
         """
         This function is assigned automatically when loading end2end module class
@@ -1793,15 +1862,17 @@ class ParallelModule(CubeModule):
             if len(samples) not in valid_nmicros:
                 raise ValueError(f"Expected one of {valid_nmicros} samples, but got {sample_count}")
             # only one step, so begin/end are both True
-            with accum_mode(begin=True, end=True):
-                return self._train_step(dataloader)
+            with self._cuda_sync_fence(), accum_mode(begin=True, end=True):
+                outputs = self._train_step(dataloader)
         else:
             outputs = []
-            for idx in range(sample_count):
-                with accum_mode(begin=(idx==0), end=(idx==sample_count-1)):
-                    output = self._train_step(dataloader)
-                outputs.append(output)
-            return outputs
+            with self._cuda_sync_fence():
+                for idx in range(sample_count):
+                    with accum_mode(begin=(idx==0), end=(idx==sample_count-1)):
+                        output = self._train_step(dataloader)
+                    outputs.append(output)
+        Executor.check_input_grad_callbacks_fired()
+        return outputs
 
     def infer_step(self, samples: List[Any]) -> List[Any]:
         """
@@ -1827,12 +1898,14 @@ class ParallelModule(CubeModule):
                 valid_nmicros = (valid_nmicros,)
             if len(samples) not in valid_nmicros:
                 raise ValueError(f"Expected one of {valid_nmicros} samples, but got {sample_count}")
-            return self._infer_step(dataloader)
+            with self._cuda_sync_fence():
+                return self._infer_step(dataloader)
         else:
             outputs = []
-            for _ in range(sample_count):
-                output = self._infer_step(dataloader)
-                outputs.append(output)
+            with self._cuda_sync_fence():
+                for _ in range(sample_count):
+                    output = self._infer_step(dataloader)
+                    outputs.append(output)
             return outputs
 
     def clip_gnorm(self, max_norm: Optional[float] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
@@ -1893,6 +1966,11 @@ class ParallelModule(CubeModule):
         # value: (sub_ranks, bucket_size), If value is None, then the parameter is not in a bucket
         opt_idx2ranks: Dict[int, Optional[Tuple[List[int], int]]] = {}
         model_params_id = [id(param) for param in self.parameters()]
+        # Checkpoint merging recovers the model parameter index by counting `is_param`
+        # entries of the fullmap in order, so that order must match `self.parameters()`.
+        assert [name for name, meta in self._fullmap.items() if meta.is_param] \
+            == [name for name, _ in self.named_parameters()], \
+            "fullmap parameter order must match named_parameters order"
 
         for reducer in self.reducers:
             _, sub_ranks = self._get_zero_subranks(reducer)
@@ -2097,7 +2175,7 @@ class ParallelModule(CubeModule):
             origname_tid_map = {meta.orig_name: meta.tid for meta in attr_meta_map.values()}
             tid_info = defaultdict(list)
             for attr, meta in attr_meta_map.items():
-                tid_info[meta.tid].append((attr, meta.slicers, meta.val_chunks))  # multiple params may share the same tid
+                tid_info[meta.tid].append((attr, meta.slicers, meta.val_chunks))  # frozen params or buffers may share the same tid
 
             for orig_param_name in orig_param_names:
                 if orig_param_name not in origname_tid_map:
@@ -2333,9 +2411,7 @@ class NonParallelModule(ParallelModule, skip_init=True):
             origin_state_dict_names=list(params.keys()),
             origin_shared_param_names=[],  # TODO: shared param support
         )
-        self._zero3_param_metadata: dict[str, Zero3AttrMeta] = {
-            n: None for n in local_name2params.keys()
-        }
+        self._zero3_param_metadata: Dict[str, Zero3AttrMeta] = {}
         self._zero_metadata = self._get_zero_metadata()
 
     def parameters(self, recurse: bool = True):

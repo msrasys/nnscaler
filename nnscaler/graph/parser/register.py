@@ -5,7 +5,7 @@
 Register cutomized function
 """
 
-from typing import Dict, Callable, Optional, Union, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 from functools import partial
 import inspect
 import logging
@@ -14,8 +14,13 @@ import torch
 from torch import ScriptFunction
 
 from nnscaler.graph.function.dimops import IRDimops, OpAnno, TransformRule
-from nnscaler.graph.tracer.wrap_utils import is_autograd_apply, is_autograd_op
+from nnscaler.graph.tracer.wrap_utils import (
+    is_autograd_apply,
+    is_autograd_op,
+    is_default_leaf_function,
+)
 from nnscaler.ir.operator import IRTensor, IRFwOperation
+from nnscaler.utils import _PUBLIC_TORCH_NAMESPACES, get_full_qualified_name, load_type
 
 _logger = logging.getLogger(__name__)
 
@@ -40,7 +45,6 @@ class CustomizedOps:
     # It accepts the IRFwOperation as input and returns the list of input tensors, which is used
     # during operator profiling.
     kOpInputGen: Dict[str, Callable[[IRFwOperation], List[torch.Tensor]]] = {}
-
     @staticmethod
     def map(signature: str) -> Callable:
         """Get IRDimop creation function by signature
@@ -315,3 +319,212 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
 # [Deprecated] register_op alias
 # Will remove in future.
 register = register_op
+no_change = object()
+
+
+# Each entry is (import path, namespace object).
+_TORCH_TENSOR_NAMESPACES = (
+    ('torch', torch),
+    ('torch.Tensor', torch.Tensor),
+)
+
+_RUNTIME_NAMESPACES = _PUBLIC_TORCH_NAMESPACES + (
+    ('torch._C._nn', torch._C._nn),
+    ('torch._C._linalg', torch._C._linalg),
+    ('torch._C._fft', torch._C._fft),
+    ('torch._C._special', torch._C._special),
+)
+
+
+def _get_torch_op_aliases(runtime_fn: Callable) -> tuple[str, ...]:
+    """
+    Return runtime aliases and same-name torch/Tensor aliases for a PyTorch operator.
+    Dunder locations are excluded, and dunder-only callables are unsupported.
+    Inplace/out-of-place counterparts are not inferred.
+    """
+    name = getattr(runtime_fn, '__name__', None)
+    if name and name.startswith('__') and name.endswith('__'):
+        raise ValueError("Dunder operator entry points are not supported by update_op")
+    signature = get_full_qualified_name(runtime_fn)
+    aliases = []
+
+    candidates = [runtime_fn]
+
+    # Module-inherited attributes such as torch.__eq__ are not Torch operators.
+    bridge_functions = [
+        vars(namespace).get(name) if inspect.ismodule(namespace) else getattr(namespace, name, None)
+        for _, namespace in _TORCH_TENSOR_NAMESPACES
+    ] if name else []
+    # torch.add and torch.Tensor.add share a parser signature despite different identities.
+    if any(candidate is runtime_fn for candidate in bridge_functions):
+        for (namespace_name, _), candidate in zip(_TORCH_TENSOR_NAMESPACES, bridge_functions):
+            if callable(candidate):
+                aliases.append(f'{namespace_name}.{name}')
+                candidates.append(candidate)
+
+    for namespace_name, namespace in _RUNTIME_NAMESPACES:
+        for alias_name, value in vars(namespace).items():
+            if alias_name.startswith('__') and alias_name.endswith('__'):
+                continue
+            if any(value is candidate for candidate in candidates):
+                aliases.append(f'{namespace_name}.{alias_name}')
+
+    if not aliases:
+        raise ValueError(f"No non-dunder runtime alias found for {signature}")
+
+    return tuple(dict.fromkeys([signature] + aliases))
+
+
+def _is_existing_tracer_leaf(runtime_fn: Callable, signatures: tuple[str, ...]) -> bool:
+    candidates = {runtime_fn}
+    for signature in signatures:
+        try:
+            candidates.add(load_type(signature))
+        except RuntimeError:
+            pass
+    return any(
+        is_default_leaf_function(candidate)
+        for candidate in candidates
+    )
+
+
+def update_op(
+    runtime_fn: Callable,
+    *,
+    op_create_fn: Optional[Callable] = no_change,
+    code: Optional[str] = no_change,
+    emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = no_change,
+    input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = no_change,
+    fake_fn: Optional[Callable] = no_change,
+) -> Callable:
+    """Update metadata for an operator already recognized by tracing or parsing.
+
+    The target must either have an existing IR creator or already be a callable
+    leaf in concrete tracing. Existing callable leaves include default wrapped
+    functions, callable Tensor methods or properties, and
+    ``torch.autograd.Function.apply``. Use :func:`register_op`
+    for an ordinary Python function that the tracer would otherwise trace
+    through. Pass an importable function or unbound method such as
+    ``torch.Tensor.add`` rather than an instance-bound method such as ``x.add``.
+    Dunder locations such as ``torch.Tensor.__add__`` are not aliases.
+    Callables exposed only through dunder locations are rejected.
+
+    ``fake_fn`` replaces execution only while concrete values are collected
+    during tracing. The FX node keeps ``runtime_fn`` as its target, so generated
+    runtime code does not call the fake. A PyTorch callable may have multiple
+    patch locations, such as ``torch.linalg.norm`` and its internal ``torch._C``
+    callable; all locations that reference the same callable use the fake while
+    preserving the same node target.
+
+    Updates are propagated to identity aliases discovered in supported PyTorch
+    namespaces, plus the same-name ``torch``/``torch.Tensor`` bridge used by
+    parser method normalization.
+
+    Each optional argument is independent. Leaving it as ``no_change`` keeps
+    the current customized or system-defined behavior. Passing ``None`` removes
+    the corresponding customized override. An ``op_create_fn`` override can be
+    removed only when the operator remains representable through an existing
+    tracer leaf or a system creator; removing the only creator of a custom
+    operator is rejected.
+
+    Autograd Function classes are normalized to their ``apply`` method.
+    Autograd Functions cannot use ``fake_fn``; wrap the call in a plain
+    function and register that wrapper when fake tracing behavior is required.
+
+    Args:
+        runtime_fn: Original operator callable whose identity is preserved in
+            the traced graph.
+        op_create_fn: Optional IR creation override.
+        code: Optional runtime implementation source.
+        emit_fn: Optional code emission override.
+        input_gen_fn: Optional profiler input generator override.
+        fake_fn: Optional tracing-only runtime replacement.
+
+    Returns:
+        The callable originally passed as ``runtime_fn``.
+    """
+    if not callable(runtime_fn):
+        raise TypeError("Expected a runtime function")
+    original_runtime_fn = runtime_fn
+    if is_autograd_op(runtime_fn):
+        runtime_fn = runtime_fn.apply
+    if fake_fn is not no_change and fake_fn is not None and not callable(fake_fn):
+        raise TypeError("Expected a fake function")
+    if op_create_fn is not no_change and op_create_fn is not None and not callable(op_create_fn):
+        raise TypeError("Expected an op creation function")
+    if code is not no_change and code is not None and not isinstance(code, str):
+        raise TypeError("Expected code to be a string")
+    if emit_fn is not no_change and emit_fn is not None and not callable(emit_fn):
+        raise TypeError("Expected an emit function")
+    if input_gen_fn is not no_change and input_gen_fn is not None and not callable(input_gen_fn):
+        raise TypeError("Expected an input generator function")
+    if fake_fn is not no_change and fake_fn is not None and is_autograd_apply(runtime_fn):
+        raise ValueError("Autograd function cannot have fake runtime function. "
+                         "Please wrap the autograd function and register the wrapper function instead.")
+
+    name = getattr(runtime_fn, '__name__', None)
+    if name and name.startswith('__') and name.endswith('__'):
+        raise ValueError("Dunder operator entry points are not supported by update_op")
+    signature = get_full_qualified_name(runtime_fn)
+    signatures = (
+        _get_torch_op_aliases(runtime_fn)
+        if signature.startswith('torch.') and not is_autograd_apply(runtime_fn)
+        else (signature,)
+    )
+    # Import locally because mapping imports this module to access CustomizedOps.
+    from nnscaler.graph.parser.mapping import SignFx2Op
+    is_tracer_leaf = _is_existing_tracer_leaf(runtime_fn, signatures)
+    if not is_tracer_leaf and not any(SignFx2Op.exist(signature) for signature in signatures):
+        raise KeyError(
+            f"{signatures[0]} is neither an existing tracer leaf nor a registered operator. "
+            "Please use register_op to register a new operator."
+        )
+
+    # we can't remove op_create_fn for custom ops.
+    if (
+        op_create_fn is None
+        and not is_tracer_leaf
+        and not any(signature in SignFx2Op.kOpMap for signature in signatures)
+    ):
+        raise ValueError(
+            f"{signatures[0]} has no existing tracer leaf or system op creator to fall back to. "
+            "A custom operator's op_create_fn cannot be deleted."
+        )
+
+    for alias in signatures:
+        try:
+            CustomizedOps.kOpRuntime[alias] = load_type(alias)
+        except RuntimeError:
+            CustomizedOps.kOpRuntime[alias] = runtime_fn
+
+        if op_create_fn is not no_change:
+            if op_create_fn is None:
+                CustomizedOps.kOpMap.pop(alias, None)
+            else:
+                CustomizedOps.kOpMap[alias] = op_create_fn
+
+        if code is not no_change:
+            if code is None:
+                CustomizedOps.kOpCodeDef.pop(alias, None)
+            else:
+                CustomizedOps.kOpCodeDef[alias] = code
+
+        if fake_fn is not no_change:
+            if fake_fn is None:
+                CustomizedOps.kOpFakeRuntime.pop(alias, None)
+            else:
+                CustomizedOps.kOpFakeRuntime[alias] = fake_fn
+
+        if emit_fn is not no_change:
+            if emit_fn is None:
+                CustomizedOps.kOpEmit.pop(alias, None)
+            else:
+                CustomizedOps.kOpEmit[alias] = emit_fn
+
+        if input_gen_fn is not no_change:
+            if input_gen_fn is None:
+                CustomizedOps.kOpInputGen.pop(alias, None)
+            else:
+                CustomizedOps.kOpInputGen[alias] = input_gen_fn
+
+    return original_runtime_fn

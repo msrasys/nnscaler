@@ -14,6 +14,7 @@ import nnscaler
 import nnscaler.graph.function.function as F
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.graph import IRGraph
+from nnscaler.graph.segment import IRSegment, IRSegmentExpander
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
@@ -24,6 +25,46 @@ from ..launch_torchrun import torchrun
 
 def _tensor(shape, requires_grad=True):
     return IRFullTensor(shape, requires_grad=requires_grad).tosub()
+
+
+@pytest.mark.parametrize('spatial_partition', [False, True])
+@pytest.mark.parametrize('value_partition', [False, True])
+def test_segment_narrowing_value_partitions(spatial_partition, value_partition):
+    """Producer-side narrowing keeps value partitions as per-device partial sums;
+    consumer-side narrowing never sees one and refuses it."""
+    source = _tensor([8], False)
+    output = _tensor([8], False)
+    nodes = []
+    for device in range(2):
+        indmap = ((device * 4, (device + 1) * 4),) if spatial_partition else source.indmap
+        valmap = (device, 2) if value_partition else (0, 1)
+        node = F.Identity(source.parent.select(indmap, valmap))
+        node.set_output(0, output.parent.select(indmap, valmap))
+        node.device = device
+        nodes.append(node)
+
+    producer = IRSegment(nodes, [source], [output])
+    producer_expander = IRSegmentExpander(producer, set(), set())
+    narrowed_output = producer_expander._try_narrow_segment_ptensors(output.parent)
+    assert narrowed_output is not None
+    for device, tensor in narrowed_output.items():
+        assert tensor.valmap == ((device, 2) if value_partition else (0, 1))
+        assert tensor.indmap == nodes[device].output(0).indmap
+
+    # Use a compute consumer rather than the identity pass-through special case.
+    consumers = []
+    for node in nodes:
+        consumer = F.Sum(node.input(0))
+        consumer.device = node.device
+        consumers.append(consumer)
+    segment = IRSegment(consumers, [source], [node.output(0) for node in consumers])
+    consumer_expander = IRSegmentExpander(segment, set(), set())
+    narrowed_input = consumer_expander._try_narrow_segment_ctensors(source.parent)
+    if value_partition or not spatial_partition:
+        assert narrowed_input is None
+    else:
+        assert narrowed_input is not None
+        assert all(t.valmap == (0, 1) for t in narrowed_input.values())
 
 
 def test_create_segment_loss_func():
@@ -50,6 +91,32 @@ def test_create_segment_loss_func():
     assert len(segment.outputs()) == 2
     assert segment.output(0) == loss
     assert segment.output(1) == d
+
+
+def test_multiref_no_backward_consumer_alias():
+    # The alias of a consumer without backward never receives a gradient. If it kept
+    # requires_grad=True, staging would rebuild a segment output gradient for it with
+    # no matching backward segment input once the alias crosses a stage boundary.
+    data = _tensor([256, 256], False)
+    w = _tensor([256, 256])
+    out = _tensor([256, 256])
+    linear = F.Linear(data, w)
+    linear.set_output(0, out)
+    loss = _tensor([1])
+    sum = F.Sum(out)
+    sum.set_output(0, loss)
+    detached = _tensor([256, 256], False)
+    detach = F.Detach(w)
+    detach.set_output(0, detached)
+    graph = IRGraph([linear, sum, detach], [data], [loss, detached], 'genmodel')
+    graph.backward(loss)
+    assert detach.mirror is None
+
+    graph.multiref(w.parent)
+    live_alias, dead_alias = linear.input(1), detach.input(0)
+    assert live_alias.parent != w.parent and dead_alias.parent != live_alias.parent
+    assert live_alias.requires_grad and live_alias.grad is not None
+    assert not dead_alias.requires_grad and dead_alias.grad is None
 
 
 def test_create_segment_loss_adapter():

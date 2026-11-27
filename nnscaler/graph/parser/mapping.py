@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Callable, Union
+from typing import Callable, Tuple, Union
 from functools import partial
 
 import nnscaler.graph.function as function
@@ -10,24 +10,23 @@ from nnscaler.graph.parser.register import CustomizedOps
 
 
 class SignFx2Op:
-
     @staticmethod
     def map(signature: str) -> Callable[..., Union[IRFwOperation, int, float]]:
         """
         Map the signature to GenericLogicalOp
         """
+        if CustomizedOps.exist(signature):
+            return CustomizedOps.map(signature)
         if signature in SignFx2Op.kOpMap:
             function = SignFx2Op.kOpMap[signature]
             return partial(function, signature=signature)
-        if CustomizedOps.exist(signature):
-            return CustomizedOps.map(signature)
         raise KeyError(f"{signature} is not supported yet")
 
     @staticmethod
     def exist(signature: str) -> bool:
-        if signature in SignFx2Op.kOpMap:
-            return True
         if CustomizedOps.exist(signature):
+            return True
+        if signature in SignFx2Op.kOpMap:
             return True
         return False
 

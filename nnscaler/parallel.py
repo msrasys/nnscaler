@@ -38,7 +38,7 @@ from nnscaler.graph.function.wrapnn import convert_to_wrapnn, wrapnn
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph.parser import FxModuleParser
 from nnscaler.graph.schedule.predefined import PredefinedSched
-from nnscaler.graph.schedule.schedplan import SchedulePlan
+from nnscaler.graph.schedule.schedplan import ScheduleAction, SchedulePlan
 
 from nnscaler.ir.cten import IRObject, IRTensor, IR
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation
@@ -88,6 +88,34 @@ _PREDEFINE_SCHED_NAME_PREFIX = 'sched_'
 for k, v in PredefinedSched.__dict__.items():
     if isinstance(v, staticmethod) and k.startswith(_PREDEFINE_SCHED_NAME_PREFIX):
         _PREDEFINE_SCHEDS[k[len(_PREDEFINE_SCHED_NAME_PREFIX):]] = getattr(PredefinedSched, k)  # be compatible with python 3.8
+
+# ZeRO-3 gathers a parameter with backward hooks on the activations right before the op's backward
+# and evicts it again as soon as the input gradient of that op has been produced.
+# Both hooks fire while the input backward runs, so a deferred weight backward
+# only sees the local shard of the parameter and cannot accumulate the full dW.
+# Reject every FBW form (the use_fbw flag and explicit I/W schedule actions) until
+# the weight backward can re-gather parameters by itself.
+_ZERO3_FBW_UNSUPPORTED = (
+    "FBW schedules (use_fbw or explicit input/weight backward actions) "
+    "are not supported with ZeRO-3: parameters are evicted during the input backward."
+)
+
+
+def _check_zero3_schedule(graph: IRGraph, compute_config: 'ComputeConfig') -> None:
+    """Reject bound schedules with explicit I/W actions under ZeRO-3.
+
+    A policy may bind a plan by constructing `SchedulePlan(graph, ...)` itself,
+    so this runs on whatever the policy returned rather than only on
+    `apply_pipeline_scheduler`.
+    """
+    if compute_config.use_zero <= 1 or graph.sched is None:
+        return
+    plans = graph.sched.values() if isinstance(graph.sched, dict) else [graph.sched]
+    split_actions = (ScheduleAction.BACKWARD_INPUT, ScheduleAction.BACKWARD_WEIGHT)
+    for plan in plans:
+        if any(block.action in split_actions for block in plan.all_blocks()):
+            raise ValueError(_ZERO3_FBW_UNSUPPORTED)
+
 
 _PREDEFINED_POLICIES: Dict[str, Callable[[IRGraph, 'ComputeConfig'], IRGraph]] = {}
 _PREDEFINED_POLICIES_NAME_PREFIX = 'pas_'
@@ -159,10 +187,17 @@ class ComputeConfig:
     # whether to use FBW schedules or FB schedules. Default is False (FB schedules).
     # only effective when `use_end2end` is True and `inference_only` is False.
     # Only useful for pipeline training with multi-stream scheduling or `use_async_common` is True.
+    # This flag is not necessary when you explicitly use FBW-aware schedulers (e.g. zero_bubble).
+    # Not supported together with ZeRO-3.
     use_fbw: bool = False
     # whether to use async communication for cross-stage collective operations.
     # This option only works for pipeline.
     use_async_comm: bool = False
+    # whether to free a pipeline stage output's storage once it has been sent to the
+    # next stage. The tensor stays alive only as a backward root, so this saves one
+    # boundary activation per in-flight micro-batch.
+    # This option only works for pipeline.
+    pipeline_deallocate_outputs: bool = True
 
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
@@ -285,6 +320,8 @@ class ComputeConfig:
                 raise ValueError("use_fbw is only supported in end2end mode.")
             if self.inference_only:
                 raise ValueError("use_fbw is not supported in inference mode.")
+            if self.use_zero > 1:
+                raise ValueError(_ZERO3_FBW_UNSUPPORTED)
 
     def apply_pipeline_scheduler(
             self,
@@ -415,10 +452,9 @@ class ComputeConfig:
         # create all groups
         plan_ngpus = self.plan_ngpus
         runtime_ngpus = self.runtime_ngpus
-        for i in range(plan_ngpus):
-            DeviceGroup().get_group(
-                list(range(i, runtime_ngpus, plan_ngpus))
-            )
+        DeviceGroup().get_groups([
+            list(range(i, runtime_ngpus, plan_ngpus)) for i in range(plan_ngpus)
+        ])
         rank_list = list(range(rank % plan_ngpus, runtime_ngpus, plan_ngpus))
         return rank_list, DeviceGroup().get_group(rank_list)
 
@@ -488,6 +524,7 @@ def _compile_flags(compute_config: ComputeConfig):
         async_reducer=compute_config.use_async_reducer, reducer_op='sum',
         max_reducer_bucket=compute_config.max_bucket_size_bytes,
         async_comm=compute_config.use_async_comm,
+        pipeline_deallocate_outputs=compute_config.pipeline_deallocate_outputs,
         use_zero=compute_config.use_zero,
         zero_ngroups=compute_config.zero_ngroups,
         zero_use_reduce_scatter=compute_config.zero_use_reduce_scatter,
@@ -1062,6 +1099,7 @@ def _gencode(
     graph = pas_policy(graph, compute_config)
     if not isinstance(graph, IRGraph):
         raise RuntimeError("Expected policy return IRGraph")
+    _check_zero3_schedule(graph, compute_config)
 
     # check assignment
     for node in graph.nodes(flatten=True):
@@ -1690,7 +1728,13 @@ _NON_PARALLEL_MODULE_ATTR_NAME = '_nnscaler_non_parallel_module_'
 _SYNC_GRAD_REQUIRED_ATTR = '_nnscaler_sync_grad_required'
 
 
-def _mark_sync_grad_required(module: torch.nn.Module, inputs, output) -> None:
+def _mark_sync_grad_required(module: torch.nn.Module, *_) -> None:
+    """Record that ``module`` ran a training step and its grads await sync.
+
+    Used as a forward hook on a mixed root module, and called directly by
+    ``mixin_module`` for a root whose custom ``train_step`` never runs the
+    root forward.
+    """
     if module.training:
         setattr(module, _SYNC_GRAD_REQUIRED_ATTR, True)
 
@@ -1785,10 +1829,6 @@ def build_optimizer(
     """
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
         raise RuntimeError("Old style CubeModule is not supported")
-
-    # only the root module can be end2end module.
-    if any(m != module and isinstance(m, ParallelModule) and  m.compute_config.use_end2end for m in module.modules()):
-        raise RuntimeError("End2End module cannot be nested in another module")
 
     is_hybrid = getattr(optimizer_fn, 'is_hybrid', False)
     if is_hybrid and param_clss_fn is None:
@@ -3210,6 +3250,7 @@ def load_deduped_state_dict(
     Returns:
         None
     """
+    module_state_dict = align_state_dict_names(module, module_state_dict)
     device = device or torch.cuda.current_device()
     cur_rank = torch.distributed.get_rank()
 
@@ -3247,13 +3288,15 @@ def load_deduped_state_dict(
                     local_name2ranks[key].append(rank)
 
         # create process groups for broadcasting
+        broadcast_groups = []
         for key, ranks in local_name2ranks.items():
             if len(ranks) <= 1:
                 continue
             # should have sorted.
             ranks.sort()
             logger.debug(f'At rank {cur_rank}, create groups for ranks: {ranks}.')
-            DeviceGroup().get_group(ranks)
+            broadcast_groups.append(ranks)
+        DeviceGroup().get_groups(broadcast_groups)
 
         torch.distributed.barrier()
 
@@ -3482,6 +3525,116 @@ def _broadcast_weights(module: torch.nn.Module, stride_size: int):
 
 
 @torch.no_grad()
+def align_state_dict_names(
+    module: torch.nn.Module,
+    module_state_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Align generated ParallelModule parameter/buffer names in a per-rank checkpoint.
+
+    Match by original name and shard metadata, ignoring generated names and tensor
+    IDs. Return a shallow copy without copying tensors or modifying the input.
+    Module prefixes, original names, partitioning and optimizer parameter order
+    must be unchanged. Missing metadata or ambiguous/incompatible matches raise
+    ValueError. This adapter is for sharded/deduped, not merged, state dicts.
+    """
+    def attr_meta_identity(meta: AttrMeta) -> tuple:
+        key = asdict(meta)
+        # Remove tensor ID from the key as it is not used for identity
+        key.pop('tid', None)
+        # slice is not hashable in old versions of Python
+        key['slicers'] = tuple((s.start, s.stop, s.step) for s in meta.slicers)
+        return tuple(key.values())
+
+    def zero3_attr_meta_identity(meta: Zero3AttrMeta) -> tuple:
+        key = asdict(meta)
+        key.pop('attr_name', None)
+        return tuple(key.values())
+
+    key_map: Dict[str, str] = {}
+    extra_states: Dict[str, Any] = {}
+    for prefix, pm in module.named_modules():
+        if not isinstance(pm, ParallelModule):
+            continue
+        prefix = f'{prefix}.' if prefix else ''
+        extra_key = f'{prefix}{ParallelModule.EXTRA_STATE_KEY}'
+        if extra_key not in module_state_dict:
+            raise ValueError(f"Cannot align checkpoint names: missing {extra_key}")
+        old = ExtraState(**module_state_dict[extra_key])
+        current_state: Dict[str, Any] = {}
+        pm._add_extra_state(current_state, prefix)
+        current = ExtraState(**current_state[extra_key])
+
+        if old.rank != current.rank:
+            raise ValueError(f"Cannot align {extra_key}: checkpoint rank changed")
+
+        for field_name in ('plan_ngpus', 'runtime_ngpus', 'use_zero', 'zero_ngroups'):
+            if getattr(old.compute_config, field_name) != getattr(current.compute_config, field_name):
+                raise ValueError(f"Cannot align {extra_key}: {field_name} changed; load a merged checkpoint instead")
+
+        for field_name in ('origin_param_names', 'origin_state_dict_names', 'origin_shared_param_names'):
+            if getattr(old, field_name) != getattr(current, field_name):
+                raise ValueError(f"Cannot align {extra_key}: original model metadata {field_name} changed; load a merged checkpoint instead")
+
+        candidates: Dict[tuple, str] = {
+            attr_meta_identity(meta): name
+            for name, meta in current.param_area_map.items()
+        }
+        if len(candidates) != len(current.param_area_map):
+            raise ValueError(f"Cannot align {extra_key}: ambiguous shard metadata in module param_area_map")
+
+        # Map old parameter names to new parameter names
+        name_map: Dict[str, str] = {}
+
+        for old_name, meta in old.param_area_map.items():
+            # Consume each match once to keep the old and new shard names in one-to-one correspondence.
+            match = candidates.pop(attr_meta_identity(meta), None)
+            if match is None:
+                raise ValueError(
+                    f"Cannot align {prefix}{old_name}: expected one match for "
+                    f"{meta.orig_name} with the same shard metadata, found {match}"
+                )
+            name_map[old_name] = match
+
+        if candidates:
+            raise ValueError(f"Cannot align {extra_key}: parameter names are missing from shard metadata")
+
+        # Optimizer state uses positional IDs (or bucket offsets), not model keys.
+        if [name_map[name] for name in old.cube_param_names] != current.cube_param_names:
+            raise ValueError(f"Cannot align {extra_key}: optimizer parameter order changed")
+        for field_name in ('zero', 'model_idx2opt_idx', 'opt_idx2ranks'):
+            if getattr(old, field_name) != getattr(current, field_name):
+                raise ValueError(f"Cannot align {extra_key}: optimizer layout {field_name} changed")
+
+        # zero3 config
+        old_zero3 = {
+            name_map[name]: zero3_attr_meta_identity(meta)
+            for name, meta in old.zero3_param_metadata.items()
+        } if old.zero3_param_metadata else {}
+        new_zero3 = {
+            name: zero3_attr_meta_identity(meta)
+            for name, meta in current.zero3_param_metadata.items()
+        } if current.zero3_param_metadata else {}
+        if old_zero3 != new_zero3:
+            raise ValueError(f"Cannot align {extra_key}: ZeRO-3 parameter layout changed")
+
+        key_map.update({f'{prefix}{old_name}': f'{prefix}{new_name}' for old_name, new_name in name_map.items()})
+        extra_states[extra_key] = current_state[extra_key]
+
+    # create a new adapted state dict with the same type of original state dict
+    # And this can also keep the `_metadata` attached to the dict if it exists
+    adapted = copy.copy(module_state_dict)
+    adapted.clear()
+    for key, value in module_state_dict.items():
+        new_key = key_map.get(key, key)
+        if new_key in adapted:
+            raise ValueError(f"Cannot align checkpoint names: key collision at {new_key}")
+        adapted[new_key] = extra_states.get(key, value)
+    logger.info("Aligned %s checkpoint parameter/buffer names", sum(k != v for k, v in key_map.items()))
+    return adapted
+
+
+@torch.no_grad()
 def load_sharded_state_dict(
     module: torch.nn.Module,
     module_state_dict: Dict[str, Any],
@@ -3505,6 +3658,7 @@ def load_sharded_state_dict(
         None
     """
 
+    module_state_dict = align_state_dict_names(module, module_state_dict)
     device = device or torch.cuda.current_device()
     module.to(device)
 

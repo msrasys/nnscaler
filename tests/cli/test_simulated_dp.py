@@ -38,8 +38,10 @@ def init_scale_unit_groups(trainer: Trainer) -> None:
         raise ValueError(f'world size {world_size} does not match runtime_ngpus {compute_config.runtime_ngpus}')
     if world_size % group_size:
         raise ValueError(f'world size {world_size} must be divisible by {group_size}')
-    for first_rank in range(0, world_size, group_size):
-        DeviceGroup().get_group(tuple(range(first_rank, first_rank + group_size)))
+    DeviceGroup().get_groups([
+        list(range(first_rank, first_rank + group_size))
+        for first_rank in range(0, world_size, group_size)
+    ])
 
 
 def _fake_slow_block(

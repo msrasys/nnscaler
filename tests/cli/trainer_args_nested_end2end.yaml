@@ -1,0 +1,75 @@
+vars:
+  dim: 16
+  nlayers: 4
+
+compute_config:
+  plan_ngpus: 2
+  runtime_ngpus: 4
+  constant_folding: true
+  use_zero: 1
+  use_end2end: true
+
+run_mode: run
+pas_policy: tp
+init_env_fn: tests.cli.test_nested_end2end.init_scale_unit_groups
+micro_batch_size: 2
+global_batch_size: 16
+max_epochs: 1
+seed: 0
+
+model:
+  type: tests.cli.test_nested_end2end.NestedEnd2EndVLModel
+  args:
+    dim: $(vars.dim)
+    nlayers: $(vars.nlayers)
+    plan_ngpus: $(compute_config.plan_ngpus)
+    # true switches the vision tower to scale-unit data parallelism
+    vision_dp: false
+  parallel_modules:
+    - type: tests.cli.test_nested_end2end.VisionTower
+      forward_args_gen_fn: tests.cli.test_nested_end2end.vision_forward_args_gen_fn
+      pas_policy: tp
+    # The language model owns the complete train graph and runs as an
+    # end-to-end pipeline nested inside the eager wrapper.
+    - type: tests.cli.test_nested_end2end.LanguageModel
+      forward_args_gen_fn: tests.cli.test_nested_end2end.language_forward_args_gen_fn
+      forward_args_autoset_requires_grad: false
+      pas_policy: hybrid
+      compute_config:
+        use_end2end: true
+        pas_config:
+          pipeline_nmicros: 4
+          pipeline_nstages: 2
+          pipeline_scheduler: 1f1b
+
+optimizer:
+  type: torch.optim.Adam
+  args:
+    lr: 0.01
+  param_clss_fn: tests.cli.test_nested_end2end.vision_param_clss_fn
+
+dataset:
+  type: tests.cli.test_nested_end2end.VLDataset
+  train_args:
+    dim: $(vars.dim)
+    size: 24
+  val_args:
+    dim: $(vars.dim)
+    size: 8
+
+dataset_sampler:
+  train_args:
+    shuffle: false
+
+dataloader:
+  train_args:
+    drop_last: true
+    shuffle: false
+  val_args:
+    drop_last: true
+    shuffle: false
+
+checkpoint:
+  keep_last_n_checkpoints: 10
+  every_n_train_steps: 1
+  save_type: deduped

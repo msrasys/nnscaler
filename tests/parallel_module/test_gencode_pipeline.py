@@ -1,4 +1,5 @@
 import re
+from functools import partial
 
 import torch
 import pytest
@@ -56,6 +57,38 @@ def pp_pas(graph, cfg, nlayers_per_stage=2):
 
 
 @replace_all_device_with('cpu')
+@pytest.mark.parametrize('num_microbatches', [1, 4])
+def test_gencode_zero_bubble(tmp_path, num_microbatches):
+    parallelize(
+        PPModule1(nlayers=4),
+        {'data': torch.randn(8, 1024)},
+        pas_policy=lambda graph, cfg: pp_pas(graph, cfg, nlayers_per_stage=1),
+        compute_config=ComputeConfig(4, 4, use_end2end=True, pas_config={
+            'pipeline_nmicros': num_microbatches,
+            'pipeline_nstages': 4,
+            'pipeline_scheduler': 'zero_bubble',
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+
+    for rank in range(4):
+        assert len(_gencode_contains(
+            tmp_path,
+            PPModule1,
+            rank,
+            r'nnscaler\.runtime\.executor\.backward_input\(',
+        )) == num_microbatches
+        assert len(_gencode_contains(
+            tmp_path,
+            PPModule1,
+            rank,
+            r'nnscaler\.runtime\.executor\.backward_weight\(',
+        )) == num_microbatches
+
+
+@replace_all_device_with('cpu')
 def test_gencode_correct_dataloader_order(tmp_path):
     m = PPModule1(return_type=3)
     m.train()
@@ -83,6 +116,21 @@ def test_gencode_correct_dataloader_order(tmp_path):
     rank0_dataloader_ops = _gencode_contains(tmp_path, PPModule1, 0, r'.*next\(\*\(dataloader\_.*')
     rank1_dataloader_ops = _gencode_contains(tmp_path, PPModule1, 1, r'.*next\(\*\(dataloader\_.*')
     assert rank0_dataloader_ops == rank1_dataloader_ops
+
+    # A stage output whose only forward consumer is the send to the next stage
+    # has its storage released right after that send, while it stays a backward root.
+    # Graph outputs (the loss on rank 1) and received tensors are never released.
+    sent_then_released = _gencode_contains(
+        tmp_path, PPModule1, 0,
+        r'aexecute\(model\.adapter\d+, \*\((\w+), \), requires_grad=False\)\n\s*'
+        r'nnscaler\.runtime\.executor\.release_storage\(\1\)',
+    )
+    stage_outputs = _gencode_contains(
+        tmp_path, PPModule1, 0, r'(\w+) = nnscaler\.runtime\.executor\.fexecute\(.*requires_grad=True\)')
+    assert len(stage_outputs) == 2 and sent_then_released == stage_outputs
+    assert all(
+        _gencode_contains(tmp_path, PPModule1, 0, rf'backward\(.*\({name}, \)') for name in stage_outputs)
+    assert not _gencode_contains(tmp_path, PPModule1, 1, r'release_storage\(')
     # code looks like:
     # rank1:
     # def _train_step(model, dataloader_33):
@@ -108,6 +156,34 @@ def test_gencode_correct_dataloader_order(tmp_path):
     #     sum_1_24 = nnscaler.runtime.executor.aexecute(model.adapter56, *(sum_1_24, ), requires_grad=True)
     #     sum_1_65 = nnscaler.runtime.executor.aexecute(model.adapter56, *(sum_1_65, ), requires_grad=True)
     #     return [sum_1_24, {'data': data_23}], [sum_1_65, {'data': data_48}]
+
+
+@replace_all_device_with('cpu')
+def test_gencode_pipeline_deallocate_outputs_disabled(tmp_path):
+    m = PPModule1(return_type=3)
+    m.train()
+    parallelize(
+        m,
+        {'data': torch.randn(64, 1024)},
+        pas_policy=lambda graph, cfg: pp_pas(graph, cfg, nlayers_per_stage=2),
+        compute_config= ComputeConfig(
+            2, 2,
+            constant_folding=False,
+            use_end2end=True,
+            pipeline_deallocate_outputs=False,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_nstages=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+        max_workers=2,
+    )
+    for rank in (0, 1):
+        assert not _gencode_contains(tmp_path, PPModule1, rank, r'release_storage\(')
 
 
 @replace_all_device_with('cpu')
@@ -468,9 +544,12 @@ def _shared_output_partition_policy(graph, cfg):
 
 @replace_all_device_with('cpu')
 def test_split_segment_with_shared_output(tmp_path):
-    """
-    Shared output will prevent the segment output from being split,
-    TODO: we should support splitting the shared output, but currently we don't support it.
+    """Keep a shared activation sharded when producer and consumers use dim 0.
+
+    This three-stage pipeline has two TP ranks per stage. Stage 0 uses x0
+    locally to compute x1 and also exports x0 to stage 1. Rank 0 must not
+    gather x0 merely to pass it through the inserted output identity.
+    This is a codegen check; it does not execute distributed forward/backward.
     """
     m = SharedOutputSegmentModule()
     m.train()
@@ -491,65 +570,421 @@ def test_split_segment_with_shared_output(tmp_path):
         load_module=False,
         reuse='override',
     )
-    assert _gencode_contains(
+    assert not _gencode_contains(
         tmp_path, SharedOutputSegmentModule, 0, r'nnscaler.runtime.adapter.nn.allgather_split'
     )
 
-    # rank 0:
+    # Stage 0 sends both outputs. `add_148` comes from the output identity over a
+    # multiref branch that is still used locally (same runtime object), so only
+    # the freshly computed `add_1_72` has its storage released after its send.
+    alias_out, fresh_out = _gencode_contains(
+        tmp_path, SharedOutputSegmentModule, 0, r'\n        return (\w+), (\w+)\n')[0]
+    assert _gencode_contains(
+        tmp_path, SharedOutputSegmentModule, 0, rf'{alias_out} = nnscaler\.runtime\.function\.identity\(')
+    for name in (alias_out, fresh_out):
+        assert _gencode_contains(
+            tmp_path, SharedOutputSegmentModule, 0, rf'aexecute\(model\.adapter\d+, \*\({name}, \), requires_grad=False\)')
+    assert _gencode_contains(tmp_path, SharedOutputSegmentModule, 0, rf'release_storage\({fresh_out}\)')
+    assert not _gencode_contains(tmp_path, SharedOutputSegmentModule, 0, rf'release_storage\({alias_out}\)')
+
+    # after narrowing, no allgather_split should be present
     # def segment39(self, data_32):
     #     data_64 = nnscaler.runtime.adapter.chunk(data_32, dim=0, ranks=[0, 1])
     #     del data_32
-    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 437, in forward,  x0 = data + self.w0
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 438, in forward,  x0 = data + self.w0
     #     add_68 = torch.add(data_64, self.w0_66, alpha=1)
     #     del data_64
-    #     # create at IRAdapterGener:autoref, comment before transformation: fn activation
-    #     add_120, add_158 = nnscaler.runtime.function.multiref(add_68, times=2)
+    #     # created at IRAdapterGener:local_consumer_multiref
+    #     add_156, add_160 = nnscaler.runtime.function.multiref(add_68, times=2)
     #     del add_68
-    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 438, in forward,  x1 = x0 + self.w1
-    #     add_1_72 = torch.add(add_120, self.w1_70, alpha=1)
-    #     del add_120
-    #     add_113 = nnscaler.runtime.adapter.nn.allgather_split(add_158, dim=0, ranks=[0, 1])
-    #     del add_158
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 439, in forward,  x1 = x0 + self.w1
+    #     add_1_72 = torch.add(add_156, self.w1_70, alpha=1)
+    #     del add_156
     #     # fn identity for segment output
-    #     add_106 = nnscaler.runtime.function.identity(add_113)
-    #     del add_113
-    #     return add_106, add_1_72
+    #     add_148 = nnscaler.runtime.function.identity(add_160)
+    #     del add_160
+    #     return add_148, add_1_72
 
-    # def adapter202(self, add_106):
-    #     add_162 = nnscaler.runtime.adapter.chunk(add_106, dim=0, ranks=[0, 1])
-    #     _ = nnscaler.runtime.adapter.move(add_162, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    # def adapter204(self, add_148):
+    #     _ = nnscaler.runtime.adapter.move(add_148, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
     #     return
 
-    # def adapter232(self, add_1_72):
+    # def adapter234(self, add_1_72):
     #     _ = nnscaler.runtime.adapter.move(add_1_72, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
     #     return
 
     # rank 2:
-    # def segment43(self, add_162, add_1_72):
+    # def segment43(self, add_148, add_1_72):
     #     # created at: segment dispatch: fix identity
-    #     add_1_128 = nnscaler.runtime.function.identity(add_1_72)
+    #     add_1_118 = nnscaler.runtime.function.identity(add_1_72)
     #     del add_1_72
     #     # created at: segment dispatch: fix identity
-    #     add_136 = nnscaler.runtime.function.identity(add_162)
-    #     del add_162
-    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 440, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
-    #     add_2_76 = torch.add(add_1_128, self.w2_74, alpha=1)
-    #     del add_1_128
-    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 440, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
-    #     add_3_78 = torch.add(add_2_76, add_136, alpha=1)
-    #     del add_136, add_2_76
-    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x3 = x2 + self.w3
+    #     add_126 = nnscaler.runtime.function.identity(add_148)
+    #     del add_148
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_2_76 = torch.add(add_1_118, self.w2_74, alpha=1)
+    #     del add_1_118
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_3_78 = torch.add(add_2_76, add_126, alpha=1)
+    #     del add_126, add_2_76
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 442, in forward,  x3 = x2 + self.w3
     #     add_4_82 = torch.add(add_3_78, self.w3_80, alpha=1)
     #     del add_3_78
     #     return add_4_82
 
-    # def adapter202(self):
-    #     add_162 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
-    #     return add_162
+    # def adapter204(self):
+    #     add_148 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return add_148
 
-    # def adapter232(self):
+    # def adapter234(self):
     #     add_1_72 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
     #     return add_1_72
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_with_different_producer_partition(tmp_path):
+    """Share one layout conversion between local use and cross-stage export.
+
+    Stage 0 produces x0 as column shards (dim 1), but its local consumer and
+    stage 1 both need row shards (dim 0). Each source rank must perform exactly
+    one all-to-all, then reuse its result for both branches without all-gather.
+    Receiver ranks must not gather the incoming shards either; otherwise the
+    redundant gather/resplit would only have moved to the receiving stage.
+    """
+    from nnscaler.ir import IRSubTensor
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    def policy(graph, cfg):
+        stage_id = 0
+        for node in get_pas_ops(graph):
+            if node.fn == torch.add:
+                dim = 0
+                weight = node.input(1)
+                if isinstance(weight, IRSubTensor) and weight.is_param():
+                    if weight.name in ['w0', 'w1']:
+                        stage_id = 0
+                    elif weight.name in ['w2', 'w3']:
+                        stage_id = 1
+                    elif weight.name in ['w4', 'w5']:
+                        stage_id = 2
+                    if weight.name == 'w0':
+                        dim = 1
+                yield OpPlan(node, stage_id=stage_id, partition=OpPartition(input=0, dim=dim))
+            else:
+                yield OpPlan(node, stage_id=stage_id, partition=None)
+
+    parallelize(
+        SharedOutputSegmentModule().train(),
+        {'data': torch.randn(4, 4)},
+        pas_policy=policy,
+        compute_config=ComputeConfig(
+            6, 6,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config={'pipeline_nmicros': 3, 'pipeline_scheduler': '1f1b'},
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    for rank in (0, 1):
+        # Convert columns to rows once, then share the row shards with both consumers.
+        assert len(_gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.nn\.alltoall_alltoall\(.*idim=1, odim=0',
+        )) == 1
+        assert not _gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.nn\.allgather_split\(',
+        )
+    for rank in (2, 3):
+        assert not _gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.(?:nn\.)?(?:all_gather|allgather_split)\(',
+        )
+
+    # rank 0
+    # def segment39(self, data_32):
+    #     data_64 = nnscaler.runtime.adapter.chunk(data_32, dim=1, ranks=[0, 1])
+    #     del data_32
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 438, in forward,  x0 = data + self.w0
+    #     add_68 = torch.add(data_64, self.w0_66, alpha=1)
+    #     del data_64
+    #     add_70 = nnscaler.runtime.adapter.nn.alltoall_alltoall(add_68, idim=1, odim=0, ranks=[0, 1])
+    #     del add_68
+    #     # created at IRAdapterGener:local_consumer_multiref
+    #     add_159, add_163 = nnscaler.runtime.function.multiref(add_70, times=2)
+    #     del add_70
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 439, in forward,  x1 = x0 + self.w1
+    #     add_1_74 = torch.add(add_159, self.w1_72, alpha=1)
+    #     del add_159
+    #     # fn identity for segment output
+    #     add_150 = nnscaler.runtime.function.identity(add_163)
+    #     del add_163
+    #     return add_150, add_1_74
+
+    # def adapter204(self, add_1_74):
+    #     _ = nnscaler.runtime.adapter.move(add_1_74, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return
+
+    # def adapter234(self, add_150):
+    #     _ = nnscaler.runtime.adapter.move(add_150, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return
+
+    # rank 2
+    # def adapter204(self):
+    #     add_1_74 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return add_1_74
+
+    # def adapter234(self):
+    #     add_150 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return add_150
+
+    # def segment43(self, add_150, add_1_74):
+    #     # created at: segment dispatch: fix identity
+    #     add_1_120 = nnscaler.runtime.function.identity(add_1_74)
+    #     del add_1_74
+    #     # created at: segment dispatch: fix identity
+    #     add_128 = nnscaler.runtime.function.identity(add_150)
+    #     del add_150
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_2_78 = torch.add(add_1_120, self.w2_76, alpha=1)
+    #     del add_1_120
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_3_80 = torch.add(add_2_78, add_128, alpha=1)
+    #     del add_128, add_2_78
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 442, in forward,  x3 = x2 + self.w3
+    #     add_4_84 = torch.add(add_3_80, self.w3_82, alpha=1)
+    #     del add_3_80
+    #     return add_4_84
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_with_different_producer_partition_no_partition(tmp_path):
+    """Preserve required receiver gathers when later consumers are replicated.
+
+    Stage 0 produces x0 along dim 1 and uses it locally along dim 0, while
+    stages 1 and 2 use complete tensors. Source ranks must still share one
+    all-to-all conversion and export row shards without gathering locally.
+    Each stage-1 rank must gather both incoming tensors, x0 and x1. This guards
+    against removing necessary communication along with the redundant gather.
+    """
+    from nnscaler.ir import IRSubTensor
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    def policy(graph, cfg):
+        stage_id = 0
+        for node in get_pas_ops(graph):
+            if node.fn == torch.add:
+                op_partition = None
+                weight = node.input(1)
+                if isinstance(weight, IRSubTensor) and weight.is_param():
+                    if weight.name in ['w0', 'w1']:
+                        stage_id = 0
+                    elif weight.name in ['w2', 'w3']:
+                        stage_id = 1
+                    elif weight.name in ['w4', 'w5']:
+                        stage_id = 2
+                    if weight.name == 'w0':
+                        op_partition = OpPartition(input=0, dim=1)
+                    elif weight.name == 'w1':
+                        op_partition = OpPartition(input=0, dim=0)
+                yield OpPlan(node, stage_id=stage_id, partition=op_partition)
+            else:
+                yield OpPlan(node, stage_id=stage_id, partition=None)
+
+    parallelize(
+        SharedOutputSegmentModule().train(),
+        {'data': torch.randn(4, 4)},
+        pas_policy=policy,
+        compute_config=ComputeConfig(
+            6, 6,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config={'pipeline_nmicros': 3, 'pipeline_scheduler': '1f1b'},
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    for rank in (0, 1):
+        # Convert columns to rows once, then share the row shards with both consumers.
+        assert len(_gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.nn\.alltoall_alltoall\(.*idim=1, odim=0',
+        )) == 1
+        assert not _gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.nn\.allgather_split\(',
+        )
+    for rank in (2, 3):
+        assert len(_gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.all_gather\(.*dim=0, ranks=\[2, 3\]',
+        )) == 2
+
+    # rank 0
+    # def segment29(self, data_32):
+    #     data_64 = nnscaler.runtime.adapter.chunk(data_32, dim=1, ranks=[0, 1])
+    #     del data_32
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 438, in forward,  x0 = data + self.w0
+    #     add_68 = torch.add(data_64, self.w0_66, alpha=1)
+    #     del data_64
+    #     add_70 = nnscaler.runtime.adapter.nn.alltoall_alltoall(add_68, idim=1, odim=0, ranks=[0, 1])
+    #     del add_68
+    #     # created at IRAdapterGener:local_consumer_multiref
+    #     add_111, add_115 = nnscaler.runtime.function.multiref(add_70, times=2)
+    #     del add_70
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 439, in forward,  x1 = x0 + self.w1
+    #     add_1_74 = torch.add(add_111, self.w1_72, alpha=1)
+    #     del add_111
+    #     # fn identity for segment output
+    #     add_102 = nnscaler.runtime.function.identity(add_115)
+    #     del add_115
+    #     return add_102, add_1_74
+
+    # def adapter150(self, add_1_74):
+    #     _ = nnscaler.runtime.adapter.move(add_1_74, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return
+
+    # def adapter210(self, add_102):
+    #     _ = nnscaler.runtime.adapter.move(add_102, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return
+
+    # rank 2
+    # def adapter150(self):
+    #     add_1_74 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     add_1_37 = nnscaler.runtime.adapter.all_gather(add_1_74, dim=0, ranks=[2, 3])
+    #     return add_1_37
+
+    # def adapter210(self):
+    #     add_102 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     add_90 = nnscaler.runtime.adapter.all_gather(add_102, dim=0, ranks=[2, 3])
+    #     return add_90
+
+    # def segment33(self, add_90, add_1_37):
+    #     add_1_82 = nnscaler.runtime.function.identity(add_1_37)
+    #     del add_1_37
+    #     add_78 = nnscaler.runtime.function.identity(add_90)
+    #     del add_90
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_2_39 = torch.add(add_1_82, self.w2_38, alpha=1)
+    #     del add_1_82
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_3_40 = torch.add(add_2_39, add_78, alpha=1)
+    #     del add_78, add_2_39
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 442, in forward,  x3 = x2 + self.w3
+    #     add_4_42 = torch.add(add_3_40, self.w3_41, alpha=1)
+    #     del add_3_40
+    #     return add_4_42
+
+
+class SharedOutputBoundaryModule(SharedOutputSegmentModule):
+    def __init__(self, case):
+        super().__init__()
+        self.case = case
+
+    def forward(self, data):
+        if self.case == 'value_producer':
+            x0 = torch.matmul(data, self.w0)
+        else:
+            x0 = data + self.w0
+        x1 = x0 + self.w1
+        if self.case == 'incompatible_consumers':
+            x1 = x1 + torch.relu(x0)
+        x2 = x1 + self.w2 + x0 + x0
+        x3 = x2 + self.w3
+        x4 = x3 + self.w4
+        x5 = x4 + self.w5
+        loss = torch.pow(x5, 2).sum()
+        if self.case == 'final_output':
+            return loss, x0
+        return loss
+
+
+def _shared_output_boundary_policy(graph, cfg, case):
+    from nnscaler.ir import IRSubTensor
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    stage_id = 0
+    for node in get_pas_ops(graph):
+        partition = None
+        if node.fn in (torch.add, torch.matmul):
+            weight = node.input(1)
+            is_weight = isinstance(weight, IRSubTensor) and weight.is_param()
+            if is_weight:
+                stage_id = 0 if weight.name in ('w0', 'w1') else 1
+            if node.fn == torch.matmul:
+                partition = OpPartition(input=1, dim=0)
+            elif not (case == 'full_next_stage' and stage_id == 1):
+                partition = OpPartition(input=0, dim=0)
+                if is_weight and weight.name == 'w0':
+                    partition = None if case == 'replicated_producer' else OpPartition(input=0, dim=1)
+        yield OpPlan(node, stage_id=stage_id, partition=partition)
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('case', ['final_output', 'incompatible_consumers'])
+def test_shared_output_pipeline_boundary_codegen(tmp_path, case):
+    """Check full-value requirements in an actual two-stage, TP=2 pipeline.
+
+    final_output:
+        x0 is consumed inside the pipeline and also returned alongside loss
+        as a final graph output. The detach feeding the return follows the
+        dim-0 consumers of its stage, so only shards cross the boundary and
+        the source ranks need no all-gather; the returned value is still
+        completed by the final stage before it is moved out.
+    incompatible_consumers:
+        A dim-0 add and a replicated ReLU consume x0 in stage 0. Their split
+        requirements are {0, 'rn'}, so there is no single compatible layout
+        for the output identity to follow, and source ranks retain an all-gather.
+
+    These are communication checks; the end-to-end companion test checks
+    returned values and parameter gradients for the same cases.
+    """
+    parallelize(
+        SharedOutputBoundaryModule(case).train(),
+        {'data': torch.randn(4, 4)},
+        pas_policy=partial(_shared_output_boundary_policy, case=case),
+        compute_config=ComputeConfig(
+            4, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config={'pipeline_nmicros': 3, 'pipeline_scheduler': '1f1b'},
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    for rank in (0, 1):
+        source_allgather = _gencode_contains(
+            tmp_path, SharedOutputBoundaryModule, rank,
+            r'nnscaler\.runtime\.adapter\.nn\.allgather_split\(',
+        )
+        assert bool(source_allgather) == (case == 'incompatible_consumers')
+    if case == 'final_output':
+        for rank in (0, 1):
+            # Both outputs are sent, but x0 is the identity over a locally consumed
+            # multiref branch, so only the fresh second output is released.
+            outputs = _gencode_contains(
+                tmp_path, SharedOutputBoundaryModule, rank,
+                r'(\w+), (\w+) = nnscaler\.runtime\.executor\.fexecute\('
+                r"'segment\d+', model\.segment\d+, \*\(data_\d+, \), requires_grad=True\)")
+            assert len(outputs) == 3
+            released = _gencode_contains(tmp_path, SharedOutputBoundaryModule, rank, r'release_storage\((\w+)\)')
+            assert released == [names[1] for names in outputs]
+        for rank in (2, 3):
+            # x0 arrives as a dim-0 shard and is consumed as such: no re-sharding
+            # inside the stage, and the only gather completes the detached return.
+            assert not _gencode_contains(
+                tmp_path, SharedOutputBoundaryModule, rank,
+                r'nnscaler\.runtime\.adapter\.nn\.split_allgather\(',
+            )
+            assert len(_gencode_contains(
+                tmp_path, SharedOutputBoundaryModule, rank,
+                r'(add_\d+) = torch\.Tensor\.detach\(add_\d+\)\n(?:[^\n]*\n){0,2}?'
+                r'\s*add_\d+ = nnscaler\.runtime\.adapter\.all_gather\(\1, dim=0, ranks=\[2, 3\]\)',
+            )) == 1
 
 
 class SharedInputSegmentModule(torch.nn.Module):
@@ -864,3 +1299,406 @@ def test_complex_shared_dict_input_with_intermediate(tmp_path):
     #     sum_1_32 = torch.sum(add_4_43)
     #     del add_4_43
     #     return sum_1_32
+
+
+class SharedDictGetInputModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w3 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, data: dict):
+        # `dict.get` with a default on a dataloader-derived dict,
+        # consumed only in the last stage
+        scale = data['meta'].get('scale', 2.0)
+        x0 = data['data'] + self.w0
+        x1 = x0 + self.w1
+
+        x2 = x1 + self.w2
+        x3 = x2 + self.w3
+
+        loss = torch.sum(x3 * scale)
+        return loss
+
+
+@replace_all_device_with('cpu')
+def test_shared_dict_get_input(tmp_path):
+    m = SharedDictGetInputModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2.0}}},
+        pas_policy=_shared_output_partition_policy,
+        compute_config= ComputeConfig(
+            2, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # rank1 recomputes the whole lookup chain `data['meta'].get('scale', 2.0)`
+    # from its local dataloader, including the dict.get default
+    assert _gencode_contains(
+        tmp_path, SharedDictGetInputModule, 1, r"_operator.getitem\(data_\d+, 'meta'\)"
+    )
+    assert _gencode_contains(
+        tmp_path, SharedDictGetInputModule, 1, r"builtins.dict.get\(getitem_\d+, 'scale', 2.0\)"
+    )
+    # rank0 no longer computes the lookups that only the last stage needs
+    assert not _gencode_contains(
+        tmp_path, SharedDictGetInputModule, 0, r"_operator.getitem\(data_\d+, 'meta'\)"
+    )
+    assert not _gencode_contains(
+        tmp_path, SharedDictGetInputModule, 0, r"builtins.dict.get"
+    )
+    # the lookup result is NOT transmitted between stages via any adapter
+    for rank in (0, 1):
+        assert not _gencode_contains(
+            tmp_path, SharedDictGetInputModule, rank, r'nnscaler.runtime.adapter.move_object'
+        )
+
+
+class LookupAsOutputModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w3 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, data: dict):
+        x0 = data['data'] + self.w0
+        x1 = x0 + self.w1
+
+        x2 = x1 + self.w2
+        x3 = x2 + self.w3
+
+        # dataloader lookups returned directly, without any op consuming them
+        return torch.sum(x3), data['id'], data.get('tag', 0)
+
+
+@replace_all_device_with('cpu')
+def test_lookup_as_graph_output(tmp_path):
+    m = LookupAsOutputModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'id': 5, 'tag': 1}},
+        pas_policy=_shared_output_partition_policy,
+        compute_config= ComputeConfig(
+            2, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # the lookups have no consumer, so they must not be removed as dead ops:
+    # every name returned by the step functions must be assigned in each rank's code
+    for rank in (0, 1):
+        returns = _gencode_contains(tmp_path, LookupAsOutputModule, rank, r'^    return \[(.*?)\]', flags=re.M)
+        assert returns
+        for ret in returns:
+            for name in (n.strip() for n in ret.split(',')):
+                assert _gencode_contains(
+                    tmp_path, LookupAsOutputModule, rank, rf'^\s*(?:\w+, )*{name}(?:, \w+)* = ', flags=re.M
+                ), f'rank {rank}: returned {name} is never assigned'
+    # the lookups follow the previous op's stage (the last one), and are kept there
+    assert _gencode_contains(tmp_path, LookupAsOutputModule, 1, r"_operator.getitem\(data_\d+, 'id'\)")
+    assert _gencode_contains(tmp_path, LookupAsOutputModule, 1, r"builtins.dict.get\(data_\d+, 'tag', 0\)")
+
+
+class TensorDefaultLookupModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w3 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, data: dict):
+        # a stage-0 tensor becomes the default of a lookup in the last stage;
+        # the lookup op mixes IR inputs with plain python values ('scale')
+        default = torch.sum(self.w0)
+        x0 = data['data'] + self.w0
+        x1 = x0 + self.w1
+
+        x2 = x1 + self.w2
+        x3 = x2 + self.w3
+
+        scale = data['meta'].get('scale', default)
+        return torch.sum(x3 * scale)
+
+
+@replace_all_device_with('cpu')
+def test_lookup_with_cross_stage_tensor_input(tmp_path):
+    m = TensorDefaultLookupModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2.0}}},
+        pas_policy=_shared_output_partition_policy,
+        compute_config= ComputeConfig(
+            2, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # the tensor default is received from stage 0, the dict lookup itself is local
+    assert _gencode_contains(
+        tmp_path, TensorDefaultLookupModule, 1, r"builtins.dict.get\(getitem_[\d_]+, 'scale', sum_[\d_]+\)"
+    )
+    assert _gencode_contains(tmp_path, TensorDefaultLookupModule, 1, r"_operator.getitem\(data_\d+, 'meta'\)")
+    assert not _gencode_contains(tmp_path, TensorDefaultLookupModule, 0, r"builtins.dict.get")
+
+
+class NonSinkableDefaultLookupModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w3 = torch.nn.Parameter(torch.randn(4, 4))
+        self.register_buffer('default_scale', torch.tensor(3.0))
+
+    def forward(self, data: dict):
+        # lookups whose defaults are not dataloader-derived: a registered buffer,
+        # and a computed tensor nested inside a container default
+        scale = data['meta'].get('scale', self.default_scale)
+        meta = data.get('meta', {'bias': torch.sum(self.w0)})
+        x0 = data['data'] + self.w0
+        x1 = x0 + self.w1
+
+        x2 = x1 + self.w2
+        x3 = x2 + self.w3
+
+        return torch.sum(x3 * scale * meta['bias'])
+
+
+@replace_all_device_with('cpu')
+def test_lookup_with_non_sinkable_default(tmp_path):
+    m = NonSinkableDefaultLookupModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2.0, 'bias': 1.0}}},
+        pas_policy=_shared_output_partition_policy,
+        compute_config= ComputeConfig(
+            2, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # neither lookup can be recomputed in the consumer stage: both stay in stage 0
+    # and only their results are forwarded
+    assert _gencode_contains(
+        tmp_path, NonSinkableDefaultLookupModule, 0, r"builtins.dict.get\(getitem_[\d_]+, 'scale', self.default_scale_\d+\)"
+    )
+    assert _gencode_contains(
+        tmp_path, NonSinkableDefaultLookupModule, 0, r"builtins.dict.get\(data_\d+, 'meta', \{'bias': sum_[\d_]+\}\)"
+    )
+    assert not _gencode_contains(tmp_path, NonSinkableDefaultLookupModule, 1, r"builtins.dict.get")
+    assert len(_gencode_contains(
+        tmp_path, NonSinkableDefaultLookupModule, 1, r"nnscaler.runtime.adapter.move_object\(\(\), src=0, dst=1\)"
+    )) == 2
+
+
+class StageLeadingLookupModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, data: dict):
+        a = data['a']                   # stage 0, consumed in stage 1
+        x0 = data['data'] + self.w0     # stage 0
+        b = data.get('b', 1)            # first op of stage 1, consumed only in stage 2
+        x1 = (x0 + self.w1) * a         # stage 1
+        x2 = (x1 + self.w2) * b         # stage 2
+        return torch.sum(x2)
+
+
+def _stage_leading_lookup_policy(graph, cfg):
+    from nnscaler.policies import OpPlan, get_pas_ops
+
+    for node in get_pas_ops(graph):
+        stage_id = -1
+        if node.signature == 'builtins.dict.get':
+            stage_id = 1
+        elif node.fn == torch.add and node.input(1).is_param():
+            stage_id = {'w0': 0, 'w1': 1, 'w2': 2}[node.input(1).name]
+        yield OpPlan(node, stage_id=stage_id, partition=None)
+
+
+@replace_all_device_with('cpu')
+def test_lookup_leading_a_stage(tmp_path):
+    """
+    The lookup that opens stage 1 is sunk into stage 2 and removed from stage 1,
+    after which another lookup still has to be copied into stage 1.
+    """
+    m = StageLeadingLookupModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'a': 2, 'b': 3}},
+        pas_policy=_stage_leading_lookup_policy,
+        compute_config= ComputeConfig(
+            3, 3,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=3,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # stage 1 recomputes data['a'] locally, stage 2 recomputes data.get('b', 1) locally
+    assert _gencode_contains(tmp_path, StageLeadingLookupModule, 1, r"_operator.getitem\(data_\d+, 'a'\)")
+    assert not _gencode_contains(tmp_path, StageLeadingLookupModule, 1, r"builtins.dict.get")
+    assert _gencode_contains(tmp_path, StageLeadingLookupModule, 2, r"builtins.dict.get\(data_\d+, 'b', 1\)")
+    for rank in (0, 1, 2):
+        assert not _gencode_contains(tmp_path, StageLeadingLookupModule, rank, r'nnscaler.runtime.adapter.move_object')
+
+
+class SharedPrefixLookupModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w3 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, data: dict):
+        # two lookups sharing the `data['meta']` prefix, both consumed in the last stage
+        meta = data['meta']
+        scale = meta.get('scale', 1)
+        bias = meta.get('bias', 0)
+        x0 = data['data'] + self.w0
+        x1 = x0 + self.w1
+
+        x2 = x1 + self.w2
+        x3 = x2 + self.w3
+
+        # the prefix is also consumed directly by a lookup living in the last stage
+        tag = meta.get('tag', 1)
+        return torch.sum(x3 * scale * bias * tag)
+
+
+@replace_all_device_with('cpu')
+def test_shared_prefix_lookups(tmp_path):
+    m = SharedPrefixLookupModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2, 'bias': 1, 'tag': 3}}},
+        pas_policy=_shared_output_partition_policy,
+        compute_config= ComputeConfig(
+            2, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # the shared prefix is copied exactly once into stage 1, shared by the two sunk
+    # lookups and by the lookup that already lives there, and all three are
+    # emitted after it
+    assert len(_gencode_contains(tmp_path, SharedPrefixLookupModule, 1, r"_operator.getitem\(data_\d+, 'meta'\)")) == 1
+    for key, default in (('scale', 1), ('bias', 0), ('tag', 1)):
+        assert _gencode_contains(
+            tmp_path, SharedPrefixLookupModule, 1,
+            rf"(getitem_[\d_]+) = _operator.getitem\(data_\d+, 'meta'\)[\s\S]*?builtins.dict.get\(\1, '{key}', {default}\)"
+        ), f'{key} lookup is emitted before its producer'
+    for rank in (0, 1):
+        assert not _gencode_contains(tmp_path, SharedPrefixLookupModule, rank, r'nnscaler.runtime.adapter.move_object')
+
+
+def _lookup_pre_hook(module, meta, inputs, kwargs):
+    pass
+
+
+def _lookup_post_hook(module, meta, inputs, kwargs, output):
+    pass
+
+
+def _hooked_lookup_policy(graph, cfg):
+    from nnscaler.policies import OpPlan, get_pas_ops
+
+    for node in get_pas_ops(graph):
+        stage_id = -1
+        if node.fn == torch.add and node.input(1).is_param():
+            stage_id = {'w0': 0, 'w1': 0, 'w2': 1, 'w3': 1}[node.input(1).name]
+        if node.signature == 'builtins.dict.get':
+            yield OpPlan(node, stage_id=stage_id, partition=None, hook_meta={'name': 'scale'},
+                         pre_hook=_lookup_pre_hook, post_hook=_lookup_post_hook)
+        else:
+            yield OpPlan(node, stage_id=stage_id, partition=None)
+
+
+@replace_all_device_with('cpu')
+def test_hooked_lookup_stays_in_its_stage(tmp_path):
+    m = SharedDictGetInputModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2.0}}},
+        pas_policy=_hooked_lookup_policy,
+        compute_config= ComputeConfig(
+            2, 2,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # the hooked lookup is not recomputed in stage 1: it runs once in stage 0,
+    # wrapped by its hooks, and only its result is forwarded
+    assert _gencode_contains(
+        tmp_path, SharedDictGetInputModule, 0,
+        r"_lookup_pre_hook\(self, \{'name': 'scale'\}, \(getitem_[\d_]+, 'scale', 2.0\), dict\(\)\)[\s\S]*?"
+        r"get_[\d_]+ = builtins.dict.get\(getitem_[\d_]+, 'scale', 2.0\)[\s\S]*?"
+        r"_lookup_post_hook\(self, \{'name': 'scale'\}, \(getitem_[\d_]+, 'scale', 2.0\), dict\(\), get_[\d_]+\)"
+    )
+    assert not _gencode_contains(tmp_path, SharedDictGetInputModule, 1, r"builtins.dict.get")
+    assert _gencode_contains(tmp_path, SharedDictGetInputModule, 1, r"nnscaler.runtime.adapter.move_object\(\(\), src=0, dst=1\)")

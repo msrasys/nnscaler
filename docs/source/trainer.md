@@ -821,7 +821,12 @@ Its **Important boundaries** section explains explicit-device overrides, device
 changes to supplied model instances during tracing, and bare legacy FILE classes.
 Models with only selected parallel submodules are also covered there.
 
-1.  When the parallel plan is changed (i.e you re-trace the model with
+1.  If only generated parameter/buffer names change after re-tracing, sharded
+    and deduped loading automatically aligns names using checkpoint metadata.
+    Original model names, module prefixes, shard layouts and optimizer
+    parameter order/layout must remain unchanged. Incompatible or ambiguous
+    mappings raise an error. Merged checkpoints are unaffected.
+    When the parallel plan is changed (i.e you re-trace the model with
     different configurations), the checkpoints become incompatible, and
     can't be loaded any more. You must firstly merge the checkpoints to
     a merged checkpoint with `Trainer.merge_checkpoint` and then load
@@ -1531,10 +1536,16 @@ of `ComputeConfig` as a dictionary.
     - `pipeline_nmicros`: the number of microbatches in the pipeline.
       Required.
     - `pipeline_scheduler`: the scheduler name. Training schedulers are
-      `1f1b`, `1f1b_plus`, `1f1b_interleaved`, `gpipe`, and `chimera_direct`
-      (four logical stages only); inference uses `infer_pipe`. Default is
-      `1f1b`. `1f1b_interleaved` requires the microbatch count to be a
-      multiple of `pipeline_size`.
+      `1f1b`, `1f1b_plus`, `1f1b_interleaved`, `gpipe`, `chimera_direct`
+      (four logical stages only), and `zero_bubble`; inference uses
+      `infer_pipe`. Default is `1f1b`. `1f1b_interleaved` requires the
+      microbatch count to be a multiple of `pipeline_size`. `zero_bubble`
+      splits each backward into input- and weight-backward actions and fills
+      pipeline bubbles with the weight part (see [F/B/W Split
+      Backward](./fbw.md)); it requires stages to be assigned round-robin
+      over the pipeline groups and the microbatch count to be a multiple of
+      `max(1, pipeline_nmicros // pipeline_size)`. It is not supported with
+      `use_zero=3`.
 
     For example, `plan_ngpus=8`, `pipeline_nstages=4`, and `pipeline_size=2`
     create two groups of four GPUs. Stages 0 and 2 use GPUs `[0, 1, 2, 3]`,

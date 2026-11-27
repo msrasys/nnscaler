@@ -316,7 +316,9 @@ def test_moe_whole(tmp_path):
 @replace_all_device_with('cpu')
 def test_moe_breakdown(tmp_path):
     from nnscaler.graph.parser.register import CustomizedOps
-    CustomizedOps.kOpMap.pop('tests.parallel_module.test_gencode_ep.moe_forward', None)
+    signature = 'tests.parallel_module.test_gencode_ep.moe_forward'
+    CustomizedOps.kOpMap.pop(signature, None)
+    CustomizedOps.kOpRuntime.pop(signature, None)
 
     ep = MoE(embed_dim=32, moe_ffn_dim=64, num_experts=8, top_k=2)
     h = torch.randn(16, 32)

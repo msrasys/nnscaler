@@ -31,7 +31,7 @@ def test_rvgather_uses_input_devices_as_sources():
     assert prim.kwargs['dst'] == 0
 
 
-@pytest.mark.parametrize('explicit_ranks', [None, (1, 2)])
+@pytest.mark.parametrize('explicit_ranks', [None, (1, 2), [1, 2]])
 def test_gather_and_chunk_preserve_layout_order(explicit_ranks):
     full = IRFullTensor((16,))
     shards = [
@@ -43,7 +43,7 @@ def test_gather_and_chunk_preserve_layout_order(explicit_ranks):
     for prim in (AllGatherPrim(shards, replicas, 0, **kwargs),
                  ReduceScatterPrim(replicas, shards, 0, **kwargs),
                  ChunkPrim(replicas, shards, 0, **kwargs)):
-        assert prim.kwargs['ranks'] == (explicit_ranks or (2, 1))
+        assert prim.kwargs['ranks'] == list(explicit_ranks or (2, 1))
 
 
 def test_all_to_all_preserves_layout_order():
@@ -52,7 +52,7 @@ def test_all_to_all_preserves_layout_order():
               for i, rank in enumerate((2, 1))]
     outputs = [_set_device(full.select(((0, 8), (i * 4, (i + 1) * 4)), (0, 1)), rank)
                for i, rank in enumerate((2, 1))]
-    assert AllToAllPrim(inputs, outputs, 0, 1).kwargs['ranks'] == (2, 1)
+    assert AllToAllPrim(inputs, outputs, 0, 1).kwargs['ranks'] == [2, 1]
 
 
 @pytest.mark.parametrize('primitive', [primitives.AllToAllPrim, primitives.AllToAllAllToAllPrim])
@@ -66,7 +66,7 @@ def test_all_to_all_keeps_independent_layouts_through_dispatch_and_scaling(primi
     outputs = [_set_device(full.select(((0, 8), (i * 2, (i + 1) * 2)), (0, 1)), rank)
                for i, rank in enumerate((1, 3, 0, 2))]
     prim = primitive(inputs, outputs, 0, 1, **({'ranks': (2, 0, 3, 1)} if explicit_ranks else {}))
-    assert prim.kwargs['ranks'] == (2, 0, 3, 1)
+    assert prim.kwargs['ranks'] == [2, 0, 3, 1]
     assert prim.kwargs['dsts'] == (1, 3, 0, 2)
     for rank in range(4):
         assert prim.dispatch(rank).kwargs == prim.kwargs
@@ -78,7 +78,7 @@ def test_all_to_all_keeps_independent_layouts_through_dispatch_and_scaling(primi
     generator.runtime_ndevs = 8
     generator.enable_dp = True
     scaled = generator.scale(adapter, 4).prims[0]
-    assert tuple(scaled.kwargs['ranks']) == (6, 4, 7, 5)
+    assert scaled.kwargs['ranks'] == [6, 4, 7, 5]
     assert tuple(scaled.kwargs['dsts']) == (5, 7, 4, 6)
 
 
@@ -96,7 +96,7 @@ def test_one_sided_shard_order_does_not_follow_replica_order(primitive):
         prim = primitive(shards, replicas, 0)
     else:
         prim = primitive(replicas, shards, 0)
-    assert prim.kwargs['ranks'] == (2, 0, 3, 1)
+    assert prim.kwargs['ranks'] == [2, 0, 3, 1]
 
 
 @pytest.mark.parametrize('dim', [0, 1])
@@ -114,7 +114,7 @@ def test_split_allgather_volume_matches_backward_allgather(dim, ranks):
     fused = primitives.SplitAllGatherPrim(replicas, shards, dim)
     assert fused.volume() == backward.volume()
     if ranks is not None:
-        assert fused.kwargs['ranks'] == ranks
+        assert fused.kwargs['ranks'] == list(ranks)
         for rank in ranks:
             # Dispatch retains one input/output but still communicates with the whole group.
             assert fused.dispatch(rank).volume() == backward.volume()
@@ -149,10 +149,10 @@ def test_split_allgather_fusion_preserves_backward_volume():
         assert DiffFusion.nnfuse(local)
         fused = local.prims[0]
         assert fused.signature == 'nnscaler.runtime.adapter.nn.split_allgather'
-        assert fused.kwargs['ranks'] == ranks
+        assert fused.kwargs['ranks'] == list(ranks)
         assert fused.volume() == expected
         scaled = generator.scale(local, rank + 4).prims[0]
-        assert tuple(scaled.kwargs['ranks']) == tuple(r + 4 for r in ranks)
+        assert scaled.kwargs['ranks'] == [r + 4 for r in ranks]
         assert scaled.volume() == expected
 
 
@@ -166,6 +166,7 @@ def test_value_collective_layout_metadata_matches_runtime(primitive, runtime):
     parts = [_set_device(full.select(((0, 12),), (index, 3)), rank)
              for index, rank in enumerate((3, 1, 2))]
     prim = primitive([root], parts) if primitive is primitives.RVScatterPrim else primitive(parts, [root])
+    assert prim.kwargs['ranks'] == ([0, 3, 1, 2] if primitive is primitives.RVScatterPrim else [3, 1, 2, 0])
     for rank in range(4):
         local = prim.dispatch(rank)
         inspect.signature(runtime).bind(None, **local.kwargs)

@@ -247,8 +247,7 @@ class CollectivePrim(CommPrim):
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
         super().__init__(itensors, otensors, **kwargs)
-        if 'ranks' not in self.kwargs:
-            self.kwargs['ranks'] = self.device
+        self.kwargs['ranks'] = list(self.kwargs.get('ranks', self.device))
 
 
 class RDScatterPrim(CommPrim):

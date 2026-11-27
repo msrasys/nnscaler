@@ -12,6 +12,36 @@ An end2end module is a module which satisfies:
 
 The above restrictions are necessary for the pipeline parallelism to work. Of course, you can still use the parallel module without pipeline parallelism for end2end modules.
 
+## Communication group initialization
+
+Generated modules initialize their communication groups automatically through
+`CubeModule.init_groups(ranks)`, which delegates to `DeviceGroup().get_groups(ranks)`.
+Code generation collects singleton, collective, reducer, ZeRO, and P2P groups.
+At runtime, `get_groups` deduplicates groups, reuses WORLD for full-world
+membership, and batches groups with disjoint rank memberships.
+P2P and collective operations with the same members reuse the same process group.
+
+On PyTorch 2.11.0 and later, initialization uses one `torch.distributed.split_group`
+call per batch when WORLD uses NCCL, has a bound `device_id`, and its device
+backend reports `supports_splitting=True`. Otherwise,
+including older PyTorch versions or an externally initialized WORLD without a
+bound device, groups are created sequentially with `new_group`.
+PyTorch versions before 2.11.0, including 2.11.0 prereleases, use sequential
+creation to avoid NCCL split-color hash collisions fixed in
+[pytorch/pytorch#173687](https://github.com/pytorch/pytorch/pull/173687).
+All WORLD ranks must initialize the generated modules in the same order,
+including ranks outside a particular subgroup.
+
+For groups needed at runtime, `DeviceGroup().get_groups(ranks)` accepts a list of
+rank lists and automatically deduplicates and batches them using the same logic
+as generated modules. It returns groups in input order, preserving duplicate
+entries and returning `None` for WORLD. Existing groups are reused. All WORLD
+ranks must call it with the same memberships, including nonmembers.
+
+The existing `CubeModule.init_group(ranks)` API remains unchanged. Standalone P2P
+adapter calls use WORLD when their pair group has not been initialized.
+Regenerate previously compiled modules to use batched initialization.
+
 ## Weight initialization
 
 By default, nnScaler saves the original model's weights during compilation and
@@ -941,6 +971,28 @@ On the other hand, a lot of weights/state in the module and the optimizer will b
 
 We provide two functions to help you save/load the merged checkpoint for the parallel module,
 and two other functions to help you save/load the deduped state dicts for the parallel module.
+
+### `align_state_dict_names`
+
+Sharded and deduped loading automatically aligns generated parameter/buffer
+names if only these names change after re-tracing. No option is needed:
+
+```python
+nnscaler.load_sharded_state_dict(
+    model, state_dict['model'], optimizer, state_dict['optimizer'],
+)
+# For deduped checkpoints, use load_deduped_state_dict instead.
+```
+
+The underlying `nnscaler.align_state_dict_names(model, model_state_dict)`
+adapter can also be called directly. It matches original names and shard metadata, ignoring tensor IDs.
+It returns a shallow copy (tensors are not copied), updates parallel-module
+metadata, and leaves non-parallel-module keys unchanged. It also works when a
+deduped rank holds only metadata. Missing metadata, ambiguous matches, changed
+sharding, or changed optimizer parameter order/layout raise `ValueError`.
+Module prefixes and original model names must remain unchanged. This is not
+a resharding or optimizer-state migration API; use a merged checkpoint for
+parallel-plan changes.
 
 ### `merge_state_dicts`
 ```python

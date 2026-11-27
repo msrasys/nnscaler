@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Type, List, Callable, Union, TYPE_CHECKI
 import math
 import torch
 from torch.fx.proxy import Scope, ScopeContextManager
+from torch.overrides import is_tensor_method_or_property
 
 import nnscaler.graph.tracer as cct
 from . import pytree_utils, orig_func, operator_patcher
@@ -222,11 +223,19 @@ def create_wrapped_leaf_func(func: Callable, *, replace_func: Optional[Callable]
             if tracer is None:
                 return func(*args, **kwargs)
             else:
-                if replace_func is None:
-                    if is_method:
-                        return tracer.create_proxy('call_method', method_name, args, kwargs)
-                    else:
-                        return tracer.create_proxy('call_function', func, args, kwargs)
+                if is_method:
+                    # replace the method call with the replacement function
+                    if replace_func is not None and replace_traced_code:
+                        return tracer.create_proxy('call_function', replace_func, args, kwargs)
+                    return tracer.create_proxy(
+                        'call_method',
+                        replace_func if replace_func is not None else method_name,
+                        args,
+                        kwargs,
+                        node_target=method_name if replace_func is not None else None,
+                    )
+                elif replace_func is None:
+                    return tracer.create_proxy('call_function', func, args, kwargs)
                 else:
                     return tracer.create_proxy(
                         'call_function', replace_func, args, kwargs,
@@ -368,12 +377,15 @@ def create_wrapped_module_call(tracer: 'ConcreteTracer'):
             module_qualified_name = tracer.get_path_of_module(mod)
             with ScopeContextManager(tracer.scope, Scope(module_qualified_name, type(mod))) as _scope:
                 tracer.module_stack[_scope.module_path] = _scope.module_type
+                tracer.module_call_count += 1
+                tracer.module_call_stack[_scope.module_path] = tracer.module_call_count
                 if not tracer.is_leaf_module(mod, module_qualified_name):
                     autowrap_check(tracer, mod.__dict__)
                     ret_val = orig_func.torch_module_call(mod, *args, **kwargs)
                 else:
                     ret_val = tracer.create_proxy('call_module', module_qualified_name, args, kwargs)
                 key, _ = tracer.module_stack.popitem(last=True)
+                tracer.module_call_stack.pop(key)
                 assert key == _scope.module_path, f" Unexpected key {key}"
             return ret_val
     return module_call_wrapper
@@ -392,6 +404,8 @@ def create_wrapped_nn_module_func(tracer: 'ConcreteTracer', mod: torch.nn.Module
             if _scope.module_path not in tracer.module_stack:
                 need_pop = True
                 tracer.module_stack[_scope.module_path] = _scope.module_type
+                tracer.module_call_count += 1
+                tracer.module_call_stack[_scope.module_path] = tracer.module_call_count
             elif _scope.module_path != list(tracer.module_stack)[-1]:
                 raise RuntimeError(f'Scope not match: {_scope.module_path} vs {list(tracer.module_stack)[-1]}')
             # has tracer means in tracing progress
@@ -405,6 +419,7 @@ def create_wrapped_nn_module_func(tracer: 'ConcreteTracer', mod: torch.nn.Module
                 result = orig_fn(*args, **kwargs)
             if need_pop:
                 key, _ = tracer.module_stack.popitem(last=True)
+                tracer.module_call_stack.pop(key)
                 assert key == _scope.module_path, f" Unexpected key {key}"
         return result
 
@@ -422,6 +437,15 @@ def is_autograd_op(func) -> bool:
     except TypeError:
         # if func is not a class, then it is not an autograd function
         return False
+
+
+def is_default_leaf_function(func: Callable) -> bool:
+    """Whether concrete tracing already treats a callable as a leaf."""
+    return (
+        func in default_autowrap_leaf_function
+        or is_autograd_apply(func)
+        or is_tensor_method_or_property(func)
+    )
 
 
 def create_wrapped_autograd_apply(default_tracer: 'ConcreteTracer'):

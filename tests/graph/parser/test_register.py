@@ -2,13 +2,17 @@
 #  Licensed under the MIT License.
 
 import nnscaler
-from nnscaler.graph.parser.converter import convert_model
-from nnscaler.profiler.database import get_func
+from nnscaler.graph.parser.converter import convert_model, to_fx_graph, to_ir_graph
+from nnscaler.profiler.database import get_func, profile
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.graph.function.dimops import DimopSplit, TransformRule
-from nnscaler.graph.parser.register import CustomizedOps
+from nnscaler.graph.parser.mapping import SignFx2Op
+from nnscaler.graph.parser.register import CustomizedOps, _get_torch_op_aliases
+from nnscaler.utils import get_full_qualified_name, load_type
 import tempfile
 import torch
+import torch.nn.functional as F
+import pytest
 
 from ...utils import replace_all_device_with
 
@@ -38,7 +42,23 @@ class MockAGF(torch.autograd.Function):
     def backward(ctx, grad):
         return grad, grad
 
-nnscaler.register_op('*, * -> *')(MockAGF.apply)
+nnscaler.register_op('*, * -> *')(MockAGF)
+
+
+class UnregisteredAGF(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad
+
+
+def test_autograd_class_registration_uses_apply_name():
+    runtime_fn = CustomizedOps.kOpRuntime[get_full_qualified_name(MockAGF)]
+    assert runtime_fn.__self__ is MockAGF
+    assert runtime_fn.__name__ == 'apply'
 
 
 class MockModel(torch.nn.Module):
@@ -309,3 +329,561 @@ def test_register_fake_fn():
         for node, p_name in zip(ir_graph.nodes(), ['linear', 'linear', 'add_xy']):
             profile_name = get_func(node)[0].__qualname__
             assert profile_name == p_name, f'{profile_name} should be {p_name}'
+
+
+class BuiltinFunctionFakeFnModel(torch.nn.Module):
+    def forward(self, x, y):
+        return torch.add(x, y)
+
+
+class BuiltinDescriptorFakeFnModel(torch.nn.Module):
+    def forward(self, x, y):
+        return torch.Tensor.add(x, y)
+
+
+class TensorWithOverriddenAdd(torch.Tensor):
+    def add(self, other):
+        raise AssertionError("The overridden method should be replaced by the fake")
+
+
+class BuiltinMethodFakeFnModel(torch.nn.Module):
+    def forward(self, x, y):
+        return x.add(y)
+
+
+class BuiltinInplaceMethodFakeFnModel(torch.nn.Module):
+    def forward(self, x, y):
+        return x.add_(y)
+
+
+class BuiltinBatchNormModel(torch.nn.Module):
+    def forward(self, x, weight, bias, running_mean, running_var):
+        return torch.batch_norm(
+            x,
+            weight,
+            bias,
+            running_mean,
+            running_var,
+            False,
+            0.1,
+            1e-5,
+            False,
+        )
+
+
+class BuiltinLinearModel(torch.nn.Module):
+    def forward(self, x, weight):
+        return F.linear(x, weight)
+
+
+def _remove_updated_op(signature):
+    if not isinstance(signature, str):
+        signature = get_full_qualified_name(signature)
+    aliases = _get_torch_op_aliases(load_type(signature)) if signature.startswith('torch.') else (signature,)
+    for alias in aliases:
+        for registry in (
+            CustomizedOps.kOpMap,
+            CustomizedOps.kOpRuntime,
+            CustomizedOps.kOpFakeRuntime,
+            CustomizedOps.kOpCodeDef,
+            CustomizedOps.kOpEmit,
+            CustomizedOps.kOpInputGen,
+        ):
+            registry.pop(alias, None)
+
+
+@pytest.mark.parametrize(
+    ('runtime_fn', 'expected'),
+    [
+        (
+            torch.add,
+            {
+                'torch.add',
+                'torch.Tensor.add',
+            },
+        ),
+        (
+            torch.Tensor.add_,
+            {
+                'torch.Tensor.add_',
+            },
+        ),
+        (
+            F.linear,
+            {'torch.nn.functional.linear', 'torch._C._nn.linear'},
+        ),
+        (
+            torch.relu,
+            {
+                'torch.relu',
+                'torch.Tensor.relu',
+            },
+        ),
+    ],
+)
+def test_get_torch_op_aliases_from_runtime(runtime_fn, expected):
+    aliases = _get_torch_op_aliases(runtime_fn)
+    assert expected.issubset(aliases)
+    assert len(aliases) == len(set(aliases))
+    for alias in aliases:
+        assert callable(load_type(alias))
+
+
+@pytest.mark.parametrize('runtime_fn', [torch.add, torch.abs])
+def test_get_torch_op_aliases_is_symmetric(runtime_fn):
+    expected = set(_get_torch_op_aliases(runtime_fn))
+    assert f'torch.Tensor.{runtime_fn.__name__}' in expected
+    assert f'torch.Tensor.{runtime_fn.__name__}_' not in expected
+    assert not any(alias.startswith('_operator.') for alias in expected)
+    assert not any(
+        alias.rsplit('.', 1)[-1].startswith('__') and alias.endswith('__')
+        for alias in expected
+    )
+    assert set(_get_torch_op_aliases(getattr(torch.Tensor, runtime_fn.__name__))) == expected
+
+
+@pytest.mark.parametrize('runtime_fn', [
+    torch.Tensor.__add__,
+    torch.Tensor.__pow__,
+    torch.Tensor.dtype.__get__,
+])
+def test_tensor_dunder_update_is_rejected(runtime_fn):
+    runtimes = dict(CustomizedOps.kOpRuntime)
+    fakes = dict(CustomizedOps.kOpFakeRuntime)
+    with pytest.raises(ValueError, match='[Dd]under'):
+        nnscaler.update_op(runtime_fn, fake_fn=lambda x, y: x)
+    assert CustomizedOps.kOpRuntime == runtimes
+    assert CustomizedOps.kOpFakeRuntime == fakes
+
+@pytest.mark.parametrize(
+    ('public_fn', 'internal_signature'),
+    [
+        (torch.linalg.norm, 'torch._C._linalg.linalg_norm'),
+        (torch.fft.fft, 'torch._C._fft.fft_fft'),
+        (torch.special.gammaln, 'torch._C._special.special_gammaln'),
+    ],
+)
+def test_get_torch_op_aliases_is_symmetric_with_internal_alias(public_fn, internal_signature):
+    aliases = _get_torch_op_aliases(public_fn)
+    assert aliases[0] == get_full_qualified_name(public_fn)
+    expected = set(aliases)
+
+    assert internal_signature in expected
+    assert set(_get_torch_op_aliases(load_type(internal_signature))) == expected
+
+
+def test_get_torch_op_aliases_does_not_match_functional_by_name():
+    assert _get_torch_op_aliases(F.batch_norm) == ('torch.nn.functional.batch_norm',)
+    assert 'torch.nn.functional.relu' not in _get_torch_op_aliases(torch.relu)
+
+
+@replace_all_device_with('cpu')
+def test_functional_fake_fn_does_not_override_same_name_torch_op():
+    calls = []
+
+    def fake_batch_norm(
+        input,
+        running_mean,
+        running_var,
+        weight=None,
+        bias=None,
+        training=False,
+        momentum=0.1,
+        eps=1e-5,
+    ):
+        calls.append(input)
+        return input
+
+    nnscaler.update_op(F.batch_norm, fake_fn=fake_batch_norm)
+    try:
+        traced = to_fx_graph(
+            BuiltinBatchNormModel(),
+            {
+                'x': torch.randn(2, 3, 4, 4),
+                'weight': torch.ones(3),
+                'bias': torch.zeros(3),
+                'running_mean': torch.zeros(3),
+                'running_var': torch.ones(3),
+            },
+        )
+    finally:
+        _remove_updated_op(F.batch_norm)
+
+    assert not calls
+    node = next(node for node in traced.graph.nodes if node.op == 'call_function')
+    assert node.target is torch.batch_norm
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_functional_alias_uses_fake_fn():
+    calls = []
+
+    def fake_linear(x, weight):
+        calls.append((x, weight))
+        return x
+
+    nnscaler.update_op(F.linear, fake_fn=fake_linear)
+    try:
+        traced = to_fx_graph(
+            BuiltinLinearModel(),
+            {
+                'x': torch.randn(2, 3),
+                'weight': torch.randn(3, 3),
+            },
+        )
+    finally:
+        _remove_updated_op('torch.nn.functional.linear')
+
+    assert len(calls) == 1
+    node = next(node for node in traced.graph.nodes if node.op == 'call_function')
+    assert node.target is F.linear
+
+
+def test_get_torch_op_aliases_scans_runtime_namespaces(monkeypatch):
+    monkeypatch.setattr(torch, 'nnscaler_test_add_alias', torch.add, raising=False)
+    assert 'torch.nnscaler_test_add_alias' in _get_torch_op_aliases(torch.add)
+
+
+def test_update_custom_op_does_not_expand_torch_aliases(monkeypatch):
+    def unexpected_alias_lookup(runtime_fn):
+        raise AssertionError("Custom operators must not use Torch alias discovery")
+
+    monkeypatch.setitem(nnscaler.update_op.__globals__, '_get_torch_op_aliases', unexpected_alias_lookup)
+    for runtime_fn in (mock_add, MockAGF, MockAGF.apply):
+        assert nnscaler.update_op(runtime_fn) is runtime_fn
+        assert get_full_qualified_name(runtime_fn) in CustomizedOps.kOpRuntime
+
+
+def test_trace_rejects_stale_registered_location(monkeypatch):
+    signature = f'{__name__}.mock_add'
+    monkeypatch.setattr(__name__ + '.mock_add', torch.add)
+
+    with pytest.raises(RuntimeError, match=f'Registered operator {signature} no longer resolves'):
+        to_fx_graph(
+            BuiltinFunctionFakeFnModel(),
+            {'x': torch.randn(2, 3), 'y': torch.randn(2, 3)},
+        )
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_function_fake_fn():
+    calls = []
+
+    def fake_add(x, y):
+        calls.append((x, y))
+        return x
+
+    nnscaler.update_op(torch.add, fake_fn=fake_add)
+    try:
+        assert 'torch.add' not in CustomizedOps.kOpMap
+        assert 'torch.add' not in CustomizedOps.kOpCodeDef
+        assert CustomizedOps.kOpRuntime['torch.add'] is torch.add
+        assert CustomizedOps.kOpFakeRuntime['torch.add'] is fake_add
+        traced = to_fx_graph(
+            BuiltinFunctionFakeFnModel(),
+            {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)},
+        )
+    finally:
+        _remove_updated_op('torch.add')
+
+    node = next(node for node in traced.graph.nodes if node.op == 'call_function')
+    assert len(calls) == 1
+    assert node.target is torch.add
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_descriptor_fake_fn():
+    calls = []
+
+    def fake_add(x, y):
+        calls.append((x, y))
+        return x
+
+    nnscaler.update_op(torch.Tensor.add, fake_fn=fake_add)
+    try:
+        traced = to_fx_graph(
+            BuiltinDescriptorFakeFnModel(),
+            {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)},
+        )
+    finally:
+        _remove_updated_op('torch.Tensor.add')
+
+    node = next(node for node in traced.graph.nodes if node.op == 'call_method')
+    assert len(calls) == 1
+    assert node.target == 'add'
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_descriptor_passes_fake_to_overridden_method():
+    calls = []
+
+    def fake_add(x, y):
+        calls.append((x, y))
+        return x
+
+    nnscaler.update_op(torch.Tensor.add, fake_fn=fake_add)
+    try:
+        traced = to_fx_graph(
+            BuiltinDescriptorFakeFnModel(),
+            {
+                'x': torch.rand(10, 10).as_subclass(TensorWithOverriddenAdd),
+                'y': torch.rand(10, 10),
+            },
+        )
+    finally:
+        _remove_updated_op('torch.Tensor.add')
+
+    node = next(node for node in traced.graph.nodes if node.op == 'call_method')
+    assert len(calls) == 1
+    assert node.target == 'add'
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_method_fake_fn():
+    calls = []
+
+    def fake_add(x, y):
+        calls.append((x, y))
+        return x
+
+    nnscaler.update_op(torch.Tensor.add, fake_fn=fake_add)
+    try:
+        traced = to_fx_graph(
+            BuiltinMethodFakeFnModel(),
+            {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)},
+        )
+    finally:
+        _remove_updated_op('torch.Tensor.add')
+
+    node = next(node for node in traced.graph.nodes if node.op == 'call_method')
+    assert len(calls) == 1
+    assert node.target == 'add'
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_inplace_method_fake_fn():
+    calls = []
+
+    def fake_add_(x, y):
+        calls.append((x, y))
+        return x
+
+    nnscaler.update_op(torch.Tensor.add_, fake_fn=fake_add_)
+    try:
+        dummy_input = {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)}
+        original_x = dummy_input['x'].clone()
+        traced = to_fx_graph(BuiltinInplaceMethodFakeFnModel(), dummy_input)
+        with tempfile.TemporaryDirectory() as tempdir:
+            ir_graph = to_ir_graph(traced, dummy_input, tempdir, constant_folding=False)
+    finally:
+        _remove_updated_op('torch.Tensor.add_')
+
+    node = next(node for node in traced.graph.nodes if node.op == 'call_method')
+    assert len(calls) == 1
+    assert torch.equal(dummy_input['x'], original_x)
+    assert node.target == 'add_'
+    assert ir_graph.nodes()[-1].signature == 'torch.Tensor.add_'
+
+
+def test_update_op_preserves_existing_fields():
+    def fake_add(x, y):
+        return x
+
+    def emit_add(*args, **kwargs):
+        return 'updated_add'
+
+    def generate_inputs(node):
+        return []
+
+    def create_add(*args, signature=None, **kwargs):
+        return None
+
+    nnscaler.update_op(torch.add, fake_fn=fake_add)
+    nnscaler.update_op(
+        torch.add,
+        op_create_fn=create_add,
+        code='def updated_add(): pass',
+        emit_fn=emit_add,
+        input_gen_fn=generate_inputs,
+    )
+    try:
+        aliases = _get_torch_op_aliases(torch.add)
+        for alias in aliases:
+            assert CustomizedOps.kOpMap[alias] is create_add
+            assert callable(CustomizedOps.kOpRuntime[alias])
+            assert CustomizedOps.kOpFakeRuntime[alias] is fake_add
+            assert CustomizedOps.kOpCodeDef[alias] == 'def updated_add(): pass'
+            assert CustomizedOps.kOpEmit[alias] is emit_add
+            assert CustomizedOps.kOpInputGen[alias] is generate_inputs
+        assert CustomizedOps.kOpMap['torch.add'] is create_add
+        assert CustomizedOps.kOpRuntime['torch.add'] is torch.add
+        assert CustomizedOps.kOpFakeRuntime['torch.add'] is fake_add
+        assert CustomizedOps.kOpCodeDef['torch.add'] == 'def updated_add(): pass'
+        assert CustomizedOps.kOpEmit['torch.add'] is emit_add
+        assert CustomizedOps.kOpInputGen['torch.add'] is generate_inputs
+        assert SignFx2Op.map('torch.add').func is create_add
+    finally:
+        _remove_updated_op('torch.add')
+
+
+def test_update_op_clears_optional_fields():
+    def fake_add(x, y):
+        return x
+
+    def emit_add(*args, **kwargs):
+        return 'updated_add'
+
+    def generate_inputs(node):
+        return []
+
+    def create_add(*args, signature=None, **kwargs):
+        return None
+
+    nnscaler.update_op(
+        torch.add,
+        op_create_fn=create_add,
+        code='def updated_add(): pass',
+        fake_fn=fake_add,
+        emit_fn=emit_add,
+        input_gen_fn=generate_inputs,
+    )
+    nnscaler.update_op(
+        torch.add,
+        op_create_fn=None,
+        code=None,
+        fake_fn=None,
+        emit_fn=None,
+        input_gen_fn=None,
+    )
+    try:
+        aliases = _get_torch_op_aliases(torch.add)
+        assert all(alias not in CustomizedOps.kOpMap for alias in aliases)
+        assert all(alias not in CustomizedOps.kOpCodeDef for alias in aliases)
+        assert all(alias not in CustomizedOps.kOpFakeRuntime for alias in aliases)
+        assert all(alias not in CustomizedOps.kOpEmit for alias in aliases)
+        assert all(alias not in CustomizedOps.kOpInputGen for alias in aliases)
+    finally:
+        _remove_updated_op('torch.add')
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_input_gen_fn_used_by_profiler():
+    class InputGenCalled(Exception):
+        pass
+
+    calls = []
+
+    def generate_inputs(node):
+        calls.append(node)
+        raise InputGenCalled
+
+    nnscaler.update_op(torch.add, input_gen_fn=generate_inputs)
+    try:
+        with tempfile.TemporaryDirectory() as tempdir:
+            ir_graph = convert_model(
+                BuiltinFunctionFakeFnModel(),
+                {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)},
+                tempdir,
+                False,
+            )
+        node = ir_graph.nodes()[0]
+        func, shapes, dtypes, requires_grads, values, kwargs = get_func(node)
+        with pytest.raises(InputGenCalled):
+            profile(node, func, shapes, dtypes, requires_grads, values, **kwargs)
+    finally:
+        _remove_updated_op('torch.add')
+
+    assert calls == [node]
+
+
+def test_update_customized_op_by_runtime_fn():
+    signature = 'tests.graph.parser.test_register.add_xy'
+    original_fake_fn = CustomizedOps.kOpFakeRuntime[signature]
+
+    def updated_fake_add(x, y):
+        return y
+
+    nnscaler.update_op(add_xy, fake_fn=updated_fake_add)
+    try:
+        assert CustomizedOps.kOpRuntime[signature] is add_xy
+        assert CustomizedOps.kOpFakeRuntime[signature] is updated_fake_add
+    finally:
+        CustomizedOps.kOpFakeRuntime[signature] = original_fake_fn
+
+
+def test_update_customized_op_cannot_remove_op_create_fn():
+    signature = get_full_qualified_name(add_xy)
+    original_op_create_fn = CustomizedOps.kOpMap[signature]
+
+    with pytest.raises(ValueError, match='has no existing tracer leaf or system op creator to fall back to'):
+        nnscaler.update_op(add_xy, op_create_fn=None)
+
+    assert CustomizedOps.kOpMap[signature] is original_op_create_fn
+
+
+def test_update_existing_leaf_can_remove_op_create_fn():
+    def create_batch_norm(*args, signature=None, **kwargs):
+        return None
+
+    signature = get_full_qualified_name(F.batch_norm)
+    nnscaler.update_op(F.batch_norm, op_create_fn=create_batch_norm)
+    try:
+        assert CustomizedOps.kOpMap[signature] is create_batch_norm
+        nnscaler.update_op(F.batch_norm, op_create_fn=None)
+        assert signature not in CustomizedOps.kOpMap
+    finally:
+        _remove_updated_op(F.batch_norm)
+
+
+@pytest.mark.parametrize('runtime_fn', [UnregisteredAGF, UnregisteredAGF.apply])
+def test_update_unregistered_autograd_leaf(runtime_fn):
+    def create_autograd_op(*args, signature=None, **kwargs):
+        return None
+
+    signature = get_full_qualified_name(UnregisteredAGF)
+    nnscaler.update_op(runtime_fn, op_create_fn=create_autograd_op)
+    try:
+        assert CustomizedOps.kOpMap[signature] is create_autograd_op
+        registered_runtime = CustomizedOps.kOpRuntime[signature]
+        assert registered_runtime.__self__ is UnregisteredAGF
+        assert registered_runtime.__name__ == 'apply'
+    finally:
+        _remove_updated_op(signature)
+
+
+@pytest.mark.parametrize('runtime_fn', [UnregisteredAGF, UnregisteredAGF.apply])
+def test_update_autograd_leaf_rejects_fake_fn(runtime_fn):
+    with pytest.raises(ValueError, match='Autograd function cannot have fake runtime function'):
+        nnscaler.update_op(runtime_fn, fake_fn=lambda x: x)
+
+
+def unregistered_op(x):
+    return x
+
+
+def test_update_non_leaf_unregistered_op_raises():
+    def create_unregistered_op(*args, signature=None, **kwargs):
+        return None
+
+    signature = get_full_qualified_name(unregistered_op)
+    with pytest.raises(KeyError, match='is neither an existing tracer leaf nor a registered operator'):
+        nnscaler.update_op(
+            unregistered_op,
+            op_create_fn=create_unregistered_op,
+            code='def unregistered_op(x): return x',
+        )
+
+    for registry in (
+        CustomizedOps.kOpMap,
+        CustomizedOps.kOpRuntime,
+        CustomizedOps.kOpFakeRuntime,
+        CustomizedOps.kOpCodeDef,
+        CustomizedOps.kOpEmit,
+        CustomizedOps.kOpInputGen,
+    ):
+        assert signature not in registry
+
+
+def test_update_unwrapped_torch_override_raises():
+    with pytest.raises(KeyError, match='is neither an existing tracer leaf nor a registered operator'):
+        nnscaler.update_op(torch.linalg.norm, fake_fn=lambda x: x)

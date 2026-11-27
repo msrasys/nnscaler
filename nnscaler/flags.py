@@ -107,7 +107,13 @@ class CompileFlag:
     # (call these FBW schedules).
     # this flag controls whether to use FBW schedules or FB schedules.
     # Default is False (FB schedules).
+    # This flag is not necessary when you explicitly use FBW-aware schedulers (e.g. zero_bubble).
+    # Not supported together with ZeRO-3.
     use_fbw = _to_bool('USE_FBW')
+
+    # free a pipeline stage output's storage once it has been sent, keeping the tensor
+    # as a backward root (same idea as Megatron's deallocate_pipeline_outputs)
+    pipeline_deallocate_outputs = _to_bool('PIPELINE_DEALLOCATE_OUTPUTS', True)
 
 
 class RuntimeFlag:

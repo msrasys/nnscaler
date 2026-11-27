@@ -14,7 +14,9 @@ from nnscaler.ir.cten import IRCell, IRTensor
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
-from nnscaler.ir.adapter.prim import CollectivePrim
+from nnscaler.ir.adapter.prim import (
+    CollectivePrim, MovePrim, ObjectMovePrim, RDScatterPrim, RDGatherPrim,
+)
 
 from nnscaler.graph.graph import IRSegment
 from nnscaler.graph.parser.register import CustomizedOps
@@ -140,6 +142,8 @@ class ModuleCodeGen(FuncEmission):
 
         # customized op code
         for op_impl in set(CustomizedOps.kOpCodeDef.values()):
+            if not op_impl:
+                continue
             # self.init_code.append('@torch.jit.script')
             self.init_code.append(op_impl)
             self.init_code += ['']
@@ -200,12 +204,13 @@ class ModuleCodeGen(FuncEmission):
             rest_params_replicated = []
             rest_params_partitioned = []
 
-            def collect_rest_params(segment):
+            def collect_rest_params(segment: IRSegment):
                 """Resursively collect parameters. Note parameters can be in sub-segments,
                 which is invisible to its top-level segment."""
                 for param in segment.attributes():
                     if not param.is_param(): continue
                     for ctensor in segment.ctensors(param):
+                        if ctensor.grad is None: continue  # consumer is in `torch.no_grad()` scope
                         if device not in ctensor.device: continue
                         if ctensor not in all_params:
                             # a same parameter can be consumed multiple times by different operators
@@ -279,7 +284,17 @@ class ModuleCodeGen(FuncEmission):
         for adapter in adapters:
             for prim in adapter.prims:
                 if isinstance(prim, CollectivePrim):
-                    ranks = np.array(tuple(sorted(prim.kwargs['ranks'])), dtype=int)
+                    groups = [prim.kwargs['ranks']]
+                elif isinstance(prim, (MovePrim, ObjectMovePrim)):
+                    groups = [[prim.kwargs['src'], prim.kwargs['dst']]]
+                elif isinstance(prim, RDScatterPrim):
+                    groups = [[prim.kwargs['src'], dst] for dst in prim.kwargs['dsts']]
+                elif isinstance(prim, RDGatherPrim):
+                    groups = [[src, prim.kwargs['dst']] for src in prim.kwargs['srcs']]
+                else:
+                    continue
+                for ranks in groups:
+                    ranks = np.array(tuple(sorted(ranks)), dtype=int)
                     for i in range(nreplica):
                         shifted_ranks = tuple(ranks + i * len(self.devices))
                         shifted_ranks = tuple(int(rank) for rank in shifted_ranks)
@@ -474,11 +489,14 @@ class ModuleCodeGen(FuncEmission):
         # and the current implementation is clearer and more robust.
         # key: parameter tensor, value: (segment index, node index)
         param_first_used_pos: Dict[IRFullTensor, Tuple[int, int]] = {}
+        param_num_segments: Dict[IRFullTensor, int] = {}
         for i, n in enumerate(sequence):
             if isinstance(n, IRSegment) and n.isfw():
                 for k, v in self._get_param_first_used_pos(n).items():
                     if k not in param_first_used_pos:
                         param_first_used_pos[k] = (i, v)
+                    # Repeated uses within one backward call share one AccumulateGrad hook.
+                    param_num_segments[k] = param_num_segments.get(k, 0) + 1
 
         attr_meta_map = {}
         # emit code
@@ -491,7 +509,7 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRAdapter):
                 codes = self.emit_adapter(node, prefix_attr='self.', async_op=CompileFlag.async_comm)
             elif isinstance(node, IRWeightReducer):
-                self.init_reducer(node, device, param_first_used_pos, as_parallel_module)
+                self.init_reducer(node, device, param_first_used_pos, param_num_segments, as_parallel_module)
                 codes = self.emit_reducer(node)
             elif isinstance(node, IRBpOperation):
                 continue
@@ -709,23 +727,15 @@ class ModuleCodeGen(FuncEmission):
 
     def emit_comm_groups(self):
         """
-        Creating communication group requires all the devices
-        enter the same call.
+        Collect groups that all runtime devices initialize through init_groups.
 
         The fields storing intermediate codes that are populated by this method:
         - `model_init_statements`
         """
-        sign = 'self.init_group(ranks={ranks})'
-        # create single rank communication group
-        self.model_init_statements.append('# single rank communication groups')
-        with ForBlock(var='rank', iters=f'range({self.runtime_ndevs})') as fb:
-            fb.insert_body(sign.format(ranks='[rank]'))
-        self.model_init_statements.extend(fb.code)
-        # create communication group
+        groups = [[rank] for rank in range(self.runtime_ndevs)]
+        groups.extend(list(ranks) for ranks in self.comm_groups)
         self.model_init_statements.append('# communication groups')
-        for ranks in self.comm_groups:
-            code = sign.format(ranks=list(ranks))
-            self.model_init_statements.append(code)
+        self.model_init_statements.append(f'self.init_groups(ranks={groups})')
         self.model_init_statements.append(' ')
 
     def init_attributes(self, node: IRCell) -> dict[str, dict[str, Any]]:
@@ -780,7 +790,7 @@ class ModuleCodeGen(FuncEmission):
                         slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
                         if itensor.is_scalar_tensor():
                             assert len(slicers) == 1 and slicers[0] == slice(0, 1), f"Unexpected slicers {slicers} for scalar tensor."
-                            slicers = '...'  # Ellipsis slicer for scalar tensor, x[...] is equivalent to x
+                            slicers = ()
                         val_chunks = itensor.valmap[1]
                         attr_name = self.tensor_name(itensor)
                         attr_props = dict(
@@ -817,7 +827,8 @@ class ModuleCodeGen(FuncEmission):
     def init_reducer(self,
         node: IRWeightReducer,
         device: int,
-        param_first_used_pos: Dict[IRFullTensor, int],
+        param_first_used_pos: Dict[IRFullTensor, Tuple[int, int]],
+        param_num_segments: Dict[IRFullTensor, int],
         as_parallel_module: bool = True,
     ) -> None:
         """
@@ -850,7 +861,7 @@ class ModuleCodeGen(FuncEmission):
             "nreplicas={nreplicas})"
         )
         reducer_add = 'self.add_reducer({reducer})'
-        add_param = '{reducer}.add_param({weight})'
+        add_param = '{reducer}.add_param({weight}{num_segments})'
         # create reducer in declare region
         weights = node.inputs()
         reducer_name = f'self.wreducer{node._id}'
@@ -867,12 +878,13 @@ class ModuleCodeGen(FuncEmission):
         self.model_init_statements.append(init_code)
         # sort weights by first used time (which is gradient all-reduce time in reverse order)
         # so that weights with similar gradient all-reduce time are bucketed together
-        weights = [
-            self.tensor_name(t, prefix_attr='self.')
-            for t in sorted(weights, key=lambda t: param_first_used_pos[t.parent])
-        ]
+        weights = sorted(weights, key=lambda t: param_first_used_pos[t.parent])
         for weight in weights:
-            add_param_code = add_param.format(reducer=reducer_name, weight=weight)
+            num_segments = param_num_segments[weight.parent]
+            add_param_code = add_param.format(
+                reducer=reducer_name, weight=self.tensor_name(weight, prefix_attr='self.'),
+                num_segments=f', num_segments={num_segments}' if num_segments > 1 else '',
+            )
             self.model_init_statements.append(add_param_code)
         add_code = reducer_add.format(reducer=reducer_name)
         self.model_init_statements.append(add_code)
@@ -1211,7 +1223,7 @@ class ModuleCodeGen(FuncEmission):
 
     def _get_param_first_used_pos(self, segment: IRSegment) -> Dict[IRFullTensor, int]:
         """
-        Get the first used node index of each parameter in the segment.
+        Get the first gradient-producing use's node index for each parameter.
         """
         # get all the parameters in the segment
         first_used_pos: Dict[IRFullTensor, int] = {}
@@ -1219,7 +1231,10 @@ class ModuleCodeGen(FuncEmission):
         for i, node in enumerate(segment.nodes()):
             # parameters are used as inputs of the node
             for tin in IRSegment.get_objects_from_complex(node.inputs()):
-                if isinstance(tin, IRSubTensor) and tin.is_param() and tin.parent not in first_used_pos:
+                if (
+                    isinstance(tin, IRSubTensor) and tin.is_param()
+                    and tin.grad is not None and tin.parent not in first_used_pos
+                ):
                     first_used_pos[tin.parent] = i
 
         return first_used_pos

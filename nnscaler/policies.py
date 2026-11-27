@@ -434,6 +434,8 @@ class OpPlan:
     # op's inputs will be passed to the hook.
     # The signature will be like
     # def pre_hook(module: ParallelModule, meta: Any, inputs: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+    # A hooked dataloader lookup is never recomputed in other pipeline stages
+    # (see `_duplicate_dataloader_index_ops_per_stage`), so the hook runs once.
     pre_hook: Optional[Callable[['ParallelModule', Any, tuple[Any, ...], dict[str, Any]], None]] = None
 
     # function to be called after the op is executed
@@ -441,6 +443,8 @@ class OpPlan:
     # op's inputs and outputs will be passed to the hook.
     # the signature will be like
     # def post_hook(module: ParallelModule, meta: Any, inputs: Tuple[Any, ...], kwargs: Dict[str, Any], output: Any) -> None:
+    # A hooked dataloader lookup is never recomputed in other pipeline stages
+    # (see `_duplicate_dataloader_index_ops_per_stage`), so the hook runs once.
     post_hook: Optional[Callable[['ParallelModule', Any, tuple[Any, ...], dict[str, Any], Any], None]] = None
 
     # OpPartition: user specified partition plan
@@ -482,6 +486,70 @@ class OpPlan:
         if len(self.partitions) == 1:
             self.partition = self.partitions[0]
             self.partitions = []
+
+
+def group_nodes_by_modules(
+    graph: IRGraph,
+    module_types: Union[type[torch.nn.Module], Iterable[type[torch.nn.Module]]],
+) -> list[list[IRFwOperation]]:
+    """Group forward operators by each invocation of the given module types.
+
+    Each group holds the consecutive operators of one call to a module of `module_types`,
+    so a module instance called several times in a row gives one group per call.
+    An operator belongs to the outermost matching module in its `module_stack`,
+    so nested matches (e.g. both a layer and its attention are given) never split the outer call.
+    Calls are told apart by module FQN and traced invocation id (`node.module_call_stack`).
+    Graphs traced before invocation ids existed fall back to grouping consecutive operators by FQN.
+    An operator outside `module_types` ends the current group.
+
+    A typical use in an `fn` policy is module-based recompute or CPU offload:
+
+        def policy(graph, cfg):
+            plans = {op: OpPlan(op) for op in get_pas_ops(graph)}
+            for group_id, group in enumerate(group_nodes_by_modules(graph, TransformerLayer)):
+                for node in group:
+                    plans[node].recompute_id = group_id  # or offload_id
+            return plans.values()
+
+    The groups only follow module boundaries.
+    Constraints of the recompute/offload group itself still apply,
+    e.g. all operators of a group must be in the same pipeline stage,
+    and an operator with a hook should not be recomputed, otherwise its hook runs twice.
+
+    Returns:
+        the groups, in graph order.
+    """
+    if isinstance(module_types, type):
+        module_types = (module_types,)
+    else:
+        module_types = tuple(module_types)
+    if not all(
+        isinstance(module_type, type) and issubclass(module_type, torch.nn.Module)
+        for module_type in module_types
+    ):
+        raise TypeError("module_types must contain torch.nn.Module classes")
+
+    groups: list[list[IRFwOperation]] = []
+    current_key = None
+    for node in graph.select(ntype=IRFwOperation):
+        # module_stack is ordered from the outermost module inwards.
+        fqn = next(
+            (fqn for fqn, mod_cls in (node.module_stack or {}).items() if mod_cls in module_types),
+            None,
+        )
+        if fqn is None:
+            current_key = None
+            continue
+        calls = node.module_call_stack or {}
+        # (FQN, invocation id) identifies one module call.
+        # An invocation id is unique within a trace, so it alone is enough when present;
+        # FQN is kept for graphs traced without ids, whose ids are all None.
+        key = (fqn, calls.get(fqn))
+        if key != current_key:
+            groups.append([])
+            current_key = key
+        groups[-1].append(node)
+    return groups
 
 
 def get_layer_index(fqn: str) -> int:
@@ -577,7 +645,11 @@ def _get_new_node_outputs_splits(node: IRFwOperation, stage: IRSegment, op_plans
             op_partition_map = op_partition_maps.get(consumer, {})
             stage_id = op_plans[consumer].stage_id
 
-            if not op_partition_map:
+            if not op_partition_map or tensor_idx is None:
+                # `tensor_idx is None`: the tensor sits inside a container input
+                # (e.g. the dict default of `dict.get`), which only non-differentiable
+                # IRPyFunc ops have; no gradient flows back through it, so the op's
+                # own partition map cannot say anything about it: replicated, no reduce.
                 tensor_split = 'rn'
             else:
                 assert tensor_idx in op_partition_map, "Internal Error: tensor_idx should be in op_partition_map"
@@ -589,8 +661,8 @@ def _get_new_node_outputs_splits(node: IRFwOperation, stage: IRSegment, op_plans
 
 
 def _refresh_grads(segment: IRSegment, tensor: IRSubTensor):
-    if not tensor.requires_grad:
-        return
+    # A no-grad replacement still needs its consumers' old gradient outputs removed.
+    # so we need to refresh the gradients even if the tensor itself has no grad.
 
     consumers = segment.consumers(tensor.parent)
     if not consumers:
@@ -604,8 +676,247 @@ def _refresh_grads(segment: IRSegment, tensor: IRSubTensor):
         fins = [t for t in fwop.iobjs() if isinstance(t, IRSubTensor)]
         igrads = [t.grad for t in fins if t.grad is not None]
         with segment.mirror.update(fwop.mirror):
+            fwop.mirror.reset_outputs(len(igrads))
             for i, igrad in enumerate(igrads):
                 fwop.mirror.set_output(i, igrad)
+
+
+def _pp_get_aux_outputs(
+    graph: IRGraph, op_plans: dict[IRFwOperation, OpPlan],
+) -> tuple[
+    dict[IRSubTensor, tuple[Optional[IRFwOperation], int, int, tuple[IRFwOperation, ...]]],
+    dict[IRFullTensor, IRFwOperation],
+]:
+    """Resolve output and boundary detach sites without editing the original graph.
+
+    Args:
+        graph: The untransformed graph, before staging or TP.
+        op_plans: Operator plans with resolved stage IDs.
+
+    Returns:
+        ``(sites, aux_param_uses)``.
+
+        ``aux_param_uses`` maps a parameter to one consumer that uses it only for
+        an auxiliary value in a stage other than its first consumer stage. Such a
+        use is harmless while every stage holds the parameter, but breaks once
+        shared-parameter multiref turns it into a per-consumer activation, so the
+        caller rejects it at that decision. See the TODO in the attribute branch.
+
+        ``sites`` is a dict mapping each source tensor to
+        ``(producer, stage_id, position, consumers)``:
+
+        * producer: The source's forward producer, or None for attributes.
+        * stage_id: The insertion stage, not necessarily the producer's stage.
+          Activations stay differentiable through their last loss-dependent
+          stage (at least their producer's stage); attributes use their earliest
+          consumer stage.
+        * position: Zero-based index of that stage's last op in graph.nodes().
+          The detach is inserted after this op.
+        * consumers: Only the operators whose source inputs must be rewired to
+          the detached view; other consumers keep the differentiable source.
+          An empty tuple means only a graph output needs detaching. A source
+          that is also a graph output must have that output replaced as well.
+
+        Both are empty when the loss has no gradient.
+    """
+    loss = graph.output(0)
+    if loss.grad is None:
+        return {}, {}  # don't need to update the graph if loss has no gradient (inference mode)
+
+    # Graph outputs that still carry a gradient and must be replaced by detached views.
+    # Do not return early when this set is empty: it only covers returned values,
+    # not stage boundaries.
+    aux_outputs = {
+        tensor for tensor in graph.oobjs()
+        if isinstance(tensor, IRSubTensor) and not tensor.is_loss() and tensor.requires_grad
+    }
+
+    # get all nodes that are live for backward tracking
+    live = {loss.grad.parent}  # set of live tensor parents for backward tracking
+    live_nodes = set()
+    # A single pass is enough because this runs on the untransformed graph, whose
+    # node list is the execution order: `IRGraph.backward` appends backward ops in
+    # reverse forward order, so every gradient is produced before it is consumed.
+    for node in graph.select(ntype=IRBpOperation):
+        if any(tensor.parent in live for tensor in node.inputs()):
+            live_nodes.add(node.mirror)
+            live.update(tensor.parent for tensor in node.outputs())
+
+    # Position of each stage's last forward op in graph.nodes(). Later entries
+    # overwrite earlier ones with the same stage_id, which gives the last op only
+    # because graph.nodes() is the execution order and `fn` has already checked
+    # that the ops of a stage are contiguous.
+    stage_ends = {
+        op_plans[node].stage_id: position
+        for position, node in enumerate(graph.nodes()) if node in op_plans
+    }
+    expanded = {}
+    aux_param_uses: dict[IRFullTensor, IRFwOperation] = {}
+    for tensor in graph.full_tensors():
+        if tensor.is_grad() or not tensor.requires_grad or tensor.is_loss():
+            continue
+        consumers = graph.consumers(tensor)
+        if tensor.is_attr():
+            # A directly returned attribute can be in the graph without any operator consumer.
+            if not consumers:
+                # example of this case:
+                # loss = self.linear(x).sum()
+                # return loss, self.unused_weight
+                raise RuntimeError(
+                    f"Cannot return weight {tensor} with no consumers as a graph output: "
+                    "its pipeline stage cannot be determined."
+                )
+
+            producer = None
+            detach_stage = min(op_plans[node].stage_id for node in consumers)
+            # TODO: auxiliary-only uses of a parameter in a later stage are not cut here.
+            # A handwritten `op(param.detach())` is needed for auxiliary-only uses in later stages.
+            detached_consumers = []
+            for node in consumers:
+                if node in live_nodes or op_plans[node].stage_id == detach_stage:
+                    continue
+                if any(t.grad is not None for t in node.inputs()
+                       if isinstance(t, IRSubTensor) and t.parent == tensor):
+                    aux_param_uses.setdefault(tensor, node)
+        else:
+            producers = graph.producers(tensor)
+            if not producers or not isinstance(producers[0], IRFwOperation):
+                continue
+            producer = producers[0]
+
+            detach_stage = max(
+                [op_plans[producer].stage_id] +
+                [op_plans[node].stage_id for node in consumers if node in live_nodes] # can be empty
+            )
+            detached_consumers = [node for node in consumers if op_plans[node].stage_id > detach_stage]
+
+        tensor_sub = tensor.tosub()
+        if tensor_sub in aux_outputs or detached_consumers:
+            expanded[tensor_sub] = (producer, detach_stage, stage_ends[detach_stage], tuple(detached_consumers))
+    return expanded, aux_param_uses
+
+
+def _pp_detach_aux_outputs(
+    graph: IRGraph, op_plans: dict[IRFwOperation, OpPlan]
+) -> tuple[dict[IRFullTensor, IRFwOperation], list[IRFwOperation]]:
+    """
+    Insert boundary/output detaches and update affected backward outputs.
+
+    Returns the auxiliary-only parameter uses that shared-parameter multiref would
+    break (see `_pp_get_aux_outputs`) and the inserted detach nodes.
+
+    Only the first output (loss) seeds backward. Other outputs are values
+    to return, not additional backward roots.
+    If we don't purge these auxiliary outputs, the backward will fail.
+
+    Examples:
+    1. Return an intermediate activation without detaching the loss path.
+        Before:
+            h = encoder(x)                  # stage 0
+            loss = head(h).sum()            # stage 1
+            return loss, h
+
+        After:
+            h = encoder(x)                  # stage 0
+            loss = head(h).sum()            # stage 1
+            returned_h = h.detach()         # end of stage 1
+            return loss, returned_h
+
+        head still consumes the original h, so loss still updates encoder.
+        Only the returned view is detached.
+
+        The backward of the last stage will fail if we don't detach the auxiliary outputs.
+
+    2. Cut a cross-stage input used only by an auxiliary branch.
+
+        Before:
+            h = encoder(x)                  # stage 0
+            y = middle(h)                   # stage 1
+            aux = aux_head(h)               # stage 2
+            loss = loss_head(y).sum()       # stage 2
+            return loss, aux.data
+
+        After:
+            h = encoder(x)                  # stage 0
+            y = middle(h)                   # stage 1
+            aux_input = h.detach()          # end of stage 1
+            aux = aux_head(aux_input)       # stage 2
+            loss = loss_head(y).sum()       # stage 2
+            return loss, aux.data
+
+        Returning aux.data already detaches the output, but stage 2 still
+        declares h as a backward input even though its loss uses only y.
+        Detaching that input avoids a missing gradient from stage 2.
+        The cut is after middle(h), preserving the loss path through stage 1.
+
+        Stage 1 will fail if we don't detach the cross-stage input used only by the auxiliary branch.
+    """
+    from nnscaler.graph.function.function import Detach
+    sites, aux_param_uses = _pp_get_aux_outputs(graph, op_plans)
+    detaches: list[IRFwOperation] = []
+    if not sites:
+        return aux_param_uses, detaches
+
+    # Sort the sites by their position in descending order
+    # to ensure that insertions do not affect subsequent positions.
+    # Note it is not a problem if multiple detach nodes are inserted at the same position
+    sorted_sites = sorted(sites.items(), key=lambda x: x[1][2], reverse=True)
+    for source, (_, stage_id, position, consumers) in sorted_sites:
+        detach = Detach(source)
+        detach.comment = 'fn detached pipeline output'
+        output = source.parent.like()
+        output.requires_grad = False
+        detach.set_output(0, output.tosub())
+        # get the plan for the operation currently at the insertion position.
+        # the detach node will follow the OpPlan of the operation at the insertion position.
+        plan = op_plans[graph._nodes[position]]
+        graph.insert(detach, position + 1)
+        # `fn` first lets the detach follow the layout this stage's other consumers
+        # of the source already need; only without such a layout does 'auto'
+        # infer the detach partition from its input, keeping the memory region.
+        # Note if the input is value partitioned, the replicated detach consumes
+        # the full value inside this stage, so the expander keeps the segment
+        # output un-narrowed and an all-reduce is inserted anyway; the detach
+        # adds no extra communication.
+        op_plans[detach] = OpPlan(
+            detach, stage_id=stage_id, partition='auto',
+            recompute_id=plan.recompute_id, offload_id=plan.offload_id,
+        )
+        detaches.append(detach)
+        for consumer in consumers:
+            with graph.update(consumer):
+                consumer.replace_input(source, detach.output(0))
+        graph.replace_output(source, detach.output(0))
+        # Source consumers need new value maps; detached consumers must drop old gradients.
+        # Note here, the `IRTensor.requires_grad` isn't automatically updated
+        # for the nodes affected directly or indirectly by the detach insertion
+        # This will not affect the correctness/speed of the gradient computation.
+        # so we skip this part.
+        #
+        # Example: h and aux require grad in the original trace.
+        #
+        # Before:
+        #     h = encoder(x)                  # stage 0
+        #     y = middle(h)                   # stage 1
+        #     loss = head(y).sum()            # stage 2
+        #     aux = h.sin()                   # stage 2
+        #     return loss, aux
+        #
+        # After:
+        #     h = encoder(x)                  # stage 0
+        #     y = middle(h)                   # stage 1
+        #     h_aux = h.detach()              # end of stage 1; requires_grad=False
+        #     loss = head(y).sum()            # stage 2
+        #     aux = h_aux.sin()               # runtime: False; IR still says True
+        #     returned_aux = aux.detach()     # end of stage 2; requires_grad=False
+        #     return loss, returned_aux
+        #
+        # aux.requires_grad would be False if we retraced this rewritten code.
+        # We keep its original True in IR: the detached input/output already
+        # isolate this branch, while the loss path through h and y stays intact.
+        _refresh_grads(graph, source)
+        _refresh_grads(graph, detach.output(0))
+    return aux_param_uses, detaches
 
 
 def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSegment, all_segments: List[IRSegment]) -> IRFwOperation:
@@ -712,13 +1023,17 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
                     producer.replace_output(tensor.grad, fwop.output(0).grad)
 
     _refresh_grads(segment, tensor)
+    # The replacements above also change other segments' forward/backward interfaces.
+    graph._reorder_producer_consumer()
 
     return fwop
 
 
-# signatures of cheap, deterministic, non-differentiable indexing/attribute ops
-# that are safe to recompute (e.g. `data['loss']` -> `_operator.getitem`).
-_SINKABLE_INDEX_SIGNATURES = ('_operator.getitem', )
+# signatures of cheap, deterministic, non-differentiable lookup ops that are safe
+# to recompute per stage (e.g. `data['loss']` -> `_operator.getitem`,
+# `data['meta'].get('scale', 1)` -> `builtins.dict.get`). Recomputing them locally
+# avoids a cross-stage object transfer for every microbatch.
+_SINKABLE_INDEX_SIGNATURES = ('_operator.getitem', 'builtins.dict.get')
 
 
 def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) -> None:
@@ -730,8 +1045,8 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
 
     Motivation:
     The dataloader operation is replicated to all devices (see the end of ``fn``),
-    hence its raw output is available in every pipeline stage. An indexing op
-    (``getitem`` / ``getattr``) on that output is non-differentiable and cheap, so
+    hence its raw output is available in every pipeline stage. A lookup op
+    (``getitem`` / ``dict.get``) on that output is non-differentiable and cheap, so
     recomputing it per stage is strictly better than transferring its result.
 
     Consider::
@@ -748,6 +1063,14 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
     original becomes dead (no remaining consumer and not a graph output), it is
     removed.
 
+    Ops that are not sinkable stay in their assigned stage and their results are
+    forwarded through adapters as before: lookups whose inputs are not all
+    dataloader-derived (parameters, buffers, activations, also when nested in a
+    container default), lookups whose output requires grad, and lookups with a
+    ``pre_hook`` or ``post_hook``. A hook is bound to the op in its assigned stage
+    and must run exactly once per microbatch; a copy in another stage would either
+    drop it or run it once more per consuming stage.
+
     This must be called before ``graph.staging`` (i.e. before any partition), while
     all forward ops still live at the top level of the graph and stage ids are known
     from ``op_plans``.
@@ -759,6 +1082,12 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
             dataloader_output_tids.add(out.tid)
     if not dataloader_output_tids:
         return
+    # graph outputs are not consumers, so a sinkable op that only feeds a graph
+    # output looks dead after sinking; it must stay in its own stage to keep
+    # the output defined.
+    graph_output_tids = {
+        out.tid for out in IRCell.get_objects_from_complex(graph.outputs())
+    }
 
     def _get_node_stage(node) -> Optional[int]:
         plan = op_plans.get(node)
@@ -788,12 +1117,22 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
             node_sinkable_cache[node.cid] = False
             return False
 
-        for inp in node.inputs():
-            if not isinstance(inp, IRObject):
-                continue
+        # hooks are bound to this op in its assigned stage; a copy in another
+        # stage would either drop them or run them once more per stage
+        plan = op_plans.get(node)
+        if plan is not None and (plan.pre_hook is not None or plan.post_hook is not None):
+            node_sinkable_cache[node.cid] = False
+            return False
+
+        for inp in node.iobjs():
             if inp.tid in dataloader_output_tids:
                 continue
             prods = graph.producers(inp.parent)
+            if not prods:
+                # parameters, buffers and other producer-less values are not
+                # available in every stage, so the lookup must stay where it is
+                node_sinkable_cache[node.cid] = False
+                return False
             assert len(prods) == 1, "Internal Error: call this before graph partitioning, each tensor/object should have a single producer"
             if _is_sinkable(prods[0]):
                 continue
@@ -806,14 +1145,17 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
 
     # cache of sinkable status for each node, keyed by node.cid
     node_sinkable_cache: dict[int, bool] = {}
-    # stage_id -> first forward op in that stage (used as insertion anchor for copies)
-    stage_anchors: dict[int, IRFwOperation] = {}
     sinkable_obj_memo: dict[tuple[IRObject, int], IRObject] = {}
-    for node in graph.select(ntype=IRFwOperation):
+    # stage_id -> position where copies sunk into that stage are inserted. It
+    # starts at the stage's first forward op and is advanced past each inserted
+    # copy, so later copies follow the ones they may reuse through
+    # `sinkable_obj_memo` while still preceding every consumer in the stage.
+    stage_starts: dict[int, int] = {}
+    for pos, node in enumerate(graph.nodes()):
+        if not isinstance(node, IRFwOperation):
+            continue
         stage_id = _get_node_stage(node)
-        if stage_id not in stage_anchors:
-            stage_anchors[stage_id] = node
-
+        stage_starts.setdefault(stage_id, pos)
         if _is_sinkable(node):  # also populate node_sinkable_cache
             for out in node.oobjs():
                 sinkable_obj_memo[(out, stage_id)] = out
@@ -825,11 +1167,16 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
             return out.like()
         return out  # static / constant output: reuse as-is
 
-    def _resolve(node: IRFwOperation, stage: int):
+    def _resolve(node: IRFwOperation, stage: int, pos: int) -> int:
+        """Copy `node` (and, recursively, its sinkable producers) into `stage`,
+        inserting the copies in dependency order starting at `pos`.
+        Returns the position right after the inserted copies."""
         assert _is_sinkable(node), "Internal Error: only sinkable nodes can be resolved"
 
-        if _get_node_stage(node) == stage:
-            return
+        # already available in `stage`: either the node lives there, or a copy was
+        # made earlier while resolving one of its consumers into the same stage
+        if all((out, stage) in sinkable_obj_memo for out in node.oobjs()):
+            return pos
 
         copy_node = node.replicate()
         copy_node._id = IDGenerator().gen_cell_id()  # a distinct op, not a device replica
@@ -848,7 +1195,7 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
                     assert len(prods) == 1, "Internal Error: call this before graph partitioning, each tensor/object should have a single producer"
                     assert _is_sinkable(prods[0]), "Internal Error: only sinkable nodes can be resolved"
 
-                    _resolve(prods[0], stage)
+                    pos = _resolve(prods[0], stage, pos)
 
                 resolved = sinkable_obj_memo[(inp, stage)]
                 copy_node.replace(inp, resolved)
@@ -859,12 +1206,17 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
             copy_node.replace(out, new_out)
             sinkable_obj_memo[(out, stage)] = new_out
 
-        graph.insert(copy_node, graph.index(stage_anchors[stage]))
+        graph.insert(copy_node, pos)
         op_plans[copy_node] = OpPlan(op=copy_node, stage_id=stage, partition=None)
+        return pos + 1
 
     # try to sink each sinkable node into its consumer stages, creating copies as needed
     # Note that we iterate in reverse topological order
     # so we have better chance to remove dead sinkable nodes after the sinking.
+    # Dead nodes are removed after the loop so that `stage_starts` stays valid;
+    # they are skipped as consumers so their producers are not kept alive or
+    # copied for them.
+    dead: dict[IRFwOperation, None] = {}  # insertion-ordered set
     for node in reversed(graph.select(ntype=IRFwOperation)):
         if not _is_sinkable(node):
             continue
@@ -875,6 +1227,8 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
         found_consumer_in_current_stage = False
         for oobj in node.oobjs():
             for consumer in graph.consumers(oobj.parent):
+                if consumer in dead:
+                    continue
                 cs = _get_node_stage(consumer)
                 if cs != node_stage:
                     foreign.setdefault(cs, []).append(consumer)
@@ -883,7 +1237,12 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
 
         for stage, consumers in foreign.items():
             # recursively resolve the node in the consumer stage, creating a copy if needed
-            _resolve(node, stage)
+            pos = stage_starts[stage]
+            inserted = _resolve(node, stage, pos) - pos
+            if inserted:
+                for sid in stage_starts:
+                    if stage_starts[sid] >= pos:
+                        stage_starts[sid] += inserted
 
             for consumer in consumers:
                 with graph.update(consumer):
@@ -893,9 +1252,13 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
                             consumer.replace(iobj, new_iobj)
 
         # dead sinkable nodes that are not needed in their own stage can be removed
-        if not found_consumer_in_current_stage:
-            graph.remove(node)
-            op_plans.pop(node, None)
+        is_graph_output = any(out.tid in graph_output_tids for out in node.oobjs())
+        if not found_consumer_in_current_stage and not is_graph_output:
+            dead[node] = None
+
+    for node in dead:
+        graph.remove(node)
+        op_plans.pop(node, None)
 
 
 def fn(
@@ -916,13 +1279,18 @@ def fn(
     2. use `node.fn` to get the operator function.
     3. use `node.module_stack` to get the module stack info.
     4. use `node.module_class_chain` to get the module class chain.
-    5. use `node.call_expr` to get the call expression string. And you can user `ast.parse` to parse it.
-    6. use `get_layer_index` to get the layer index in a torch.nn.ModuleList.
-    7. use `get_called_self_module_name` to get the called self module name from the call expression.
-    8. use `node.inputs()` the get the input tensors of the operator.
+    5. use `node.module_call_stack` to get the traced invocation id of each module in `node.module_stack`.
+        It distinguishes repeated calls to the same module instance (e.g., a shared block called in a loop),
+        which have identical `module_stack`.
+        To get the operators of each module call directly (e.g., for module-based recompute or offload),
+        use `group_nodes_by_modules`.
+    6. use `node.call_expr` to get the call expression string. And you can user `ast.parse` to parse it.
+    7. use `get_layer_index` to get the layer index in a torch.nn.ModuleList.
+    8. use `get_called_self_module_name` to get the called self module name from the call expression.
+    9. use `node.inputs()` the get the input tensors of the operator.
         We can further check whether the input tensor is a parameter by `tensor.is_param`,
         or get the full name of the parameter by `tensor.name`, etc.
-    9. insert anchors in code with `nnscaler.anchor` to help locate the operator (intrusive way).
+    10. insert anchors in code with `nnscaler.anchor` to help locate the operator (intrusive way).
 
     A good way to locate the operator will be like:
     1. Locate the module first by module_class_chain (`target_module in node.module_class_chain`)
@@ -932,6 +1300,12 @@ def fn(
        we can further locate the operator by
        `node.name`,`node.call_expr`, `node.fn`, `node.inputs()` (especially the `is_param`/`name` of input)
        or other properties.
+
+    cfg.pas_config['pipeline_multiref_replicated_params'] controls shared replicated
+    parameters across stages. True inserts multiref; False skips it.
+    None (the default) decides per parameter: skip multiref when the sharing stages
+    use the same layout and physical device group, otherwise insert it.
+    Mixed layouts always require multiref regardless of this option.
 
     Args:
         graph: the input IRGraph
@@ -992,6 +1366,13 @@ def fn(
             raise ValueError("pipeline_size must be 1 when pipeline is disabled")
     tp_size = ngpus // pp_size
 
+    # Plan the inserted nodes together with user operators, before any
+    # recompute/offload grouping, tensor-split bookkeeping or graph rewrites.
+    aux_param_uses: dict[IRFullTensor, IRFwOperation] = {}
+    aux_detaches: list[IRFwOperation] = []
+    if nstages > 1:
+        aux_param_uses, aux_detaches = _pp_detach_aux_outputs(graph, op_plans)
+
     recompute_groups: dict[int, list[IRFwOperation]] = {}
     recompute_last_id: int = -1
     recompute_group_stages: dict[int, int] = {}
@@ -1049,6 +1430,18 @@ def fn(
                 op_plan.partition = None
             if op_plan.partition is not None:
                 raise ValueError("Only IRDimops can be partitioned.")
+
+        if node in aux_detaches:
+            # An inserted detach sits after every other op of its stage, so the
+            # layouts this stage's other consumers need for its source are already
+            # in `tensor_splits`. Reusing a unanimous local layout adds no new
+            # layout requirement: no activation multiref, and for a cross-stage
+            # source no full-tensor boundary transfer. Otherwise keep 'auto',
+            # which follows the producer layout.
+            local_splits = tensor_splits.get(node.input(0).parent, {}).get(op_plan.stage_id, set())
+            if len(local_splits) == 1:
+                local_split = list(local_splits)[0]
+                op_plan.partition = OpPartition(input=0, dim=local_split) if isinstance(local_split, int) else None
 
         # list of partitions for the op
         # [] means no partition(replicated)
@@ -1205,7 +1598,7 @@ def fn(
     assert nstages == len(pp_stages), "Internal Error: nstages should be equal to the number of pipeline stages"
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
     pp_multiref_replicated_params = \
-        cfg.pas_config.get('pipeline_multiref_replicated_params', True)
+        cfg.pas_config.get('pipeline_multiref_replicated_params', None)
 
     # set recompute groups
     for group in recompute_groups.values():
@@ -1226,8 +1619,18 @@ def fn(
             continue
         splits = set(k for v in stage_info.values() for k in v)
         find_replicated = 'rr' in splits or 'rn' in splits
+        multiref_replicated_param = pp_multiref_replicated_params
+        if multiref_replicated_param is None:
+            # Same-layout uses in stages on one physical device group can keep the parameter local.
+            is_colocated_param = (
+                nstages > pp_size and len(stage_info) > 1
+                # all uses are colocated on the same physical device group
+                and len({stage_id % pp_size for stage_id in stage_info}) == 1
+                and len(splits) == 1
+            )
+            multiref_replicated_param = not is_colocated_param
         splits = list(splits)
-        # For safety, we will add multiref when detecting shared param are all replicated for pipeline parallelism.
+        # Unless colocated uses are retained, add multiref for shared replicated parameters.
         # The reason is that stages may have different number of devices, it is hard to synchronize gradients directly
         # by inserting reducers although weights are all REPLICAED.
 
@@ -1245,7 +1648,25 @@ def fn(
         # 4. (2) and (3): if the param is shared across stages and is replicated in at least one stage.
         #    Note: the case when some is replicated and some is partitioned is handled by (1).
 
-        if len(splits) > 1 or (pp_multiref_replicated_params and len(stage_info) > 1 and find_replicated):
+        # TODO: `graph.multiref` creates one alias per consumer, so a stage that uses a
+        # shared parameter several times with the same partition receives one copy per
+        # consumer and returns one gradient per copy.
+        # It is a waste. Should create multiref per (stage, partition) instead of per consumer.
+        if len(splits) > 1 or (multiref_replicated_param and len(stage_info) > 1 and find_replicated):
+            if ftensor in aux_param_uses:
+                # Only the first consumer stage keeps the parameter; every other
+                # consumer gets its own alias as an activation and declares a gradient
+                # for it that an auxiliary-only consumer never produces.
+                node = aux_param_uses[ftensor]
+                raise RuntimeError(
+                    f"Parameter {ftensor.name} is used by {node.signature} in pipeline stage "
+                    f"{op_plans[node].stage_id} only for an auxiliary output, but that stage "
+                    "receives it as an activation from stage "
+                    f"{min(stage_info)} and would declare a gradient the loss never produces. "
+                    "Detach it at the use site, e.g. `op(param.detach())`, or set "
+                    "pas_config['pipeline_multiref_replicated_params'] to False when every "
+                    "stage can hold the parameter."
+                )
             _logger.info(f'add multiref for shared param {ftensor}')
             consumers = graph.consumers(ftensor)
             multiref_node = graph.multiref(ftensor, comment='shared param')
@@ -1315,14 +1736,25 @@ def fn(
             if not isinstance(sub_tensor, IRSubTensor):
                 continue
             if seg.consumers(sub_tensor.parent):
+                output_dim = None
+                consumer_splits = tensor_splits[sub_tensor.parent].get(stage_id, set())
+                # Final graph outputs and incompatible layouts must stay replicated.
+                # Intermediate outputs can share the layout required by all local consumers.
+                # we will keep the consumer layout (the communication will definitely satisfy the existing consumer layout requirement)
+                # so we have more chance to optimize the compute graph in later stages.
+                # Communication will be generated correctly later no matter what the Identity layout is.
+                if pp_enabled and not is_tensor_in_output(sub_tensor.parent, graph) and len(consumer_splits) == 1:
+                    split = list(consumer_splits)[0]
+                    if isinstance(split, int):
+                        output_dim = split
+
                 ident_op = _identity_segment_output(graph, sub_tensor, seg, pp_segs)
-                # always replicate the identity operator
-                # even when the original tensor is partitioned
-                # as it is the output of segment which needs a complete tensor.
-                op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=None)
-                # 'rn' means `ident_op` is replicated
-                tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add('rn')
-                op_partition_maps[ident_op] = {}
+                partition = OpPartition(input=0, dim=output_dim) if output_dim is not None else None
+                op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=partition)
+                tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add(
+                    output_dim if output_dim is not None else 'rn'
+                )
+                op_partition_maps[ident_op] = {0: output_dim} if output_dim is not None else {}
 
                 # the tensor is a segment output,
                 # we have replaced the original output tensor with the identity output tensor

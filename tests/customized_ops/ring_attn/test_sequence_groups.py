@@ -8,12 +8,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
-# Skip all tests if flash_attn_func is not available
 try:
-    from flash_attn import flash_attn_func
+    from flash_attn import flash_attn_varlen_func  # noqa: F401
 except ImportError:
-    pytest.skip("flash_attn_func not available", allow_module_level=True)
-
+    pytest.skip("flash_attn_varlen_func not available", allow_module_level=True)
 
 from nnscaler.customized_ops.ring_attention.ring_attn_varlen import (
     emit_ring as emit_varlen_ring,
@@ -181,9 +179,8 @@ def _sequence_group_attention_worker():
     dist.init_process_group(backend='nccl')
     nnscaler.init()
 
-    groups = ([0, 1], [2, 3])
-    for ranks in groups:
-        DeviceGroup().get_group(ranks)
+    groups = [[0, 1], [2, 3]]
+    DeviceGroup().get_groups(groups)
 
     rank = dist.get_rank()
     group_index = rank // 2

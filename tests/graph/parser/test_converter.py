@@ -3,7 +3,9 @@
 
 import tempfile
 import importlib
+import logging
 from pathlib import Path
+import threading
 
 import torch
 import pytest
@@ -13,6 +15,40 @@ from nnscaler.graph.parser import AttrSaveLevel, FxModuleParser
 from nnscaler.ir.cten import IRObject, IRTensor
 
 from ...utils import replace_all_device_with
+
+
+@pytest.mark.parametrize('background_thread', [False, True])
+@replace_all_device_with('cpu')
+def test_trace_background_thread_warning(background_thread, monkeypatch, caplog):
+    stop = threading.Event()
+    worker = threading.Thread(target=stop.wait, name='trace-test-background', daemon=True)
+    inactive = threading.Thread(name='trace-test-inactive')
+    if background_thread:
+        worker.start()
+    current_thread = threading.current_thread()
+    monkeypatch.setattr(threading, 'enumerate', lambda: [current_thread, inactive, worker])
+    try:
+        model = torch.nn.Linear(3, 5)
+        inputs = {'input': torch.ones(2, 3)}
+        with caplog.at_level(logging.WARNING, logger='nnscaler.graph.parser.converter'):
+            traced = to_fx_graph(model, inputs)
+        torch.testing.assert_close(traced(**inputs), model(**inputs))
+        records = [
+            record for record in caplog.records
+            if 'Other live Python threads detected before concrete_trace' in record.getMessage()
+        ]
+        assert len(records) == int(background_thread)
+        if background_thread:
+            message = records[0].getMessage()
+            assert 'trace-test-background' in message
+            assert 'type=threading.Thread' in message
+            assert 'daemon=True' in message
+            assert current_thread.name not in message
+            assert 'trace-test-inactive' not in message
+    finally:
+        stop.set()
+        if background_thread:
+            worker.join()
 
 
 @replace_all_device_with('cpu')
