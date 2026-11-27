@@ -4,6 +4,7 @@
 import builtins
 import importlib
 import pickle
+import types
 from contextlib import contextmanager
 from functools import wraps, cache
 from typing import (
@@ -856,6 +857,14 @@ def extract_tensors(data: Dict[str, Any]) -> Tuple[Dict[str, Any], List[torch.Te
     Returns:
         Tuple[Dict[str, Any], List[torch.Tensor]]: The skeleton and the list of tensors.
     """
+    transform_fn, tensors = _tensor_indexer()
+    skeleton = transform_recursively(data, transform_fn, target_types=(torch.Tensor,))
+
+    return skeleton, tensors
+
+
+def _tensor_indexer() -> Tuple[Callable[[torch.Tensor], '_TensorIndex'], List[torch.Tensor]]:
+    """The tensor-to-`_TensorIndex` function of `extract_tensors`, and the list it fills."""
     tensors = []
 
     # used to deduplicate tensors
@@ -871,9 +880,7 @@ def extract_tensors(data: Dict[str, Any]) -> Tuple[Dict[str, Any], List[torch.Te
             tensor_ids[key] = idx
             tensors.append(o)
         return idx
-    skeleton = transform_recursively(data, transform_fn, target_types=(torch.Tensor,))
-
-    return skeleton, tensors
+    return transform_fn, tensors
 
 
 def refill_tensors(skeleton: Dict[str, Any], tensors: List[torch.Tensor]) -> Dict[str, Any]:
@@ -893,15 +900,31 @@ def refill_tensors(skeleton: Dict[str, Any], tensors: List[torch.Tensor]) -> Dic
     return state_dict
 
 
-class _TensorFound(Exception):
+class _StopProbe(Exception):
     pass
 
 
-_EXACT_WALKED_TYPES = (list, tuple, dict)
+# Types whose pickling runs no user code (they are saved by reference or by a
+# builtin reducer), so the probe may serialize them. Exact builtin containers
+# and scalars never reach `reducer_override` at all; classes (saved by
+# reference), numpy dtypes and numpy scalars are checked separately.
+_PROBE_SAFE_TYPES = frozenset([
+    types.FunctionType, types.BuiltinFunctionType,
+    complex, range, slice, type(Ellipsis), type(NotImplemented),
+    np.ndarray, torch.dtype, torch.device,
+])
 
 
-class _TensorDetectingPickler(pickle.Pickler):
-    """Pickles into nothing and stops at the first tensor anywhere in the object."""
+class _TensorProbePickler(pickle.Pickler):
+    """Pickles into nothing and stops at the first object that may hold a tensor.
+
+    It stops at a tensor, and also at every object whose pickling could run
+    user code (`__reduce__`, `__getstate__`, ...) before calling that code:
+    such code may hide tensors from the probe (e.g. a list subclass that
+    pickles its items converted), and it may have side effects that must happen
+    only once, in the real broadcast (e.g. a `__reduce__` that consumes an
+    iterator).
+    """
 
     class _Discard:
         def write(self, b):
@@ -911,89 +934,95 @@ class _TensorDetectingPickler(pickle.Pickler):
         super().__init__(self._Discard(), protocol=pickle.HIGHEST_PROTOCOL)
 
     def reducer_override(self, obj):
-        if isinstance(obj, torch.Tensor):
-            raise _TensorFound
-        # `extract_tensors` walks list/tuple/dict subclasses (it checks with
-        # `isinstance`), but their own `__reduce__`/`__getstate__` may hand the
-        # pickler something other than the tensors they hold. Treat them as
-        # tensor-bearing instead of trusting their pickled form.
-        if isinstance(obj, _EXACT_WALKED_TYPES) and type(obj) not in _EXACT_WALKED_TYPES:
-            raise _TensorFound
-        return NotImplemented
+        t = type(obj)
+        if (
+            t in _PROBE_SAFE_TYPES
+            or isinstance(obj, (type, np.dtype))
+            or (isinstance(obj, np.generic) and t.__module__ == 'numpy')
+        ):
+            return NotImplemented
+        raise _StopProbe
 
 
 def _may_contain_tensor(data: Any) -> bool:
-    """Conservative check whether `data` holds a tensor anywhere, at C speed.
+    """Conservative check whether `data` may hold a tensor, at C speed.
 
     `reducer_override` is not called for exact builtin containers and scalars,
-    so a large tensor-free structure (e.g. per-rank data loader states merged
-    from thousands of ranks) costs one C-level pickle pass instead of a Python
-    call per element as in `transform_recursively`. It also looks into dict
-    keys and other objects' pickled state, and treats list/tuple/dict
-    subclasses as tensor-bearing, so it may report tensors that
-    `extract_tensors` does not touch; it never misses one that it does.
+    so a large structure of them (e.g. per-rank data loader states merged from
+    thousands of ranks) costs one C-level pickle pass instead of a Python call
+    per element as in `transform_recursively`. Any other object, including dict
+    keys and list/tuple/dict subclasses, counts as possibly holding a tensor
+    (see `_TensorProbePickler`), and so does data that cannot be pickled. So it
+    may report tensors that `extract_tensors` does not touch, but never misses
+    one that it does.
     """
     try:
-        _TensorDetectingPickler().dump(data)
+        _TensorProbePickler().dump(data)
     except Exception:
-        # `_TensorFound`, or data that cannot be pickled: assume tensors.
+        # `_StopProbe`, or data that cannot be pickled.
         return True
     return False
 
 
 # How many levels of exact dict/list `broadcast_mixed_data` looks into before
-# handing a tensor-bearing value to `extract_tensors`: the top-level keys, and
-# the elements of their values (e.g. the per-rank entries of a merged
-# `dataloader` list, so one tensor-bearing rank does not send all of them
-# through the walk).
+# handing a value that may hold tensors to the `extract_tensors` walk: the
+# top-level keys, and the elements of their values (e.g. the per-rank entries
+# of a merged `dataloader` list, so one tensor-bearing rank does not send all
+# of them through the walk).
 _BROADCAST_SPLIT_DEPTH = 2
 
 
 class _WalkedSubtree:
-    """Skeleton placeholder for a subtree that went through `extract_tensors`."""
-    def __init__(self, index: int):
-        self.index = index
+    """Skeleton node: an `extract_tensors` skeleton that holds `_TensorIndex`es."""
+    def __init__(self, value: Any):
+        self.value = value
 
 
 class _SplitContainer:
-    """Skeleton placeholder for an exact dict/list whose children were checked one by one."""
+    """Skeleton node: an exact dict/list rebuilt from its children's skeletons."""
     def __init__(self, value: Union[dict, list]):
         self.value = value
 
 
-def _split_tensor_subtrees(data: Any, depth: int, walked: list) -> Any:
-    """Replace the subtrees of `data` that may hold tensors by placeholders.
+def _extract_tensor_subtrees(data: Any, depth: int, transform_fn: Callable) -> Tuple[bool, Any]:
+    """`extract_tensors` that skips the subtrees `_may_contain_tensor` rules out.
 
-    Exact dicts and lists down to `depth` levels are copied with their
-    tensor-free children kept as they are; every other tensor-bearing subtree is
-    appended to `walked` (to go through `extract_tensors` in one call, so that
-    tensor deduplication still spans all of them) and replaced by a
-    `_WalkedSubtree`. Data that is not an exact dict or list is walked whole,
-    exactly as `extract_tensors(data)` would.
+    Returns `(changed, skeleton)`. Exact dicts and lists down to `depth` levels
+    have their children checked one by one; other values that may hold tensors
+    are walked with `transform_fn` (one `_tensor_indexer` shared by all calls,
+    so deduplication and tensor order match a single `extract_tensors(data)`).
+    As in `extract_tensors`, a subtree where no tensor was replaced is returned
+    as the original object, not a copy, so objects shared across the data stay
+    shared after the broadcast. Data that is not an exact dict or list is walked
+    whole, exactly as `extract_tensors(data)` would.
     """
-    if depth > 0 and type(data) is dict:
-        return _SplitContainer({
-            k: _split_tensor_subtrees(v, depth - 1, walked) if _may_contain_tensor(v) else v
-            for k, v in data.items()
-        })
-    if depth > 0 and type(data) is list:
-        return _SplitContainer([
-            _split_tensor_subtrees(v, depth - 1, walked) if _may_contain_tensor(v) else v
-            for v in data
-        ])
-    walked.append(data)
-    return _WalkedSubtree(len(walked) - 1)
+    if depth > 0 and type(data) in (dict, list):
+        items = data.items() if type(data) is dict else enumerate(data)
+        children = []
+        changed = False
+        for k, v in items:
+            if _may_contain_tensor(v):
+                c, v = _extract_tensor_subtrees(v, depth - 1, transform_fn)
+                changed = changed or c
+            children.append((k, v))
+        if not changed:
+            return False, data
+        if type(data) is dict:
+            return True, _SplitContainer(dict(children))
+        return True, _SplitContainer([v for _, v in children])
+    changed, skeleton = _transform_recursively(data, transform_fn, target_types=(torch.Tensor,))
+    return (True, _WalkedSubtree(skeleton)) if changed else (False, data)
 
 
-def _fill_tensor_subtrees(skeleton: Any, walked: list) -> Any:
-    """Inverse of `_split_tensor_subtrees`, given the refilled `walked` subtrees."""
+def _refill_tensor_subtrees(skeleton: Any, tensors: List[torch.Tensor]) -> Any:
+    """Inverse of `_extract_tensor_subtrees`."""
     if isinstance(skeleton, _WalkedSubtree):
-        return walked[skeleton.index]
+        return refill_tensors(skeleton.value, tensors)
     if isinstance(skeleton, _SplitContainer):
         value = skeleton.value
         if type(value) is dict:
-            return {k: _fill_tensor_subtrees(v, walked) for k, v in value.items()}
-        return [_fill_tensor_subtrees(v, walked) for v in value]
+            return {k: _refill_tensor_subtrees(v, tensors) for k, v in value.items()}
+        return [_refill_tensor_subtrees(v, tensors) for v in value]
     return skeleton
 
 
@@ -1034,15 +1063,13 @@ def broadcast_mixed_data(
     if rank == src_rank:
         if data is None:
             raise ValueError("data must not be None in src_rank")
-        # Only walk the subtrees that may hold tensors with `extract_tensors`;
-        # tensor-free ones (where the walk is a no-op) are sent as they are and
-        # skipped by `refill_tensors` below.
-        walked = []
-        skeleton = _split_tensor_subtrees(data, _BROADCAST_SPLIT_DEPTH, walked)
-        walked_skeleton, tensors = extract_tensors(walked)
-        del walked
+        # Same skeleton and tensor list as `extract_tensors(data)`, but the
+        # subtrees that cannot hold tensors (where the walk is a no-op) are not
+        # walked here, nor by `refill_tensors` below.
+        transform_fn, tensors = _tensor_indexer()
+        _, skeleton = _extract_tensor_subtrees(data, _BROADCAST_SPLIT_DEPTH, transform_fn)
         meta_tensors = [t.to('meta') for t in tensors]
-        sent = [(skeleton, walked_skeleton, meta_tensors)]
+        sent = [(skeleton, meta_tensors)]
     else:
         if data is not None:
             raise ValueError("data must be None in non-src ranks")
@@ -1050,7 +1077,7 @@ def broadcast_mixed_data(
         sent = [None]
 
     torch.distributed.broadcast_object_list(sent, src=src_rank, group=group)
-    skeleton, walked_skeleton, meta_tensors = sent[0]
+    skeleton, meta_tensors = sent[0]
     sent = None
     if rank != src_rank:
         tensors = [None] * len(meta_tensors)
@@ -1076,7 +1103,7 @@ def broadcast_mixed_data(
 
     torch.cuda.synchronize()
     # refill tensors
-    return _fill_tensor_subtrees(skeleton, refill_tensors(walked_skeleton, tensors))
+    return _refill_tensor_subtrees(skeleton, tensors)
 
 
 def gather_mixed_data(
