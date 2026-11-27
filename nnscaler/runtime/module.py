@@ -33,6 +33,7 @@ from nnscaler.runtime.executor import Executor
 from nnscaler.runtime.gnorm import ParamsInfo
 from nnscaler.runtime.utils import microbatches, set_dparam_meta, get_dparam_meta
 from nnscaler.runtime.function import insert_backward_hook
+from nnscaler.runtime.page_release import FilePageReleaser
 
 from nnscaler import __version__ as runtime_version
 from nnscaler.flags import CompileFlag
@@ -765,6 +766,8 @@ class CubeModule(torch.nn.Module):
         #  used to track how many elements have been filled for each zero3 parameter
         zero3_current_filled: Dict[str, Dict[Tuple[Tuple[int, int, int], ...], List[Tuple[int, int]]]] = {}
         zero3_param_metadatas = [info[-1] for info in zero_idx_maps] if zero_idx_maps is not None else [None] * len(state_dicts)
+        # drop the page cache of consumed mmap-loaded shard tensors
+        releaser = FilePageReleaser()
         # gather param/buffer full tensor
         for rank, (model_state_dict, local_fullmap, zero3_param_metadata) in enumerate(zip(state_dicts, fullmaps, zero3_param_metadatas)):
             for local_name, meta in local_fullmap.items():
@@ -788,11 +791,13 @@ class CubeModule(torch.nn.Module):
                 if dest_tensor.shape == partial_tensor.shape and state_dict_merge_track_id in state_dict_merge_track[meta.orig_name]:
                     if not cls._safe_tensor_equal(dest_tensor, partial_tensor):
                             raise ValueError(f"Conflict in merging {meta.orig_name} from rank {rank}")
+                    releaser.release(partial_tensor)
                     _logger.debug(f'rank {rank}: skip merging duplicated model state for param {meta.orig_name} with slicers {meta.slicers}')
                 else:
                     state_dict_merge_track[meta.orig_name].add(state_dict_merge_track_id)
                     if dest_tensor.shape == partial_tensor.shape:
                         dest_tensor.copy_(partial_tensor)
+                        releaser.release(partial_tensor)
                     else:
                         # we assume zero3 is on when dest_tensor.shape != partial_tensor.shape
                         if len(partial_tensor.shape) != 1:
@@ -811,9 +816,13 @@ class CubeModule(torch.nn.Module):
                             old_shape = dest_tensor.shape
                             dest_tensor = dest_tensor.reshape(-1)
                             dest_tensor[curr_start: curr_end] = partial_tensor[0: fill_len]
+                            releaser.release(partial_tensor[0: fill_len])
                             full_model_state_dict[meta.orig_name][meta.slicers] = dest_tensor.view(old_shape)
                             zero3_current_filled[meta.orig_name][state_dict_merge_track_id].append((curr_start, curr_end))
 
+        released = releaser.close()  # waits for the queued releases
+        if released:
+            _logger.info(f'released {released / 2**30:.1f} GiB of merged model checkpoint pages')
         if zero3_current_filled:
             # verify all zero3 parameters are fully filled
             for param_name, slicers2filled in zero3_current_filled.items():
@@ -929,6 +938,13 @@ class CubeModule(torch.nn.Module):
         plan_ngpus = len(optim_state_dicts)
         # gather optimizer states
         full_optim_state_dict: Dict[str, Any] = {}  # param_id -> Dict[state_name, value]
+        # Each source range is read once; drop its page cache (mmap-loaded
+        # shards only) so it does not compete with the growing merged state.
+        releaser = FilePageReleaser()
+
+        def _copy_and_release(dst, src):
+            dst.copy_(src)
+            releaser.release(src)
 
         # build parameter order to match with the optimizer state order
         # NOTE: the param IDs in optimizer typically follow the same order of
@@ -1018,18 +1034,22 @@ class CubeModule(torch.nn.Module):
                 end_rank_id, end_offset = pend // chunk_size, pend % chunk_size
                 if start_rank_id == end_rank_id:
                     for key in opt_state_keys:
-                        opt_states_1d[key][:] = bucket_states[start_rank_id][key][start_offset:end_offset]
+                        _copy_and_release(opt_states_1d[key][:],
+                                          bucket_states[start_rank_id][key][start_offset:end_offset])
                 else:
                     offset = chunk_size-start_offset
                     for key in opt_state_keys:
-                        opt_states_1d[key][:offset] = bucket_states[start_rank_id][key][start_offset:]
+                        _copy_and_release(opt_states_1d[key][:offset],
+                                          bucket_states[start_rank_id][key][start_offset:])
                     for i in range(start_rank_id+1, end_rank_id):
                         for key in opt_state_keys:
-                            opt_states_1d[key][offset:offset+chunk_size] = bucket_states[i][key][:]
+                            _copy_and_release(opt_states_1d[key][offset:offset+chunk_size],
+                                              bucket_states[i][key][:])
                         offset += chunk_size
                     if end_offset:  # skip if end_offset == 0, because it is a no-op
                         for key in opt_state_keys:
-                            opt_states_1d[key][offset:] = bucket_states[end_rank_id][key][:end_offset]
+                            _copy_and_release(opt_states_1d[key][offset:],
+                                              bucket_states[end_rank_id][key][:end_offset])
             else:  # zero_version == 3
                 assert zero_version > 1, f'unsupported zero version {zero_version}'
                 param_numel = math.prod(pshape)
@@ -1060,7 +1080,8 @@ class CubeModule(torch.nn.Module):
                         ):
                             raise ValueError(f'Conflict in merging optimizer state for param with shape {pshape}')
                         if end > covered_end:
-                            opt_states_1d[key][covered_end:end] = bstate[key][pstart + covered_end - start:pstart + end - start]
+                            _copy_and_release(opt_states_1d[key][covered_end:end],
+                                              bstate[key][pstart + covered_end - start:pstart + end - start])
                             covered_end = end
                     if covered_end != param_numel:
                         raise ValueError(f'Incomplete optimizer state for param with shape {pshape}')
@@ -1252,12 +1273,16 @@ class CubeModule(torch.nn.Module):
                         else:
                             # assign with partial tensor
                             full_states[full_index][state_name][meta.slicers] = value
+                            releaser.release(value)
 
                 state_merge_track.add(track_id)
 
             if full_index in full_states and state_merge_track != expected_state_tracks:
                 raise ValueError(f'Incomplete optimizer state for parameter {param_name}: '
                                  f'found slices {state_merge_track}, expected {expected_state_tracks}')
+        released = releaser.close()  # waits for the queued releases
+        if released:
+            _logger.info(f'released {released / 2**30:.1f} GiB of merged optimizer checkpoint pages')
         # handle additional state dict keys
         for optim_state_dict in optim_state_dicts[0 : plan_ngpus]:
             for key in optim_state_dict.keys():
