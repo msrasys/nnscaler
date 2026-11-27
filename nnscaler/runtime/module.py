@@ -979,7 +979,13 @@ class CubeModule(torch.nn.Module):
                         for key in opt_state_keys)
 
         def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size, zero_version,
-                                      zero3_ranges=None):
+                                      zero3_ranges=None, dest=None):
+            """Gather one parameter shard's state from its ZeRO bucket chunks.
+
+            `dest(key, dtype)` may return a contiguous 1-D tensor with the shard's
+            numel (a view into the merged full tensor); the chunks are then copied
+            straight into it instead of through a temporary shard tensor.
+            """
             assert bucket_size % len(bucket_states) == 0
             for other in bucket_states[1:]:
                 if other.keys() != bucket_states[0].keys():
@@ -997,9 +1003,14 @@ class CubeModule(torch.nn.Module):
 
             opt_states, opt_states_1d = {}, {}
             for key in opt_state_keys:
-                opt_states[key] = torch.zeros(pshape, dtype=bucket_states[0][key].dtype,
-                                                device='cpu', requires_grad=False)
-                opt_states_1d[key] = opt_states[key].view(-1)
+                dtype = bucket_states[0][key].dtype
+                target = dest(key, dtype) if dest is not None else None
+                if target is None:
+                    # Both ZeRO paths below write (or reject) every element, so
+                    # skip zero-filling: it is a full extra pass over the state.
+                    target = torch.empty(math.prod(pshape), dtype=dtype, device='cpu')
+                opt_states[key] = target.view(pshape)
+                opt_states_1d[key] = target
 
             if zero_version == 1:
                 chunk_size = bucket_size // len(bucket_states)
@@ -1081,7 +1092,7 @@ class CubeModule(torch.nn.Module):
                     zero3_layouts[rank] = order, by_shard
             return zero3_layouts[rank]
 
-        def _merge_opt_zero(param_shape, worker_idx, param_idx):
+        def _merge_opt_zero(param_shape, worker_idx, param_idx, dest=None):
             if len(zero_idx_maps[worker_idx]) == 4:
                 model_idx2opt_idx, opt_idx2ranks, zero_version, _ = zero_idx_maps[worker_idx]
             elif len(zero_idx_maps[worker_idx]) == 3:  # backward compatibility
@@ -1130,6 +1141,7 @@ class CubeModule(torch.nn.Module):
                     bucket_size,
                     zero_version,
                     zero3_ranges,
+                    dest,
                 )
 
         # full_index: param IDs in the full optimizer state
@@ -1147,6 +1159,27 @@ class CubeModule(torch.nn.Module):
             # please note this is only used for non-zero mode
             # becase re-merging the same parameter slice (via _merge_opt_zero) is avoided in zero mode
             state_merge_track: Set[Tuple[Tuple[Any, Any, Any], ...]] = set()
+            # Full state tensors of this parameter, allocated on first use. ZeRO
+            # shards whose slice of a full tensor is contiguous (e.g. expert
+            # shards on dim 0) are gathered straight into it.
+            full_tensors: Dict[str, torch.Tensor] = {}
+
+            def _full_tensor(state_name, dtype, shape):
+                if state_name not in full_tensors:
+                    full_tensors[state_name] = torch.empty(shape, dtype=dtype, device='cpu')
+                return full_tensors[state_name]
+
+            def _direct_dest(meta, written):
+                def dest(key, dtype):
+                    full = _full_tensor(key, dtype, meta.shape)
+                    if full.dtype != dtype:
+                        return None  # the dtype check below reports the conflict
+                    target = full[meta.slicers]
+                    if tuple(target.shape) != tuple(meta.sub_shape) or not target.is_contiguous():
+                        return None
+                    written.add(key)
+                    return target.view(-1)
+                return dest
 
             # There is this for loop because a parameter may be sharded due to TP,
             # consequently, the parameter's optimizer state is also sharded.
@@ -1158,6 +1191,8 @@ class CubeModule(torch.nn.Module):
                     continue
                 # TODO: support customized param groups, where each parameter has IDs
                 # specified from its own param_group
+                # state names already gathered in place into their full tensors
+                written: Set[str] = set()
                 if zero_idx_maps is None:
                     states: Dict[str, torch.Tensor] = optim_state['state'].get(local_index)
                 else:
@@ -1165,7 +1200,10 @@ class CubeModule(torch.nn.Module):
                         # As ZeRO is applied, the optimizer state of this parameter (a shard)
                         # may not be stored locally in its optimizer state.
                         # _merge_opt_zero is for recovering the optimizer state corresponding to this parameter shard.
-                        states: Dict[str, torch.Tensor] = _merge_opt_zero(meta.sub_shape, work_idx, local_index)
+                        # Each track_id is gathered once (zero_done_track), so an in-place
+                        # write never overwrites an already merged slice.
+                        states: Dict[str, torch.Tensor] = _merge_opt_zero(
+                            meta.sub_shape, work_idx, local_index, _direct_dest(meta, written))
                     else:
                         _logger.debug(f'rank {work_idx}: skip merging duplicated optimizer state for param {full_index} with slicers {meta.slicers}')
                         continue
@@ -1201,13 +1239,16 @@ class CubeModule(torch.nn.Module):
                             raise ValueError(f'Invalid optimizer state shape for {param_name}.{state_name}')
                         # create optimizer state tensor
                         if state_name not in full_states[full_index]:
-                            full_states[full_index][state_name] = torch.empty(meta.shape, dtype=value.dtype, device='cpu')
-                        elif full_states[full_index][state_name].dtype != value.dtype:
+                            full_states[full_index][state_name] = _full_tensor(
+                                state_name, value.dtype, meta.shape)
+                        if full_states[full_index][state_name].dtype != value.dtype:
                             raise ValueError(f'Conflicting optimizer state dtype for {param_name}.{state_name}')
 
                         if track_id in state_merge_track:
                             if not cls._safe_tensor_equal(full_states[full_index][state_name][meta.slicers], value):
                                 raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
+                        elif state_name in written:
+                            pass  # already gathered in place by _merge_opt_zero
                         else:
                             # assign with partial tensor
                             full_states[full_index][state_name][meta.slicers] = value
