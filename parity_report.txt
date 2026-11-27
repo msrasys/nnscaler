@@ -1,0 +1,19 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.22, pytest-9.2.0, pluggy-1.7.0 -- /home/v-xuasong/miniforge3/envs/nnscaler/bin/python
+cachedir: .pytest_cache
+rootdir: /home/v-xuasong/nnscaler
+configfile: pyproject.toml
+plugins: anyio-4.16.0
+collecting ... collected 38 items / 35 deselected / 3 selected
+
+examples/tests/test_training_parity.py::test_distributed_micro_training[qwen3p5-micro-moe-moe_ep4_tp1-4-32] PASSED [ 33%]
+examples/tests/test_training_parity.py::test_distributed_micro_training[qwen3p5-micro-moe-moe_expanded_ep2-2-32] PASSED [ 66%]
+examples/tests/test_training_parity.py::test_distributed_micro_training[qwen3p5-micro-vl-vl_tp2-2-32] PASSED [100%]
+
+=============================== warnings summary ===============================
+examples/tests/test_training_parity.py::test_distributed_micro_training[qwen3p5-micro-moe-moe_ep4_tp1-4-32]
+  /home/v-xuasong/nnscaler/nnscaler/runtime/f16_optimizer.py:237: UserWarning: Dion is not installed. Dion Muon optimizers are unavailable.
+    import nnscaler.runtime.dion_optimizer as _dion_optimizer
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+============ 3 passed, 35 deselected, 1 warning in 98.34s (0:01:38) ============

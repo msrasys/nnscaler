@@ -86,3 +86,27 @@ Include the full 60-layer `Qwen3.5-397B-A17B` 32-GPU weightless compilation test
 ```bash
 PYTHONPATH=. python -m examples.qwen3p5.tests.run_all_tests --include-397b
 ```
+
+## Optional CUDA Kernels
+
+Gated DeltaNet uses FLA only for matching FP16/BF16 CUDA Q/K/V on Ampere or newer
+GPUs with key head dimension at most 256. FP32 uses the differentiable PyTorch
+reference without downcasting. Grouped Q/K heads are expanded to the value-head
+count before FLA, and TP slices are made contiguous without detaching gradients.
+The same device/dtype policy applies to GLM/Kimi KDA, which explicitly bypasses
+HF's automatic kernel selection on CPU.
+
+The optional `causal_conv1d` extension is loaded only for CUDA convolution widths
+2/3/4 and FP16/BF16/FP32 weights. Inputs are normalized to channel-first contiguous
+layout so TP-local channel counts do not inherit channel-last alignment limits.
+GLM/Kimi convolution wrappers continue to use PyTorch `F.conv1d`.
+Unavailable optional kernels log a warning and use the reference; errors from an
+invoked kernel are propagated rather than silently retried.
+
+```bash
+PYTHONPATH=. python -m pytest examples/tests/test_linear_attention_kernels.py -q -rs
+```
+
+The suite separates CPU dispatch regressions from real CUDA forward/backward and
+manual TP-split parity. CUDA cases skip when hardware or the optional package is
+unavailable; a skipped case does not validate that kernel or multi-process training.

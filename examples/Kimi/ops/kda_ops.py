@@ -12,6 +12,7 @@ Enables 100% head-parallel sharding across `linear_num_heads` (`h`) for:
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import torch
@@ -19,6 +20,11 @@ import torch.nn.functional as F
 from transformers.models.kimi_linear.modeling_kimi_linear import chunk_kimi_delta_attention
 
 from nnscaler.graph.parser.register import CustomizedOps, register_op
+
+from examples._kernel_utils import fla_kernel
+
+
+_reference_chunk_kda = inspect.unwrap(chunk_kimi_delta_attention)
 
 
 def kimi_causal_conv1d(
@@ -75,12 +81,19 @@ def kimi_chunk_kda(
     Uses pure-PyTorch `chunk_kimi_delta_attention` on CPU and dispatches to FLA Triton
     kernels on CUDA when available.
     """
-    out, _ = chunk_kimi_delta_attention(
-        query,
-        key,
-        value,
-        g=g,
-        beta=beta,
+    if (
+        query.ndim != 4 or query.shape != key.shape or query.shape != g.shape
+        or value.shape[:3] != query.shape[:3] or beta.shape != query.shape[:3]
+    ):
+        raise ValueError("KDA expects matching Q/K/g [B,S,H,D], V [B,S,H,Dv], and beta [B,S,H]")
+    kernel = fla_kernel("kda", query, key, value)
+    if kernel is not None and g.device == beta.device == query.device:
+        query, key, value = (tensor.contiguous() for tensor in (query, key, value))
+        g, beta = g.float().contiguous(), beta.contiguous()
+    else:
+        kernel = _reference_chunk_kda
+    out, _ = kernel(
+        query, key, value, g=g, beta=beta,
         initial_state=None,
         output_final_state=False,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,

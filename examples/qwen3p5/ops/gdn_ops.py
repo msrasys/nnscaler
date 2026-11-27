@@ -13,15 +13,7 @@ import torch.nn.functional as F
 from nnscaler.graph.parser.register import CustomizedOps, register_op
 from nnscaler.ir.cten import IRObject, IRTensor
 
-try:
-    from causal_conv1d import causal_conv1d_fn as _cuda_causal_conv1d_fn
-except Exception:  # pragma: no cover - optional CUDA package
-    _cuda_causal_conv1d_fn = None
-
-try:
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk_gated_delta_rule
-except Exception:  # pragma: no cover - optional Triton/CUDA package
-    _fla_chunk_gated_delta_rule = None
+from examples._kernel_utils import fla_kernel, load_optional_kernel
 
 
 def _unwrap_ir_value(value: Any) -> Any:
@@ -45,9 +37,26 @@ def qwen3_5_causal_conv1d(
     activation: Optional[str] = "silu",
 ) -> torch.Tensor:
     """Depthwise causal Conv1d (`[B, C, S]`) supporting both 2D `[C, W]` and 3D `[C, 1, W]` weights."""
-    if x.is_cuda and _cuda_causal_conv1d_fn is not None:
-        w2d = weight.squeeze(1) if weight.dim() == 3 else weight
-        return _cuda_causal_conv1d_fn(x, w2d, bias, activation=activation)
+    if activation not in (None, "silu", "swish"):
+        raise ValueError(f"Unsupported causal_conv1d activation: {activation}")
+    w2d = weight.squeeze(1) if weight.dim() == 3 else weight
+    if (
+        x.is_cuda and weight.is_cuda and x.device == weight.device
+        and (bias is None or bias.is_cuda and bias.device == x.device)
+        and weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and w2d.shape[-1] in (2, 3, 4)
+        and x.numel() > 0
+    ):
+        kernel = load_optional_kernel("causal_conv1d", "causal_conv1d_fn")
+        if kernel is not None:
+            # Channel-first contiguous inputs avoid the channel-last alignment constraint after TP slicing.
+            out = kernel(
+                x.to(weight.dtype).contiguous(),
+                w2d.contiguous(),
+                bias.to(weight.dtype).contiguous() if bias is not None else None,
+                activation=activation,
+            )
+            return out.to(x.dtype)
 
     _, channels, seq_len = x.shape
     w3d = weight.unsqueeze(1) if weight.dim() == 2 else weight
@@ -61,8 +70,6 @@ def qwen3_5_causal_conv1d(
     )[..., :seq_len]
     if activation in ("silu", "swish"):
         out = F.silu(out)
-    elif activation is not None:
-        raise ValueError(f"Unsupported causal_conv1d activation: {activation}")
     return out.to(x.dtype)
 
 
@@ -167,13 +174,26 @@ def qwen3_5_chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = True,
 ) -> torch.Tensor:
     """Chunk Gated Delta Rule (`[B, T, Hv, Dv]`) with FLA Triton fast-path & CPU fallback."""
-    if q.is_cuda and _fla_chunk_gated_delta_rule is not None:
-        out, _ = _fla_chunk_gated_delta_rule(
-            q,
-            k,
-            v,
-            g=g,
-            beta=beta,
+    if (
+        q.ndim != 4 or q.shape != k.shape or v.ndim != 4
+        or q.shape[:2] != v.shape[:2] or q.shape[2] == 0
+        or v.shape[2] % q.shape[2] != 0
+        or g.shape != v.shape[:3] or beta.shape != g.shape
+    ):
+        raise ValueError("GDN expects matching Q/K [B,T,Hk,Dk], V [B,T,Hv,Dv], g/beta [B,T,Hv], and Hv % Hk == 0")
+    kernel = fla_kernel("gated_delta_rule", q, k, v)
+    if kernel is not None and g.device == beta.device == q.device:
+        # Older FLA kernels use a single head count for Q/K/V addressing.
+        group = v.shape[2] // q.shape[2]
+        if group != 1:
+            q = q.repeat_interleave(group, dim=2)
+            k = k.repeat_interleave(group, dim=2)
+        out, _ = kernel(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            g=g.float().contiguous(),
+            beta=beta.contiguous(),
             scale=scale,
             initial_state=None,
             output_final_state=False,

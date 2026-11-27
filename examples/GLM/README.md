@@ -32,3 +32,7 @@ PYTHONPATH=. python examples/GLM/compile.py \
 # 3. Run Full Verification Suite (CPU Golden Parity + Zero-GPU Compilation)
 PYTHONPATH=. python examples/GLM/tests/run_all_tests.py
 ```
+
+KDA explicitly uses the unwrapped PyTorch reference on CPU and for FP32; optional
+FLA is selected only for supported FP16/BF16 CUDA inputs. Convolution remains
+`F.conv1d`. See [optional-kernel dispatch and CUDA parity tests](../qwen3p5/README.md#optional-cuda-kernels).
