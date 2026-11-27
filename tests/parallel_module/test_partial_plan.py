@@ -13,8 +13,8 @@ import torch
 import torch.nn as nn
 
 from nnscaler.parallel import (
-    ComputeConfig, build_optimizer, deduped_state_dict, load_deduped_state_dict,
-    load_merged_state_dict, merge_state_dicts, parallelize,
+    ComputeConfig, build_optimizer, deduped_state_dict, gather_full_model_state_dict,
+    load_deduped_state_dict, load_merged_state_dict, merge_state_dicts, parallelize,
 )
 from nnscaler.policies import OpPartition, OpPlan, fn, get_pas_ops
 from nnscaler.runtime.hybrid_optimizer import HybridOptConfig, HybridOptimizer, HybridSubOptConfig
@@ -31,6 +31,15 @@ class Encoder(nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
+
+class ScaledEncoder(Encoder):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('scale', torch.full((3,), 2.0), persistent=False)
+
+    def forward(self, x):
+        return super().forward(x) * self.scale
 
 
 class Mlp(nn.Module):
@@ -249,3 +258,22 @@ def _inactive_rank_training_worker(tmp_path, mode):
 @pytest.mark.parametrize('mode', ['zero1', 'zero3', 'hybrid', 'deduped', 'npp_zero1'])
 def test_inactive_rank_training_matches_eager(tmp_path, mode):
     launch_torchrun(4, _inactive_rank_training_worker, tmp_path, mode)
+
+
+def _gather_with_non_persistent_buffer_worker(tmp_path):
+    init_distributed()
+    torch.manual_seed(0)
+    source = ScaledEncoder()
+    expected = {f'0.{k}': v.detach().cpu() for k, v in source.state_dict().items()}
+    model = nn.Sequential(parallelize(source, {'x': torch.ones(2, 3)}, _first_rank_only,
+                                      ComputeConfig(2, 2), gen_savedir=tmp_path))
+    # Every rank, including the inactive one, skips the non-persistent buffer alike.
+    gathered = gather_full_model_state_dict(model)
+    assert sorted(gathered) == sorted(expected)
+    for key, value in expected.items():
+        torch.testing.assert_close(gathered[key].cpu(), value)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason='requires 2 GPUs')
+def test_gather_full_model_state_dict_with_non_persistent_buffer(tmp_path):
+    launch_torchrun(2, _gather_with_non_persistent_buffer_worker, tmp_path)

@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.utils import first_or
 
 if TYPE_CHECKING:
     from nnscaler.runtime.module import AttrMeta, Zero3AttrMeta
@@ -72,10 +73,14 @@ class DTensor:
         return dest_tensor[:self.attr_meta.get_local_numel()].reshape(self.attr_meta.sub_shape).contiguous()
 
     def _get_tp_groups(self):
-        if self.attr_meta is None:
+        # Use the metadata of any rank holding the tensor (`attr_metas` is the same on every rank),
+        # so every rank calls `_create_pgs` with the same groups:
+        # creating a group that is not cached yet is a world-wide collective.
+        meta = first_or(self.attr_metas, lambda m: m is not None)
+        if meta is None:
             return None, None
 
-        partitioned_dims = self.attr_meta.get_partitioned_dims()
+        partitioned_dims = meta.get_partitioned_dims()
         assert len(partitioned_dims) <= 1, "Only support partitioning on one dimension for now."
         partitioned_dim = partitioned_dims[0] if partitioned_dims else None
 
@@ -125,6 +130,11 @@ class DTensor:
 
         param_ranks: list[int] = [i for i, meta in enumerate(self.attr_metas) if meta is not None]
 
+        # The groups are inferred from rank ids only:
+        # consecutive holders form one TP group (replicated holders are grouped the same way),
+        # and every PP group below must contain exactly one holder.
+        # This holds when the holders are a prefix of each scale unit or one pipeline stage;
+        # other placements may need explicit group metadata instead.
         tp_groups: list[list[int]] = [[param_ranks[0]]]
         for r in param_ranks[1:]:
             # tp in the same pp groups have consecutive rank ids
