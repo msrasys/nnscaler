@@ -17,7 +17,7 @@ from nnscaler.flags import CompileFlag
 import nnscaler.graph.function.dimops
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.parser.mapping import SignFx2Op
-from nnscaler.graph.parser.register import CustomizedOps, _get_torch_op_aliases
+from nnscaler.graph.parser.register import CustomizedOps, EmitContext, _get_torch_op_aliases
 from nnscaler.ir.cten import IR, IRObject
 from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig, CubeModule, _gen_graph
 from nnscaler.utils import mark_dynamic
@@ -90,20 +90,168 @@ def test_codegen_multiprocess():
         with tempfile.TemporaryDirectory() as tempdir:
             m_new = _to_cube_model(
                 Module0(),
-                ComputeConfig(1, 4),
+                ComputeConfig(2, 2),
                 cube_savedir=tempdir,
                 load_module=False,
                 max_workers=2,
             )
             assert m_new is None
-            for rank in range(4):
-                assert _gencode_contains(tempdir, Module0, rank, rf'rank = {rank}')
+            assert _gencode_files(tempdir, Module0) == ['gencode0.py', 'gencode1.py']
+            for rank in range(2):
+                # `rank` is assigned by the loader whenever the code is sharable
+                assert _gencode_contains(tempdir, Module0, rank, r'rank = None')
                 assert _gencode_contains(
                     tempdir, Module0, rank,
                     r'nnscaler\.runtime\.function\.print_time',
                 )
     finally:
         CompileFlag.line_timer = old_line_timer
+
+
+def _gencode_files(cubesave_dir, module_class, instance_name=None):
+    from nnscaler.parallel import _prepare_namespace
+    _, outdir = _prepare_namespace(cubesave_dir, module_class, instance_name)
+    return sorted(f.name for f in outdir.glob('gencode*.py'))
+
+
+class TpScaleUnitModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(4, 8)
+        self.linear2 = torch.nn.Linear(8, 4)
+
+    def forward(self, x):
+        return self.linear2(torch.relu(self.linear1(x))).sum()
+
+
+@replace_all_device_with('cpu')
+def test_codegen_shared_scale_unit_code(tmp_path):
+    """
+    With runtime_ngpus > plan_ngpus, one file is generated per plan device and
+    shared by all scale units. Ranks of communication groups are shifted at runtime
+    by `self.scale_unit_index`, and the loader assigns the rank of each process.
+    """
+    parallelize(
+        TpScaleUnitModule(),
+        {'x': torch.randn(2, 4)},
+        'tp',
+        ComputeConfig(2, 6),
+        gen_savedir=tmp_path,
+        load_module=False,
+        max_workers=2,
+    )
+    assert _gencode_files(tmp_path, TpScaleUnitModule) == ['gencode0.py', 'gencode1.py']
+    for plan_rank in range(2):
+        assert _gencode_contains(tmp_path, TpScaleUnitModule, plan_rank, r'rank = None')
+        # adapter ranks are plan ranks shifted by the scale unit offset
+        assert _gencode_contains(
+            tmp_path, TpScaleUnitModule, plan_rank,
+            r'ranks=\[r \+ self\.scale_unit_index \* 2 for r in \[0, 1\]\]',
+        )
+        assert not _gencode_contains(tmp_path, TpScaleUnitModule, plan_rank, r'ranks=\[[0-9], [0-9]\]\)')
+
+    classes = {}
+    for rank in range(6):
+        module_class = _load_parallel_module_class(TpScaleUnitModule, gen_savedir=tmp_path, rank=rank)
+        assert module_class.rank == rank
+        assert module_class.__name__ == 'TpScaleUnitModule'
+        classes[rank] = module_class
+    # ranks sharing a file still get distinct classes with their own rank
+    assert len(set(map(id, classes.values()))) == 6
+    assert all(cls.rank == rank for rank, cls in classes.items())
+
+    from ..utils import new_empty
+    for rank in (0, 3, 5):
+        m = new_empty(classes[rank])
+        assert m.rank == rank
+        assert m.scale_unit_index == rank // 2
+        # reducer groups are scale-unit invariant and always contain the loaded rank
+        assert m.reducers
+        assert all(rank in r.ranks for r in m.reducers)
+        assert all(r.ranks in (tuple(range(6)), tuple(range(rank % 2, 6, 2))) for r in m.reducers)
+
+    # the generated directory is recognized as complete and reused
+    with patch('nnscaler.parallel._gencode') as mocked_gencode:
+        parallelize(
+            TpScaleUnitModule(),
+            {'x': torch.randn(2, 4)},
+            'tp',
+            ComputeConfig(2, 6),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='match',
+        )
+        mocked_gencode.assert_not_called()
+
+
+def _legacy_emit_add(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs):
+    kw_pairs = [f'{key}={value}' for key, value in kwargs.items()]
+    return f"torch.add({', '.join(list(args) + kw_pairs)})"
+
+
+@nnscaler.register_op('*, * -> *', emit_fn=_legacy_emit_add)
+def legacy_emit_add(x, y):
+    return x + y
+
+
+def _ctx_emit_add(node, args, kwargs, ctx: EmitContext):
+    assert ctx.plan_ngpus == 1 and ctx.runtime_ngpus == 3 and ctx.plan_devid == 0
+    assert ctx.is_shared and ctx.scale_unit_index is None
+    kw_pairs = [f'{key}={value}' for key, value in kwargs.items()]
+    return f"torch.add({', '.join(list(args) + kw_pairs)}).mul({ctx.rank_expr} - {ctx.rank_expr})"
+
+
+@nnscaler.register_op('*, * -> *', emit_fn=_ctx_emit_add)
+def ctx_emit_add(x, y):
+    return x + y
+
+
+class LegacyEmitModule(torch.nn.Module):
+    def forward(self, x, y):
+        return legacy_emit_add(x, y)
+
+
+class CtxEmitModule(torch.nn.Module):
+    def forward(self, x, y):
+        return ctx_emit_add(x, y)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_legacy_emit_fn_disables_shared_code(tmp_path, caplog):
+    """A legacy emit_fn hard-codes ranks, so one file per runtime rank is generated with a warning."""
+    with caplog.at_level('WARNING', logger='nnscaler.parallel'):
+        parallelize(
+            LegacyEmitModule(),
+            {'x': torch.randn(2, 4), 'y': torch.randn(2, 4)},
+            'dp',
+            ComputeConfig(1, 3),
+            gen_savedir=tmp_path,
+            load_module=False,
+        )
+    assert any('legacy signature' in r.message and 'legacy_emit_add' in r.message for r in caplog.records)
+    assert _gencode_files(tmp_path, LegacyEmitModule) == ['gencode0.py', 'gencode1.py', 'gencode2.py']
+    for rank in range(3):
+        assert _gencode_contains(tmp_path, LegacyEmitModule, rank, rf'rank = {rank}')
+        assert _gencode_contains(tmp_path, LegacyEmitModule, rank, r'torch\.add\(')
+        assert _load_parallel_module_class(LegacyEmitModule, gen_savedir=tmp_path, rank=rank).rank == rank
+
+
+@replace_all_device_with('cpu')
+def test_codegen_emit_context_shared_code(tmp_path):
+    """An EmitContext emit_fn keeps the shared layout and emits runtime rank expressions."""
+    parallelize(
+        CtxEmitModule(),
+        {'x': torch.randn(2, 4), 'y': torch.randn(2, 4)},
+        'dp',
+        ComputeConfig(1, 3),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    assert _gencode_files(tmp_path, CtxEmitModule) == ['gencode0.py']
+    assert _gencode_contains(
+        tmp_path, CtxEmitModule, 0,
+        r'torch\.add\(.*\)\.mul\(\(self\.scale_unit_index \* 1 \+ 0\) - \(self\.scale_unit_index \* 1 \+ 0\)\)',
+    )
 
 
 @replace_all_device_with('cpu')
@@ -460,13 +608,29 @@ class AttrModule(torch.nn.Module):
         return x + getattr(attr, 'a')
 
 
+def _gencode_file(outdir, index):
+    """
+    The generated file run by rank `index`.
+
+    When the code is shared across scale units, only plan devices have files and
+    rank `index` runs the file of plan device `index % plan_ngpus`.
+    """
+    from nnscaler.parallel import ParallelModule
+    file = outdir / f'gencode{index}.py'
+    if not file.exists():
+        compute_config = ComputeConfig.safe_load_from_file(outdir / ParallelModule.COMPUTE_CONFIG_FILE)
+        if compute_config is not None:
+            file = outdir / f'gencode{index % compute_config.plan_ngpus}.py'
+    return file
+
+
 def print_gencode(cubesave_dir, module_class, index=0, instance_name=None):
     from nnscaler.parallel import _PARALLEL_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
     from pathlib import Path
     import re
     namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{instance_name or _DEFAULT_INSTANCE_NAME}'
     outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
-    filecontent = (outdir /f'gencode{index}.py').read_text()
+    filecontent = _gencode_file(outdir, index).read_text()
     print(filecontent)
 
 
@@ -476,7 +640,7 @@ def _gencode_contains(cubesave_dir, module_class, index, search_re, *, instance_
     import re
     namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{instance_name or _DEFAULT_INSTANCE_NAME}'
     outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
-    filecontent = (outdir /f'gencode{index}.py').read_text()
+    filecontent = _gencode_file(outdir, index).read_text()
     matches = re.findall(search_re, filecontent, flags)
     return matches
 

@@ -47,7 +47,7 @@ def register_op(
     name: Optional[str] = None,
     code_impl_pattern: str = 'import',
     *,
-    emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None,
+    emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], EmitContext], str] = None,
     transform_rules: Tuple[TransformRule] = None,
     input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
     fake_fn: Optional[Callable] = None,
@@ -105,9 +105,26 @@ This function has the following parameters:
     taks inputs and kwargs as arguments and returns the operator annotation.
 - `name` (`str | None`): operator name. Only usable when `node_repr` is a string.
 - `code_impl_pattern` (`str`): It can only be 'import' or 'source'. If 'import' (default), will generate code with import statement. If 'source', will take the source code directly.
-- `emit_fn` (`Callable`): special emit function for codegen, it accepts the node, repred args, repred kwargs, runtime_devid,
-    plan_ndevs, runtime_ndevs as input and returns the generated code. Check examples/customized_ops/ring_attention/zigzag_attn.py for more details.
+- `emit_fn` (`Callable`): special emit function for codegen, it accepts the node, repred args, repred kwargs and an
+    `nnscaler.EmitContext` as input and returns the generated code. Check nnscaler/customized_ops/ring_attention/zigzag_attn.py for more details.
     Default: None.
+
+    When `runtime_ngpus > plan_ngpus`, the plan is replicated over scale units and nnScaler generates one code file per
+    plan device that is shared by all scale units, so the scale unit index is unknown at codegen time. `EmitContext`
+    describes the device position (`plan_devid`, `plan_ngpus`, `runtime_ngpus`) and offers `ranks(plan_ranks)` /
+    `scale_unit_ranks` to emit process groups: they return literal rank lists when the scale unit index is known and
+    runtime expressions based on `self.scale_unit_index` otherwise, so one `emit_fn` serves both cases.
+
+    ```python
+    def emit_ring(node, args, kwargs, ctx: nnscaler.EmitContext) -> str:
+        kw_pairs = [f'{k}={v}' for k, v in kwargs.items()]
+        kw_pairs.append(f'process_group={ctx.scale_unit_ranks}')  # all devices of the current scale unit
+        return f"{node.signature}({', '.join(list(args) + kw_pairs)})"
+    ```
+
+    The legacy signature `(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)` is still accepted. Because it
+    hard-codes runtime ranks, a graph using such an operator is generated once per runtime rank (with a warning),
+    which is slower for large `runtime_ngpus`.
 - `transform_rules` (`Tuple[TransformRule]`): a tuple of special TransformRules which will be used when partitioning the node.
     Default: None.
 - `input_gen_fn` (`Callable`): input generator function for profiler, this function accepts the IRFwOperation as input and returns

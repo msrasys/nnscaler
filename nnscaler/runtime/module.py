@@ -1238,7 +1238,7 @@ class ParallelModule(CubeModule):
     _PREFETCH_LEVEL_ENV_VAR = 'CPU_OFFLOADING_PREFETCH_LEVEL'
     _PREFETCH_LEVEL_DEFAULT = 2
 
-    # the rank of the module, will be assigned in the generated subclasses
+    # the rank of the module, assigned by `nnscaler.parallel._load_parallel_module_class` when loaded
     rank: int
     # the world size to run this module, will be assigned in the generated subclasses
     world_size: int
@@ -1274,6 +1274,8 @@ class ParallelModule(CubeModule):
             _logger.warning(
                 f"Runtime version mismatch: {rv} vs {runtime_version}. "
             )
+        if getattr(self, 'rank', 0) is None:
+            raise RuntimeError("The rank of this module is not assigned. Please load it with `nnscaler.parallelize`.")
         super().__init__()
         # this is used to allow multiple sync_grad() calls
         self._sync_grad_required = False
@@ -1336,6 +1338,17 @@ class ParallelModule(CubeModule):
                     attr_meta_map = pickle.load(f)
                     attr_meta_map = {attr: AttrMeta(**meta) for attr, meta in attr_meta_map.items()}
                     cls.attr_meta_maps.append(attr_meta_map)
+
+    @property
+    def scale_unit_index(self) -> int:
+        """
+        Index of the scale unit this rank belongs to, i.e. `rank // plan_ngpus`.
+
+        The plan is replicated `runtime_ngpus // plan_ngpus` times (once per scale unit).
+        Generated code shared by all scale units uses this index to shift the
+        plan-level ranks of communication groups to runtime ranks.
+        """
+        return self.rank // self.compute_config.plan_ngpus
 
     @property
     def non_presistent_buffers_inited(self):
