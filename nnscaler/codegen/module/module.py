@@ -36,6 +36,8 @@ from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.graph.schedule.module_streams import checkpoint_stream, weight_gradient_stream, direct_weight_gradients
 from nnscaler.codegen.module.stream import emit_module_streams
 from nnscaler.runtime.async_op import registered_async_ops
+from nnscaler.runtime.checkpoint_tail import registered_checkpoint_tails
+from nnscaler.codegen.module.checkpoint_tail import emit_checkpoint_tail
 
 from nnscaler.flags import CompileFlag
 from nnscaler.utils import fields
@@ -114,6 +116,7 @@ class ModuleCodeGen(FuncEmission):
         # Only names are needed in codegen workers. Runtime implementations
         # are registered when the generated module imports each operator.
         self.async_op_signatures = frozenset(registered_async_ops())
+        self.checkpoint_tails = registered_checkpoint_tails()
         if any(fnmatchcase(node.signature, pattern)
                for node in execplan.graph.select(ntype=IRFwOperation)
                for pattern in CompileFlag.multi_stream_ops):
@@ -1362,8 +1365,10 @@ class ModuleCodeGen(FuncEmission):
         # that the variable is not defined (because it has been 'del'-ed).
 
         captures = list(dict.fromkeys(weight_regions[node] for node in nodes if node in (weight_regions or {})))
+        tail = emit_checkpoint_tail(self, nodes, outputs) if prefetch is None else None
         # Explicit arguments keep each invocation's region alive through replay.
-        with FunctionBlock('recompute', input_names + captures, False) as fb:
+        arguments = input_names + captures + (['*, _rebuilding'] if tail else [])
+        with FunctionBlock('recompute', arguments, False) as fb:
             # The nodes to recompute share the same space of line_ids (or "node ids") with non-recomputable nodes.
             # e.g. those ids in subgraphs are not 0-based, and incremented after the preceding non-rc nodes and so on.
             #
@@ -1374,7 +1379,11 @@ class ModuleCodeGen(FuncEmission):
 
             # for ncode in ModuleCodeGen._emit_nodes(nodes, lifecycle):
             #     fb.insert_body(ncode)
-            fb.insert_body(self._emit_nodes(nodes, lifecycle, runtime_devid, weight_regions=weight_regions))
+            if tail:
+                fb.insert_body(self._emit_nodes(nodes[:-2], lifecycle, runtime_devid, weight_regions=weight_regions))
+                fb.insert_body(tail)
+            fb.insert_body(self._emit_nodes(nodes[-2:] if tail else nodes, lifecycle, runtime_devid,
+                                           weight_regions=weight_regions))
             fb.insert_body(f'return {output_names_tuple}')
         codes = [''] + fb.code + ['']
         stream = checkpoint_stream(nodes, CompileFlag.module_streams)
@@ -1390,8 +1399,12 @@ class ModuleCodeGen(FuncEmission):
                            f'{stream!r}, {dependencies}'
                            f'{", backward_ready=" + backward_ready if backward_ready else ""})')
         checkpoint_inputs = ', '.join(input_names + captures)
-        codes.append(f'{output_names_tuple} = ckpt.checkpoint(recompute, {checkpoint_inputs}, '
-                     f'use_reentrant=False{context})')
+        if tail:
+            codes.append(f'{output_names_tuple} = nnscaler.runtime.checkpoint_tail.run('
+                         f'recompute, {checkpoint_inputs}{context})')
+        else:
+            codes.append(f'{output_names_tuple} = ckpt.checkpoint(recompute, {checkpoint_inputs}, '
+                         f'use_reentrant=False{context})')
         return codes
 
     def _get_param_first_used_pos(self, segment: IRSegment) -> Dict[IRFullTensor, int]:

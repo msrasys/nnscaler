@@ -48,7 +48,8 @@ class ModuleStreamRule:
     weight_backward_only: bool = False
     accumulate_weight_grads: bool = False
     cuda_graph: bool | str = False
-    _codegen_version: int = field(default_factory=lambda: 38, init=False, repr=False)
+    recompute_saved_state: bool = False
+    _codegen_version: int = field(default_factory=lambda: 39, init=False, repr=False)
 
     def __post_init__(self):
         for name in ('module', 'stream'):
@@ -69,7 +70,8 @@ class ModuleStreamRule:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f'{name} must be a nonempty string or None')
-        for name in ('recompute_only', 'overlap_backward', 'weight_backward_only', 'accumulate_weight_grads'):
+        for name in ('recompute_only', 'overlap_backward', 'weight_backward_only', 'accumulate_weight_grads',
+                     'recompute_saved_state'):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f'{name} must be a boolean')
         if not (type(self.cuda_graph) is bool or self.cuda_graph == 'forward'):
@@ -91,6 +93,8 @@ class ModuleStreamRule:
                 raise ValueError('Operator selection cannot split modules or select recompute regions')
         if self.recompute_ready_on is not None and not self.recompute_only:
             raise ValueError('recompute_ready_on requires a recompute_only rule')
+        if self.recompute_saved_state and (not self.recompute_only or self.recompute_prefetch_on):
+            raise ValueError('recompute_saved_state requires a recompute_only rule without prefetch')
         if self.recompute_prefetch_on is not None:
             if not self.recompute_only or self.recompute_ready_on is not None:
                 raise ValueError('Checkpoint prefetch requires recompute_only without recompute_ready_on')
