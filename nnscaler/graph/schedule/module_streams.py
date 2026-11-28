@@ -55,8 +55,9 @@ class ModuleStreamRule:
         for name in ('module', 'stream'):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f'{name} must be a nonempty string')
-        if self.stream == 'default' and self.recompute_prefetch_on is None:
-            raise ValueError('Module streams must use a distinct, named stream')
+        if (self.stream == 'default' and self.recompute_prefetch_on is None
+                and not (self.recompute_only and self.recompute_saved_state and self.recompute_ready_on is None)):
+            raise ValueError('Module streams must use a distinct, named stream except for caller-stream checkpoint replay')
         for name in (
             'launch_before',
             'launch_after',
@@ -568,7 +569,7 @@ def direct_weight_gradients(node, rules):
 
 def checkpoint_stream(nodes, rules):
     """Select a whole checkpoint; never silently move part of a larger region."""
-    result = None
+    selected = None
     named = [node for node in nodes if node.module_stack is not None]
     for rule in normalize_module_stream_rules(rules):
         if not rule.recompute_only:
@@ -583,10 +584,13 @@ def checkpoint_stream(nodes, rules):
         if unsafe:
             signatures = ', '.join(dict.fromkeys(node.signature for node in unsafe))
             raise ValueError(f'Recompute streams require pure operations and local adapters: {signatures}')
-        if result is not None and result != rule.stream:
-            raise ValueError('Conflicting recompute streams for one checkpoint')
-        result = rule.stream
-    return result
+        if selected is not None:
+            if selected.stream != rule.stream:
+                raise ValueError('Conflicting recompute streams for one checkpoint')
+            if rule.stream == 'default' and selected.recompute_saved_state != rule.recompute_saved_state:
+                raise ValueError('Caller-stream state rebuilding cannot share its checkpoint with prefetch')
+        selected = rule
+    return selected.stream if selected is not None else None
 
 
 def _local_dict_updates(nodes):

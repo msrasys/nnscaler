@@ -1388,7 +1388,7 @@ class ModuleCodeGen(FuncEmission):
         codes = [''] + fb.code + ['']
         stream = checkpoint_stream(nodes, CompileFlag.module_streams)
         context = ''
-        if stream is not None:
+        if stream is not None and (stream != 'default' or prefetch is not None):
             self.execplan.mark_module_streams()
             dependencies = list(dict.fromkeys([*inputs, *[obj for node in nodes for obj in node.iobjs() if obj.is_attr()]]))
             dependencies = self.tuple_name(dependencies, prefix_attr='self.')

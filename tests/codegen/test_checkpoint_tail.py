@@ -12,7 +12,12 @@ import nnscaler.runtime.checkpoint_stream
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.module.module import ModuleCodeGen
+from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
+from nnscaler.execplan import ExecutionPlan
 from nnscaler.flags import CompileFlag
+from nnscaler.graph.graph import IRGraph
+from nnscaler.graph.schedule.module_streams import checkpoint_stream
+from nnscaler.graph.segment import IRSegment
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.runtime import checkpoint_tail
@@ -51,11 +56,11 @@ def gather(index, value):
     return _Gather.apply(index, value)
 
 
-def build(monkeypatch, callback, *, extra_output=False, duplicate=False):
+def build(monkeypatch, callback, *, extra_output=False, duplicate=False, stream='module_overlap', full=False):
     key = tuple(f'{f.__module__}.{f.__name__}' for f in (product, gather))
     monkeypatch.delitem(checkpoint_tail._tails, key, raising=False)
     nnscaler.register_checkpoint_tail(product, gather, input_index=1, rebuild=callback)
-    rule = nnscaler.ModuleStreamRule('demo', recompute_only=True, recompute_saved_state=True)
+    rule = nnscaler.ModuleStreamRule('demo', stream=stream, recompute_only=True, recompute_saved_state=True)
     monkeypatch.setattr(CompileFlag, 'module_streams', (rule,))
     tensors = [IRFullTensor((3,), name=n, requires_grad=n != 'index',
                             dtype=torch.int64 if n == 'index' else torch.float32).tosub()
@@ -70,6 +75,11 @@ def build(monkeypatch, callback, *, extra_output=False, duplicate=False):
         node.module_stack = {'demo': torch.nn.Module}
     nodes, inputs = [a, b], [x, w, index]
     outputs = [result, middle] if extra_output else [result]
+    if full:
+        segment = IRSegment(nodes, inputs, outputs)
+        graph = IRGraph([segment], inputs, outputs, 'test_caller_checkpoint')
+        plan = ExecutionPlan(graph, [segment])
+        return ModuleCodeGen(plan).gen(0), ScheduleCodeGen(plan).gen(0), plan
     emitter = ModuleCodeGen.__new__(ModuleCodeGen)
     FuncEmission.__init__(emitter)
     emitter.plan_ndevs = emitter.runtime_ndevs = 1
@@ -82,8 +92,9 @@ def build(monkeypatch, callback, *, extra_output=False, duplicate=False):
     return source
 
 
+@pytest.mark.parametrize('stream', ['module_overlap', 'default'])
 @pytest.mark.parametrize(('applicable', 'early_stop'), [(True, True), (True, False), (False, True)])
-def test_generated_tail_rebuild_preserves_values_and_gradients(monkeypatch, applicable, early_stop):
+def test_generated_tail_rebuild_preserves_values_and_gradients(monkeypatch, applicable, early_stop, stream):
     observations = []
 
     def rebuild(args, kwargs, following, other_kwargs):
@@ -100,7 +111,7 @@ def test_generated_tail_rebuild_preserves_values_and_gradients(monkeypatch, appl
         assert not early_stop, 'native checkpoint should have stopped at the last save'
         return True
 
-    source = build(monkeypatch, rebuild)
+    source = build(monkeypatch, rebuild, stream=stream)
     assert 'checkpoint_tail.rebuild' in source
     root = __name__.split('.')[0]
     namespace = {'torch': torch, 'nnscaler': nnscaler, root: sys.modules[root]}
@@ -124,3 +135,40 @@ def test_generated_tail_rebuild_preserves_values_and_gradients(monkeypatch, appl
 def test_falls_back_when_producer_value_escapes_its_declared_edge(monkeypatch, invalid):
     source = build(monkeypatch, lambda *args: True, **{invalid: True})
     assert 'nnscaler.runtime.checkpoint_tail.' not in source and 'ckpt.checkpoint' in source
+
+
+def test_caller_rebuild_preserves_single_stream_execution_plan(monkeypatch):
+    monkeypatch.setattr(CompileFlag, 'max_pending_backward_tasks', 0)
+    module, schedule, plan = build(monkeypatch, lambda *args: False, stream='default', full=True)
+    assert 'nnscaler.runtime.checkpoint_tail.run(' in module
+    assert 'context_fn=' not in module
+    assert not plan.use_multi_streams and not plan.track_stream_inputs
+    assert 'module_parameter_streams = {}' in module
+    assert 'module_stream_parameters = []' in module
+    assert 'nnscaler.runtime.stream.ModuleStreams(' not in module
+    assert 'nnscaler.runtime.checkpoint_stream.contexts(' not in module
+    assert 'cuda_task_queue(' not in schedule
+    assert 'track_stream=False' in schedule
+
+
+@pytest.mark.parametrize('options', [{}, {'recompute_saved_state': True, 'recompute_ready_on': 'dispatch'},
+                                    {'recompute_prefetch_on': 'dispatch', 'recompute_saved_state': True}])
+def test_caller_rebuild_rejects_other_stream_actions(options):
+    with pytest.raises(ValueError):
+        nnscaler.ModuleStreamRule('demo', stream='default', recompute_only=True, **options)
+
+
+def test_caller_rebuild_is_local_to_its_matching_checkpoint():
+    value = IRFullTensor((3,), name='x', requires_grad=True, dtype=torch.float32).tosub()
+    node = IRFwOperation('op', 'torch.cos', [value], 1)
+    node.module_stack = {'demo': torch.nn.Module}
+    caller = nnscaler.ModuleStreamRule('demo', stream='default', recompute_only=True, recompute_saved_state=True)
+    other = nnscaler.ModuleStreamRule('other', stream='side', recompute_only=True)
+    assert checkpoint_stream([node], [other, caller]) == 'default'
+    node.module_stack = {'other': torch.nn.Module}
+    assert checkpoint_stream([node], [caller, other]) == 'side'
+    prefetch = nnscaler.ModuleStreamRule('demo', stream='default', recompute_only=True,
+                                        recompute_prefetch_on='dispatch')
+    node.module_stack = {'demo': torch.nn.Module}
+    with pytest.raises(ValueError, match='cannot share'):
+        checkpoint_stream([node], [prefetch, caller])
